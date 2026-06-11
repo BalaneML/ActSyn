@@ -5,7 +5,7 @@
 NHTS2022をダウンロードする
 
 1. NHTSのWebサイトへアクセス  
-[text](https://nhts.ornl.gov/)
+[NHTS](https://nhts.ornl.gov/)
 
 2. サイトからCSVファイルをダウンロード  
 ダウンロードが完了したファイルの構成は以下のようになっている  
