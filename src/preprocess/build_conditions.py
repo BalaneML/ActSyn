@@ -5,7 +5,7 @@ NHTS 2022 社会属性 -> 条件ベクトル構築 (5属性)
     age                : R_AGE (5..92)
     gender             : R_SEX (欠損<0 は R_SEX_IMP で補完), 1=male, 2=female -> {0:male,1:female}
     num_member         : HHSIZE (1..10)
-    role_household_type: 8分類, 世帯単位で R_RELAT と Spouse有無, R_SEX から判定
+    role_household_type: 8分類, 世帯単位で R_RELAT と Spouse有無, R_SEX から判定 ※改良すべき
     worker_status      : WORKER==1 -> 1(就業), それ以外(2 および -1=子供非該当) -> 0(非就業)
 
 role_household_type の 8 カテゴリ(index):
@@ -16,6 +16,7 @@ role_household_type の 8 カテゴリ(index):
 
 import numpy as np
 import pandas as pd
+
 
 # R_RELAT コード
 SELF, SPOUSE, CHILD, PARENT = 7, 1, 2, 3
@@ -45,7 +46,7 @@ def build_conditions(person_path: str, household_path: str, keys_path: str) -> p
 
     # スケジュールを作れた個人だけに絞る
     keys = pd.read_csv(keys_path)
-    per = keys.merge(per, on=["HOUSEID","PERSONID"], how="left")
+    per = keys.merge(per, on=["HOUSEID","PERSONID"], how="left")  # keysに含まれるHHID, PERIDのみ
     per = per.merge(hh, on="HOUSEID", how="left")
 
     # 世帯ごとに Spouse が存在するか(role判定に必要)
@@ -55,32 +56,39 @@ def build_conditions(person_path: str, household_path: str, keys_path: str) -> p
     )
     per["spouse_in_hh"] = per["HOUSEID"].map(spouse_present)
 
+    # 世帯内役割推定アルゴリズム
     def role_of(row):
-        rel = int(row["R_RELAT"])
-        g = resolve_gender(int(row["R_SEX"]), int(row["R_SEX_IMP"]))  # 0=m,1=f
-        hhsize = int(row["HHSIZE"])
+        rel = int(row["R_RELAT"])  # 続柄
+        g = resolve_gender(int(row["R_SEX"]), int(row["R_SEX_IMP"]))  # 性別 (0=m,1=f)
+        hhsize = int(row["HHSIZE"])  # 世帯構成人数
+
         if rel == SELF or rel == SPOUSE:
-            # 単独 or 夫婦の一方 or 配偶者なしの親(ひとり親)
             if hhsize == 1:
+                # 単独 or 夫婦の一方 or 配偶者なしの親(ひとり親)
                 return ROLE["single_m"] if g==0 else ROLE["single_f"]
-            # 複数人世帯: 夫婦なら husband/wife、Spouseなしの self はひとり親として husband/wife に吸収
-            return ROLE["husband"] if g==0 else ROLE["wife"]
+            else:
+                # 複数人世帯: 夫婦なら husband/wife、Spouseなしの self はひとり親として husband/wife に吸収
+                return ROLE["husband"] if g==0 else ROLE["wife"]
         elif rel == CHILD:
+            # 子供
             return ROLE["child_m"] if g==0 else ROLE["child_f"]
         elif rel == PARENT:
+            # 親
             return ROLE["parent_m"] if g==0 else ROLE["parent_f"]
         else:  # 4,5,6,-9 など
             return ROLE["other"]
 
-    per["age"] = per["R_AGE"].astype(int)
-    per["gender"] = [resolve_gender(int(s), int(si)) for s,si in zip(per["R_SEX"], per["R_SEX_IMP"])]
-    per["num_member"] = per["HHSIZE"].astype(int)
-    per["role_household_type"] = per.apply(role_of, axis=1)
-    per["worker_status"] = (per["WORKER"]==1).astype(int)  # 1=就業, それ以外=0
+    # 条件ベクトル構築
+    per["age"] = per["R_AGE"].astype(int)  # 年齢
+    per["gender"] = [resolve_gender(int(s), int(si)) for s,si in zip(per["R_SEX"], per["R_SEX_IMP"])]  # 性別，R_SEX_IMPで欠損補完
+    per["num_member"] = per["HHSIZE"].astype(int)  # 世帯構成人数
+    per["role_household_type"] = per.apply(role_of, axis=1)  # 世帯内役割 (推定)
+    per["worker_status"] = (per["WORKER"]==1).astype(int)  # 就業=1, それ以外=0
 
     cond = per[["HOUSEID","PERSONID","age","gender","num_member","role_household_type","worker_status"]]
     return cond
 
+# How to use
 def main():
     cond = build_conditions(PERSON_PATH, HOUSEHOLD_PATH, KEYS_PATH)
     cond.to_csv("../../data/processed/conditions.csv", index=False)
@@ -100,6 +108,7 @@ def main():
     print(f"\n子供のうち worker=1(就業)の数: {int((child['worker_status']==1).sum())} / {len(child)}")
     # その他(-1)がどれくらいか
     print(f"role=その他(-1) の数: {int((cond['role_household_type']==-1).sum())}")
+
 
 if __name__ == "__main__":
     main()
