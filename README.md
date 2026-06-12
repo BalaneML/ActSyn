@@ -22,5 +22,5 @@ csv
 
 ## pre-processing
 pathを指定して以下の2つのファイルを順番に実行する
-1. ``src/preprocess/build_schedules.py``
-2. ``src/preprocess/build_conditions.py``
+1. ``src/preprocess/preprocess.py``
+1. ``src/preprocess/merge_weight.py``
