@@ -1,0 +1,37 @@
+# CVAE 学習設定 (ベースライン)
+#
+# このファイルの値は train.py の --config で読み込まれる。
+# 個別の項目は CLI フラグで上書きできる (CLI > YAML > デフォルト)。
+#   例: python train.py --config configs/baseline.yaml --beta 0.5 --device cuda
+#
+# 記載しなかった項目は CVAEConfig のデフォルト値が使われる。
+
+# --- 入出力 (パスは実行するディレクトリ基準) ---
+data: data/processed/weighted_dataset.csv
+out: checkpoints/baseline.pt
+history_csv: logs/baseline_history.csv
+
+# --- スケジュール (出力系列) ---
+num_slots: 96
+num_activities: 10
+
+# --- condition ---
+embedding_dim: 8
+age_bin_width: 10
+
+# --- ネットワーク ---
+latent_dim: 32
+hidden_dims: [512, 512]   # 層を増やすなら [512, 512, 256] のように書く
+
+# --- 損失 ---
+beta: 1.0
+
+# --- 学習 ---
+batch_size: 500
+epochs: 300
+learning_rate: 0.001
+weight_decay: 0.00001
+
+# --- その他 ---
+device: mps               # GPU を使うなら cuda
+seed: 42

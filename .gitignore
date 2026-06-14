@@ -11,3 +11,9 @@ data/*
 
 # notebooks
 notebooks/*
+
+# checkpoints
+checkpoints/*
+
+# log
+logs/*
