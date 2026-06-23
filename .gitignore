@@ -8,12 +8,19 @@ __pycache__/
 
 # data
 data/*
+imgs/*
+logs/*
 
 # notebooks
 notebooks/*
 
-# checkpoints
+# model
 checkpoints/*
+model_configs/*
+*.pt
 
-# log
-logs/*
+# md
+NOTE.md
+
+# wandb
+wandb/
