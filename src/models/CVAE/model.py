@@ -32,6 +32,7 @@ MODEL_SAVE_PATH = './cvae.pt'
 # 活動スケジュール
 NUM_SLOTS   = 96      # 15分刻み × 96 = 24時間（04:00開始）
 NUM_ACT     = 10      # 活動状態 HOME=0 ... TRAVEL=9
+X_DIM       = NUM_SLOTS * NUM_ACT   # 960
 
 # 条件5属性のカテゴリ数（one-hot の次元）
 AGE_BINS    = 11      # min(age // 10, 10) で 0..10 の11区分
@@ -41,7 +42,6 @@ NUM_ROLE    = 8       # role_household_type 0..7
 NUM_WORKER  = 2
 COND_DIM    = AGE_BINS + NUM_GENDER + NUM_MEMBER + NUM_ROLE + NUM_WORKER  # = 33
 
-X_DIM       = NUM_SLOTS * NUM_ACT   # 960
 HIDDEN_DIM  = 512
 Z_DIM       = 64
 BETA        = 0.5
