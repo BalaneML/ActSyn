@@ -24,3 +24,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "nbconvert>=7.17.1",
+    "nbformat>=5.10.4",
+]
