@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .DS_Store
+.vscode/*
 
 # data
 data/*
@@ -29,3 +30,4 @@ wandb/
 # claude
 .claude/*
 CLAUDE.md
+CLAUDE_EXPERIMENT.md
