@@ -36,6 +36,7 @@ import argparse
 import copy
 import sys
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -43,11 +44,9 @@ import torch
 import torch.nn.functional as F
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(REPO_ROOT / "src" / "common" / "aggregates"))
 sys.path.insert(0, str(REPO_ROOT / "src" / "common" / "preprocess" / "stula"))
-sys.path.insert(0, str(REPO_ROOT / "src" / "models" / "CVAE_Aggregate"))
 from crosswalk_atus_stula import Common, NUM_COMMON, stula_to_common  # noqa: E402
-from aggmatch_experiment import (  # noqa: E402
+from model import (  # noqa: E402
     AggCVAE, train_elbo, group_rates, DEVICE, Z_DIM, NUM_SLOTS,
     PRETRAIN_EPOCHS, S_TRAIN, LR_EMB, LR_DECODER,
 )
@@ -85,24 +84,24 @@ def load_stula_targets(name: str) -> dict:
     """timeband CSV -> {cross (28,12,96), margin_ga (14,12,96), margin_ge (4,12,96),
                         pi_e (2,7,2: e|g,a), pop (2,7,2)} 率は[0,1], NaN=非公表"""
     df = pd.read_csv(STULA_DIR / f"{name}.csv")
-    df = df[df["region"] == "00_全国"]
+    df = cast(pd.DataFrame, df[df["region"] == "00_全国"])
     com = stula_to_common(df)   # activity20 -> common12 に率を集約
-    com["g"] = com["gender"].map({"1_男": 0, "2_女": 1})
-    com["e"] = com["employment"].map({"1_有業者": 1, "2_無業者": 0})
+    com["g"] = com["gender"].map({"1_男": 0, "2_女": 1})  # type: ignore
+    com["e"] = com["employment"].map({"1_有業者": 1, "2_無業者": 0})  # type: ignore
     com["a16"] = com["age_class"].str[:2].map(lambda c: int(c) if c.isdigit() and c != "00" else np.nan)
-    com["a7"] = com["a16"].map(AGE16_TO_7)
+    com["a7"] = com["a16"].map(AGE16_TO_7)  # type: ignore
     cidx = {c.name: int(c) for c in Common}
-    com["ci"] = com["common"].map(cidx)
+    com["ci"] = com["common"].map(cidx)  # type: ignore
 
     # 人口 (推定人口千人): 元dfの行動=総数行から。5歳16区分 (pop16) と10歳7区分 (pop) の両方を持つ
-    pop_src = df[(df["activity"].str.startswith("00_")) ]
+    pop_src = cast(pd.DataFrame, df[(df["activity"].str.startswith("00_"))])
     pop_src = pop_src.assign(
-        g=pop_src["gender"].map({"1_男": 0, "2_女": 1}),
-        e=pop_src["employment"].map({"1_有業者": 1, "2_無業者": 0}),
+        g=pop_src["gender"].map({"1_男": 0, "2_女": 1}),  # type: ignore
+        e=pop_src["employment"].map({"1_有業者": 1, "2_無業者": 0}),  # type: ignore
         a16=pop_src["age_class"].str[:2].map(lambda c: int(c) if c.isdigit() and c != "00" else np.nan),
     ).dropna(subset=["g", "e", "a16"])
     pop16 = np.zeros((N_G, 16, N_E))   # a16 は 1..15 (index 1..15 を使用)
-    for (g, a16, e), grp in pop_src.groupby(["g", "a16", "e"]):
+    for (g, a16, e), grp in pop_src.groupby(["g", "a16", "e"]):  # type: ignore
         pop16[int(g), int(a16), int(e)] = grp["population_k"].iloc[0]
     pop = np.zeros((N_G, N_A, N_E))
     for a16, a7 in AGE16_TO_7.items():
@@ -114,8 +113,8 @@ def load_stula_targets(name: str) -> dict:
         wsum = np.zeros(shape + (NUM_COMMON, NUM_SLOTS))
         acc  = np.zeros(shape + (NUM_COMMON, NUM_SLOTS))
         for _, r in sub.iterrows():
-            idx = tuple(int(r[k]) for k in keys) + (int(r["ci"]),)
-            vals = r[SLOT_COLS].to_numpy(dtype=float) / 100.0
+            idx = tuple(int(r[k]) for k in keys) + (int(r["ci"]),)  # type: ignore
+            vals = r[SLOT_COLS].to_numpy(dtype=float) / 100.0  # type: ignore
             m = ~np.isnan(vals)
             acc[idx][m]  += r["wrow"] * vals[m]
             wsum[idx][m] += r["wrow"]
@@ -128,11 +127,11 @@ def load_stula_targets(name: str) -> dict:
                    for g, a16, e in zip(sub["g"], sub["a16"], sub["e"])]
     cross = rates_block(sub, ["g", "a7", "e"], (N_G, N_A, N_E)).reshape(D_GROUPS, NUM_COMMON, NUM_SLOTS)
     # margin_ga: 就業=総数 の行 (性×年齢; 5歳→10歳は e 合計人口で重み付け)
-    sub = com[(com["employment"] == "0_総数")].dropna(subset=["g", "a7"]).copy()
+    sub = cast(pd.DataFrame, com[(com["employment"] == "0_総数")]).dropna(subset=["g", "a7"]).copy()
     sub["wrow"] = [pop16[int(g), int(a16), :].sum() for g, a16 in zip(sub["g"], sub["a16"])]
     margin_ga = rates_block(sub, ["g", "a7"], (N_G, N_A))
     # margin_ge: 年齢=総数 の行 (性×就業; 1セル1行なので重みは1)
-    sub = com[(com["age_class"] == "00_総数")].dropna(subset=["g", "e"]).copy()
+    sub = cast(pd.DataFrame, com[(com["age_class"] == "00_総数")]).dropna(subset=["g", "e"]).copy()
     sub["wrow"] = 1.0
     margin_ge = rates_block(sub, ["g", "e"], (N_G, N_E))
     return {"cross": cross, "margin_ga": margin_ga, "margin_ge": margin_ge,
@@ -140,11 +139,13 @@ def load_stula_targets(name: str) -> dict:
 
 
 # ============================================================
-# Stage 2: 周辺マッチ + 関数空間アンカー
+# Stage 2: 周辺マッチ + 関数空間アンカー (model.aggregate_match の周辺マッチ変種)
 # ============================================================
 def margin_match(model: AggCVAE, pre: AggCVAE, tgt: dict, mask_c: np.ndarray,
                  anchor_w: float, tag: str, shuffle_groups: np.ndarray | None = None):
-    """margin_ga/margin_ge にマッチ。shuffle_groups は placebo 用の群置換 (μ̂ 側に適用)"""
+    """margin_ga/margin_ge にマッチ。shuffle_groups は placebo 用の群置換 (μ̂ 側に適用)。
+    model.aggregate_match との違い: P の逆問題を回避して公表周辺 (性×年齢, 性×就業) を
+    π で混合再構成して直接マッチ + pretrain デコーダへの関数空間アンカー項。"""
     mga = torch.as_tensor(tgt["margin_ga"], dtype=torch.float32, device=DEVICE)  # (2,7,12,96)
     mge = torch.as_tensor(tgt["margin_ge"], dtype=torch.float32, device=DEVICE)  # (2,2,12,96)
     pi_e = torch.as_tensor(tgt["pi_e"], dtype=torch.float32, device=DEVICE)      # (2,7,2)

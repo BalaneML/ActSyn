@@ -1,0 +1,10 @@
+{
+    "typeCheckingMode": "basic",
+    "venvPath": ".",
+    "venv": ".venv",
+    "extraPaths": [
+        "src/common/aggregates",
+        "src/common/preprocess/stula",
+        "src/models/CVAE_Aggregate"
+    ]
+}

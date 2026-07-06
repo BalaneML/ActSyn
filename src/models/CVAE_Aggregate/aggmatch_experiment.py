@@ -1,18 +1,21 @@
 """
 D2-b 集計マッチ腕: セル集計のみから CVAE のデモグラ条件付けを学習する
 
+モデル・損失・学習・生成は model.py（AggCVAE / cvae_loss / train_elbo /
+aggregate_match / group_rates）に分離。このスクリプトは実験の編成・評価・出力を担当する。
+
 目的 (実験デザイン D2-b, 計画ファイル参照):
     recovery_experiment.py の線形復元をベースラインに、非線形生成器 (CVAE) の
     「集計マッチ微調整」でデモグラ条件付けを個票ラベルなしで獲得できるかを検証する。
     ATLAS のシナリオを再現: 個票スケジュールはあるがデモグラベルが無い。
     教師は セル集計 ν(g) と構成行列 P のみ。個票の群ラベルは評価にだけ使う。
 
-2段階学習:
-    Stage 1 (pretrain)  : デモグラ条件を null トークンに固定した無条件 ELBO 学習。
-                          ラベル不使用。スペック非依存なので1回だけ学習し使い回す。
-    Stage 2 (agg-match) : 群埋め込み + デコーダを、集計マッチ損失で微調整。
-                          μ̂(d) = E_z[softmax(dec(z, e_d))] (S サンプルの MC 平均; 微分可能),
-                          ν̂ = P μ̂,  loss = MSE(ν̂, ν)。個票ラベルは一切見ない。
+2段階学習 (model.py):
+    Stage 1 (train_elbo)      : デモグラ条件を null トークンに固定した無条件 ELBO 学習。
+                                ラベル不使用。スペック非依存なので1回だけ学習し使い回す。
+    Stage 2 (aggregate_match) : 群埋め込み + デコーダを、集計マッチ損失で微調整。
+                                μ̂(d) = E_z[softmax(dec(z, e_d))] (S サンプルの MC 平均; 微分可能),
+                                ν̂ = P μ̂,  loss = MSE(ν̂, ν)。個票ラベルは一切見ない。
 
 比較する腕:
     linear    : recovery_experiment.recover (lstsq) — 線形ベースライン
@@ -49,14 +52,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from scipy.spatial.distance import jensenshannon
 
 REPO_ROOT = Path(__file__).resolve().parents[3]   # src/models/CVAE_Aggregate -> repo root
 sys.path.insert(0, str(REPO_ROOT / "src" / "common" / "aggregates"))
 from shakicho_sim import CELL_SPECS, SLOT_COLS, OUT_DIR, DEFAULT_DATASET, derive_strata  # noqa: E402
 from recovery_experiment import one_hot_schedules, weighted_mean, recover  # noqa: E402
+from model import (  # noqa: E402
+    AggCVAE, train_elbo, aggregate_match, group_rates, group_rates_null,
+    sample_schedules, DEVICE, SEED, NUM_SLOTS, PRETRAIN_EPOCHS,
+)
 
 CKPT_PATH = REPO_ROOT / "outputs" / "checkpoints" / "aggmatch_pretrain.pt"
 
@@ -65,143 +70,7 @@ DEMO_COLS  = ["gender", "age_class"]   # 群 d = 性×年齢7区分 (D=14; recov
 EVAL_CELL_SPECS = ["state", "state_x_daytype", "dow_x_emp_x_sex", "daytype_x_emp"]
                                         # σ_min 良 / 最良(セル極小) / 中 / 悪 の4点
 
-NUM_SLOTS  = 96
-HIDDEN_DIM = 512
-Z_DIM      = 64
-DEMO_EMB   = 16
-BETA       = 0.5
-
-PRETRAIN_EPOCHS = 200
-BATCH_SIZE      = 1024
-LR_PRETRAIN     = 1e-3
-
-AGG_STEPS   = 600
-S_TRAIN     = 128     # Stage2 の群あたり z サンプル数 (MC平均)
-LR_EMB      = 1e-2    # 埋め込みはランダム初期化から動かすので高め
-LR_DECODER  = 3e-4
-
-EVAL_S      = 2048    # 評価時の群あたり z サンプル数
 BIGRAM_N    = 2000    # bigram 評価用の離散サンプル数/群
-SEED        = 42
-
-DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
-
-
-# ============================================================
-# モデル: 無条件 encoder + 群埋め込み条件付き decoder の CVAE
-# ============================================================
-class AggCVAE(nn.Module):
-    """demo index D が null トークン (Stage1 / ラベル無し学習用)"""
-
-    def __init__(self, n_act: int, n_demo: int):
-        super().__init__()
-        self.n_act = n_act
-        x_dim = NUM_SLOTS * n_act
-        self.encoder = nn.Sequential(
-            nn.Linear(x_dim, HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
-            nn.ReLU(),
-        )
-        self.fc_mu     = nn.Linear(HIDDEN_DIM, Z_DIM)
-        self.fc_logvar = nn.Linear(HIDDEN_DIM, Z_DIM)
-
-        self.demo_emb  = nn.Embedding(n_demo + 1, DEMO_EMB)  # +1 = null
-        self.decoder = nn.Sequential(
-            nn.Linear(Z_DIM + DEMO_EMB, HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, x_dim),
-        )
-
-    def decode_probs(self, z: torch.Tensor, demo_idx: torch.Tensor) -> torch.Tensor:
-        """(B,Z),(B,) -> スロット別活動確率 (B,96,n_act)"""
-        e = self.demo_emb(demo_idx)
-        logits = self.decoder(torch.cat([z, e], dim=1)).view(-1, NUM_SLOTS, self.n_act)
-        return F.softmax(logits, dim=-1)
-
-    def forward(self, sched: torch.Tensor, demo_idx: torch.Tensor):
-        x = F.one_hot(sched, self.n_act).float().view(sched.size(0), -1)
-        h = self.encoder(x)
-        mu, logvar = self.fc_mu(h), self.fc_logvar(h)
-        z = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
-        e = self.demo_emb(demo_idx)
-        logits = self.decoder(torch.cat([z, e], dim=1)).view(-1, NUM_SLOTS, self.n_act)
-        return logits, mu, logvar
-
-
-def elbo_loss(logits, sched, mu, logvar):
-    recon = F.cross_entropy(logits.reshape(-1, logits.size(-1)), sched.reshape(-1),
-                            reduction="sum") / sched.size(0)
-    kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / sched.size(0)
-    return recon + BETA * kl
-
-
-def train_elbo(model: AggCVAE, S_t: torch.Tensor, demo_t: torch.Tensor, w: np.ndarray,
-               epochs: int, tag: str):
-    """重み付きサンプラで ELBO 学習 (demo_t = null で無条件 / 真ラベルで skyline)"""
-    opt = torch.optim.Adam(model.parameters(), lr=LR_PRETRAIN)
-    n = len(S_t)
-    prob = torch.as_tensor(w / w.sum())
-    for ep in range(1, epochs + 1):
-        idx = torch.multinomial(prob, n, replacement=True)
-        model.train()
-        ep_loss = 0.0
-        for b in range(0, n, BATCH_SIZE):
-            bi = idx[b:b + BATCH_SIZE]
-            sched, demo = S_t[bi].to(DEVICE), demo_t[bi].to(DEVICE)
-            logits, mu, logvar = model(sched, demo)
-            loss = elbo_loss(logits, sched, mu, logvar)
-            opt.zero_grad(); loss.backward(); opt.step()
-            ep_loss += loss.item() * len(bi)
-        if ep % 50 == 0 or ep == 1:
-            print(f"  [{tag}] epoch {ep:3d}  loss {ep_loss / n:8.3f}")
-
-
-@torch.no_grad()
-def group_rates(model: AggCVAE, n_demo: int, n_samples: int = EVAL_S) -> np.ndarray:
-    """μ̂(d): 群ごとの期待スロット別活動確率 (D, 96*n_act)。離散化せず確率の平均。"""
-    model.eval()
-    out = []
-    for d in range(n_demo):
-        z = torch.randn(n_samples, Z_DIM, device=DEVICE)
-        di = torch.full((n_samples,), d, dtype=torch.long, device=DEVICE)
-        probs = model.decode_probs(z, di).mean(dim=0)         # (96, n_act)
-        out.append(probs.T.reshape(-1).cpu().numpy())          # act-major (a*96+t) に転置
-    return np.stack(out)
-
-
-@torch.no_grad()
-def sample_schedules(model: AggCVAE, d: int, n: int) -> np.ndarray:
-    """群 d の離散スケジュール (n,96) をスロット別カテゴリカルサンプリングで生成"""
-    model.eval()
-    z = torch.randn(n, Z_DIM, device=DEVICE)
-    di = torch.full((n,), d, dtype=torch.long, device=DEVICE)
-    probs = model.decode_probs(z, di)
-    return torch.distributions.Categorical(probs=probs).sample().cpu().numpy()
-
-
-def aggregate_match(model: AggCVAE, P: np.ndarray, nu: np.ndarray, n_act: int, tag: str):
-    """Stage 2: 群埋め込み+デコーダを集計マッチ損失で微調整 (個票ラベル不使用)"""
-    P_t  = torch.as_tensor(P, dtype=torch.float32, device=DEVICE)
-    nu_t = torch.as_tensor(nu, dtype=torch.float32, device=DEVICE).view(len(nu), n_act, NUM_SLOTS)
-    D = P.shape[1]
-    opt = torch.optim.Adam([
-        {"params": model.demo_emb.parameters(), "lr": LR_EMB},
-        {"params": model.decoder.parameters(),  "lr": LR_DECODER},
-    ])
-    model.train()
-    for step in range(1, AGG_STEPS + 1):
-        z  = torch.randn(D * S_TRAIN, Z_DIM, device=DEVICE)
-        di = torch.arange(D, device=DEVICE).repeat_interleave(S_TRAIN)
-        probs = model.decode_probs(z, di).view(D, S_TRAIN, NUM_SLOTS, model.n_act)
-        mu_hat = probs.mean(dim=1).permute(0, 2, 1)            # (D, n_act, 96)
-        nu_hat = torch.einsum("gd,daf->gaf", P_t, mu_hat)      # (G, n_act, 96)
-        loss = F.mse_loss(nu_hat, nu_t)
-        opt.zero_grad(); loss.backward(); opt.step()
-        if step % 200 == 0 or step == 1:
-            print(f"  [{tag}] step {step:4d}  agg-mse {loss.item():.6f}")
 
 
 def bigram_dist(scheds: np.ndarray, n_act: int, w: np.ndarray | None = None) -> np.ndarray:
@@ -236,7 +105,7 @@ def main():
     demo_key  = df[DEMO_COLS].astype(str).agg("_".join, axis=1)
     demo_cats = sorted(demo_key.unique())
     D = len(demo_cats)
-    demo_of   = demo_key.map({d: i for i, d in enumerate(demo_cats)}).to_numpy()
+    demo_of   = demo_key.map({d: i for i, d in enumerate(demo_cats)}).to_numpy()  # type: ignore
     demo_idx  = {i: np.flatnonzero(demo_of == i) for i in range(D)}
     mu_star   = np.stack([weighted_mean(X, w, demo_idx[i]) for i in range(D)])
     bigram_star = [bigram_dist(S_np[demo_idx[i]], n_act, w[demo_idx[i]]) for i in range(D)]
@@ -254,22 +123,13 @@ def main():
         if cond:
             mu_hat = group_rates(model, D)
         else:
-            mu_hat = np.repeat(group_rates_null(model), D, axis=0)
+            mu_hat = np.repeat(group_rates_null(model, D), D, axis=0)
         rmse, dev = rate_and_dev_rmse(mu_hat)
         jsds = [jensenshannon(bigram_dist(sample_schedules(model, i if cond else D, BIGRAM_N),
                                           n_act),
                               bigram_star[i], base=2) ** 2
                 for i in range(D)]
         return rmse, dev, float(np.mean(jsds))
-
-    @torch.no_grad()
-    def group_rates_null(model: AggCVAE) -> np.ndarray:
-        """null トークン (index D) での期待行動者率 (1, F)"""
-        model.eval()
-        z = torch.randn(EVAL_S, Z_DIM, device=DEVICE)
-        di = torch.full((EVAL_S,), D, dtype=torch.long, device=DEVICE)
-        probs = model.decode_probs(z, di).mean(dim=0)
-        return probs.T.reshape(1, -1).cpu().numpy()
 
     # --- Stage 1: 無条件 pretrain (スペック非依存; 1回だけ) ---
     null_t = torch.full((len(df),), D, dtype=torch.long)
