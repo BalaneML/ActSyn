@@ -28,7 +28,7 @@
 
 使い方:
     - main(): クロスウォーク表CSVを出力し、ATUS 96スロットデータセットを共通12分類へ写像
-      (atus2024_common12_dataset.csv; degrade_triplike.py の出力パターン踏襲)
+      (atus2024_common12_dataset.csv; T と同一フォーマット)
     - stula_to_common(df): parse_timeband.py の wide 出力の行動20分類を共通12分類へ集約
       (行動者率は主行動で排他的なので率の単純和が共通分類の率になる)
 """

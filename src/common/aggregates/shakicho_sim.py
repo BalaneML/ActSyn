@@ -138,7 +138,7 @@ def constitution_matrix(df: pd.DataFrame, cell_cols: list[str], demo_cols: list[
 def main():
     ap = argparse.ArgumentParser(description="社基調時間帯編スタイル集計 + σ_min(P) 診断")
     ap.add_argument("--dataset", type=Path, default=DEFAULT_DATASET,
-                    help="processed dataset CSV (T / triplike18 / nhts10)")
+                    help="processed dataset CSV")
     args = ap.parse_args()
 
     df = pd.read_csv(args.dataset)

@@ -48,7 +48,7 @@ ATUS生データ(time-use diary) -> 活動スケジュール(96スロット) + �
         (TUCASEID, TUACTIVITY_N, start_min, stop_min, duration_min, tier1, tier2, tewhere, act_idx, trcode)
         (start/stop_min は 04:00 起点の経過分。tier-50 処理「前」の生データ)
 
-場所コード TEWHERE (劣化パイプライン degrade_triplike.py で使用):
+場所コード TEWHERE (episodes 出力に保持; 連続表現・将来用途):
     -1 = 非収集 (personal care=tier01 は場所を尋ねない仕様。実データで tier01/50 のみ)
     1  = 自宅・庭
     2..11, 30..89 = 職場・他人の家・店舗など自宅外
@@ -114,11 +114,7 @@ TIER1_TO_IDX = {t: i for i, t in enumerate(list(range(1, 17)) + [18])}  # {1:0,.
 # スケジュール構築
 # ==================================================================
 def clean_tier1(dur: np.ndarray, tier1: np.ndarray) -> tuple[np.ndarray | None, str | None]:
-    """diary単位のクレンジング -> (tier1修正版 or None, 除外reason or None)
-
-    T(time-use版)と T'(擬似trip版, degrade_triplike.py)で同一の採否判定を共有し、
-    両データセットの diary 集合を厳密に一致させる (D1-a のペア比較の前提)。
-    """
+    """diary単位のクレンジング -> (tier1修正版 or None, 除外reason or None)"""
     # 24h丸め後の合計が1日に一致しない diary は除外
     if dur.sum() != DAY_MIN:
         return None, "duration_sum_mismatch"
@@ -210,7 +206,7 @@ def build_episodes(act: pd.DataFrame) -> pd.DataFrame:
 
 
 # ==================================================================
-# 読み込み・条件結合 (degrade_triplike.py と共有)
+# 読み込み・条件結合
 # ==================================================================
 def load_activity() -> pd.DataFrame:
     """Activity file を (TUCASEID, TUACTIVITY_N) 順で読む"""
@@ -219,7 +215,7 @@ def load_activity() -> pd.DataFrame:
     return act.sort_values(["TUCASEID", "TUACTIVITY_N"])
 
 
-# 統合CSVに書き出す条件・重み列 (degrade_triplike.py と共有)
+# 統合CSVに書き出す条件・重み列
 COND_COLS = ["TUCASEID", "TUFINLWGT", "age", "gender", "day_of_week", "telfs",
              "region", "state_fips", "metro"]
 
