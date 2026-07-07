@@ -23,6 +23,7 @@ model_configs/*
 
 # md
 NOTE.md
+docs/*
 
 # wandb
 wandb/

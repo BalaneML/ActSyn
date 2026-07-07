@@ -4,18 +4,18 @@ model.py
 集計マッチ学習のための CVAE（AggCVAE）
 
 CVAE / CVAE_Embedding との差分（★が本モデルの新規部分）:
-    - encoder      : ★無条件（条件を入力しない）。個票にデモグラベルが無い設定のため。
+    - encoder      : ★無条件（条件を入力しない）。個票にデモグラベルが無い設定のため
     - decoder 条件 : ★単一の群インデックス d を nn.Embedding で埋め込み
-                     （CVAE の one-hot 連結 / CVAE_Embedding の5属性 Embedding に対応）。
-                     ★埋め込みは null トークン（index = n_demo）を1つ持ち、
-                     Stage1 のラベル無し学習では全個票を null に固定する。
-    - 損失         : cvae_loss は CVAE と同一（96スロット cross-entropy + β*KL）。
-    - 学習         : ★2段階。
-                     Stage 1 (train_elbo)      : ELBO 学習（null 固定=無条件 / 真ラベル=skyline）。
-                     Stage 2 (aggregate_match) : 群埋め込み+デコーダのみを集計マッチ損失
-                                                 MSE(P μ̂, ν) で微調整。個票ラベル不使用。
-    - 生成         : 群レベルの期待行動者率 μ̂(d)（group_rates）が主目的。
-                     個票サンプリングは sample_schedules（CVAE の generate に対応）。
+                    （CVAE の one-hot 連結 / CVAE_Embedding の5属性 Embedding に対応）
+                    ★埋め込みは null トークン（index = n_demo）を1つ持ち、
+                    Stage1 のラベル無し学習では全個票を null に固定する
+    - 損失         : cvae_loss は CVAE と同一（96スロット cross-entropy + β*KL）
+    - 学習         : ★2段階
+                    Stage 1 (train_elbo)      : ELBO 学習（null 固定=無条件 / 真ラベル=skyline）
+                    Stage 2 (aggregate_match) : 群埋め込み+デコーダのみを集計マッチ損失
+                                                MSE(P μ̂, ν) で微調整。個票ラベル不使用
+    - 生成         : 群レベルの期待行動者率 μ̂(d)（group_rates）が主目的
+                    個票サンプリングは sample_schedules（CVAE の generate に対応）
 
 このファイルは単体実行しない（データ読み込みは実験ごとに異なるため実験スクリプトが担当）:
     uv run python src/models/CVAE_Aggregate/aggmatch_experiment.py    (D2-b シミュレーション)
@@ -30,14 +30,12 @@ import torch.nn.functional as F
 # ============================================================
 # 1. 設定（ハイパーパラメータ）
 # ============================================================
-# データ・チェックポイントのパスは実験スクリプト側で持つ（このモデルはデータセット非依存）
-
 # 活動スケジュール
-NUM_SLOTS   = 96      # 15分刻み × 96 = 24時間
 # 活動状態数 n_act と群数 n_demo はデータセット依存のため AggCVAE のコンストラクタ引数
+NUM_SLOTS   = 96      # 15分刻み × 96 = 24時間
 
 # モデル
-HIDDEN_DIM  = 512
+HIDDEN_DIM  = 512  
 Z_DIM       = 64
 DEMO_EMB    = 16      # ★群埋め込みの次元（CVAE_Embedding の COND_EMB_DIM に対応）
 BETA        = 0.5
@@ -65,22 +63,30 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_availabl
 # （CVAE/model.py の load_data / ScheduleDataset に相当する処理がここに無いのは意図的）:
 #   - aggmatch_experiment.py : shakicho_sim.derive_strata による疑似層別データ
 #   - japan_match_experiment.py : ATUS 共通12分類データ + 社基調公表集計
-# モデルは活動状態数 n_act・群数 n_demo をコンストラクタで受けるデータセット非依存設計。
+# モデルは活動状態数 n_act・群数 n_demo をコンストラクタで受けるデータセット非依存設計
 
 
 # ============================================================
 # 3. モデル（AggCVAE: 無条件 encoder + 群埋め込み条件付き decoder）
 # ============================================================
 class AggCVAE(nn.Module):
-    """demo index が null トークン (index = n_demo) のとき無条件（Stage1 / ラベル無し学習用）"""
+    """Aggregate Conditional VAE
+    args:
+        n_act : 活動数
+        n_demo: 群数 + 1ダミー (例: 年齢7層 × 性別2 -> n_demo = 14 + 1 = 15)
+                demo index が null の時，無条件を意味する (ラベルなし学習用)
+                Decoderは条件 (群埋め込み) を入力に取る設計 
+                    -> 余分に確保した15番目を「無条件条件」として入力する
+
+    """
 
     def __init__(self, n_act: int, n_demo: int):
         super().__init__()
         self.n_act = n_act
         x_dim = NUM_SLOTS * n_act
 
-        # encoder: x_onehot(96*n_act) -> hidden -> (mu, logvar)
         # ★CVAE との差分: 条件を入力しない（個票にデモグラベルが無い設定）
+        # EN: x_onehot(96*n_act) -> hidden -> (mu, logvar)
         self.encoder = nn.Sequential(
             nn.Linear(x_dim, HIDDEN_DIM),
             nn.ReLU(),
@@ -115,7 +121,7 @@ class AggCVAE(nn.Module):
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         std = torch.exp(0.5 * logvar)  # logσ² → σ
         eps = torch.randn_like(std)    # N(0, I) からサンプリング（ε ～ N(0, I)）
-        return mu + eps * std          # z = μ + σ·ε
+        return mu + eps * std          # z = μ + ε·σ
 
     # デコーダー（e は埋め込み済み群ベクトル）
     def decode(self, z: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
@@ -123,28 +129,59 @@ class AggCVAE(nn.Module):
         return logits.view(-1, NUM_SLOTS, self.n_act)    # (B, 96, n_act)
 
     def decode_probs(self, z: torch.Tensor, demo_idx: torch.Tensor) -> torch.Tensor:
-        """(B,Z),(B,) -> スロット別活動確率 (B,96,n_act)"""
+        """各スロットにおける活動カテゴリの確率分布を計算する
+        (B,Z),(B,) -> スロット別活動確率 (B,96,n_act)
+        """
         logits = self.decode(z, self.embed_demo(demo_idx))
         return F.softmax(logits, dim=-1)
 
     def forward(self, sched: torch.Tensor, demo_idx: torch.Tensor):
-        x_onehot = F.one_hot(sched, self.n_act).float().view(sched.size(0), -1)
-        mu, logvar = self.encode(x_onehot)          # encoder input: [act] のみ（★条件なし）
-        z = self.reparameterize(mu, logvar)
-        logits = self.decode(z, self.embed_demo(demo_idx))  # decoder input: [z, demo_emb]
+        x_onehot = F.one_hot(sched, self.n_act).float().view(sched.size(0), -1)  # 活動系列をonehot化
+        mu, logvar = self.encode(x_onehot)  # encoder: [x_onehot(96*n_act)] -> [μ(64)], [logσ^2(64)
+        z = self.reparameterize(mu, logvar)  # 再構成トリック
+        logits = self.decode(z, self.embed_demo(demo_idx))  # decoder: [z, demo_emb] -> [96, n_act]
         return logits, mu, logvar
+
+
+# ============================================================
+# 3.5 微分可能な系列統計量（提案①: 複数統計量教師; docs/proposals.md）
+# ============================================================
+def participation_probs(probs: torch.Tensor) -> torch.Tensor:
+    """日次参加率 P(いずれかのスロットで活動a | z) = 1 − Π_t (1 − p_t(a))
+
+    z 条件付きでスロット独立（decode_probs のカテゴリカル仮定）の下での閉形式。
+    時刻別行動者率（1次周辺）からは導出できない、エピソードの個人内集中度を
+    拘束する統計量。積は log1p の和で数値安定に計算する。
+
+    probs: (..., NUM_SLOTS, n_act) -> (..., n_act)
+    """
+    log_none = torch.log1p(-probs.clamp(max=1.0 - 1e-6)).sum(dim=-2)
+    return 1.0 - torch.exp(log_none)
 
 
 # ============================================================
 # 4. 損失
 # ============================================================
-def cvae_loss(logits: torch.Tensor, sched: torch.Tensor, mu: torch.Tensor,
-              logvar: torch.Tensor, beta: float = BETA) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # 再構成: 96スロットの cross-entropy（1サンプルあたり96スロット合計、バッチ平均）
+def cvae_loss( logits: torch.Tensor,
+                sched: torch.Tensor,
+                mu: torch.Tensor,
+                logvar: torch.Tensor, 
+                beta: float = BETA
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    '''
+    再構成: 
+        96スロットの cross-entropy（1サンプルあたり96スロット合計、バッチ平均）
+        logits: デコーダ出力
+        sched : 正解
+    '''
     recon = F.cross_entropy(
         logits.reshape(-1, logits.size(-1)), sched.reshape(-1), reduction="sum"
     ) / sched.size(0)
-    # 正則化: KL( q(z|x) || N(0,I) )（バッチ平均）
+
+    '''
+    正則化: 
+        KL( q(z|x) || N(0,I) )（バッチ平均）
+    '''
     kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / sched.size(0)
     return recon + beta * kl, recon, kl
 
@@ -152,10 +189,25 @@ def cvae_loss(logits: torch.Tensor, sched: torch.Tensor, mu: torch.Tensor,
 # ============================================================
 # 5. 学習
 # ============================================================
-def train_elbo(model: AggCVAE, S_t: torch.Tensor, demo_t: torch.Tensor,
-               w: npt.NDArray[np.float64], epochs: int, tag: str) -> None:
-    """Stage 1: 重み付きサンプラで ELBO 学習（CVAE の train() に対応）。
-    demo_t = null トークンで無条件 pretrain / 真ラベルで skyline。"""
+def train_elbo( model : AggCVAE,
+                S_t   : torch.Tensor,
+                demo_t: torch.Tensor,
+                w     : npt.NDArray[np.float64],
+                epochs: int,
+                tag   : str
+                ) -> None:
+    """
+    Stage 1: 重み付きサンプラで ELBO 学習（CVAE の train() に対応）
+    demo_t = null トークンで無条件 pretrain / 真ラベルで skyline (天井性能)
+
+    args:
+        model : AggCVAE
+        S_t   : 個票のスケジュール系列 (N, NUM_SLOTS)
+        demo_t: 各個票に紐づく群インデックス (N,) / 無条件null or 群条件
+        w     : サンプル重み (N,)
+        epochs: 学習エポック数
+        tag   : ログ出力用
+    """
     opt = torch.optim.Adam(model.parameters(), lr=LR_PRETRAIN)
     n = len(S_t)
     prob = torch.as_tensor(w / w.sum())
@@ -168,33 +220,63 @@ def train_elbo(model: AggCVAE, S_t: torch.Tensor, demo_t: torch.Tensor,
             sched, demo = S_t[bi].to(DEVICE), demo_t[bi].to(DEVICE)
             logits, mu, logvar = model(sched, demo)
             loss, _, _ = cvae_loss(logits, sched, mu, logvar)
-            opt.zero_grad(); loss.backward(); opt.step()
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
             ep_loss += loss.item() * len(bi)
         if ep % 50 == 0 or ep == 1:
             print(f"  [{tag}] epoch {ep:3d}  loss {ep_loss / n:8.3f}")
 
 
-def aggregate_match(model: AggCVAE, P: npt.NDArray[np.float64],
-                    nu: npt.NDArray[np.float64], n_act: int, tag: str) -> None:
-    """★Stage 2（CVAE に無い新規部分）: 群埋め込み+デコーダを集計マッチ損失で微調整。
+def aggregate_match(model: AggCVAE,
+                    P      : npt.NDArray[np.float64],
+                    nu     : npt.NDArray[np.float64],
+                    n_act  : int,
+                    tag    : str,
+                    part_nu: npt.NDArray[np.float64] | None = None,
+                    part_w : float = 0.0,
+                    steps  : int = AGG_STEPS
+                    ) -> None:
+    """
+    ★Stage 2（CVAE に無い新規部分）: 群埋め込み+デコーダを集計マッチ損失で微調整
     μ̂(d) = E_z[softmax(dec(z, e_d))]（S_TRAIN サンプルの MC 平均; 微分可能）,
-    ν̂ = P μ̂,  loss = MSE(ν̂, ν)。個票の群ラベルは一切見ない。"""
+    ν̂ = P μ̂,  loss = MSE(ν̂, ν)。個票の群ラベルは一切見ない
+
+    args:
+        model  : AggCVAE
+        P      : 構成行列[セルg, 群d]，セルgの人口のうち，群dの人が占める割合，各行の和=1
+        nu     : 複数のセルgの人たちを平均した時刻別行動者率ベクトル
+        n_act  : 活動の種類数
+        tag    : ログ出力用
+        part_nu: セル別・活動別の日次参加率 (G, n_act)。生活時間編「行動者率」に対応
+                （提案①: 参加率は個人指示関数の期待値なのでセル集約が線形 ν_part = P·part(d)）
+        part_w : 参加率マッチ項の重み。0 なら従来の周辺マッチのみ（既存呼び出しは不変）
+        steps  : マッチ反復数（既定 AGG_STEPS）
+    """
     P_t  = torch.as_tensor(P, dtype=torch.float32, device=DEVICE)
     nu_t = torch.as_tensor(nu, dtype=torch.float32, device=DEVICE).view(len(nu), n_act, NUM_SLOTS)
+    part_t = None
+    if part_nu is not None and part_w > 0:
+        part_t = torch.as_tensor(part_nu, dtype=torch.float32, device=DEVICE)  # (G, n_act)
     D = P.shape[1]
     opt = torch.optim.Adam([
         {"params": model.demo_emb.parameters(), "lr": LR_EMB},
         {"params": model.decoder.parameters(),  "lr": LR_DECODER},
     ])
     model.train()
-    for step in range(1, AGG_STEPS + 1):
+    for step in range(1, steps + 1):
         z  = torch.randn(D * S_TRAIN, Z_DIM, device=DEVICE)
         di = torch.arange(D, device=DEVICE).repeat_interleave(S_TRAIN)
         probs = model.decode_probs(z, di).view(D, S_TRAIN, NUM_SLOTS, model.n_act)
         mu_hat = probs.mean(dim=1).permute(0, 2, 1)            # (D, n_act, 96)
         nu_hat = torch.einsum("gd,daf->gaf", P_t, mu_hat)      # (G, n_act, 96)
         loss = F.mse_loss(nu_hat, nu_t)
-        opt.zero_grad(); loss.backward(); opt.step()
+        if part_t is not None:
+            part_hat = participation_probs(probs).mean(dim=1)  # (D, n_act)
+            loss = loss + part_w * F.mse_loss(P_t @ part_hat, part_t)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
         if step % 200 == 0 or step == 1:
             print(f"  [{tag}] step {step:4d}  agg-mse {loss.item():.6f}")
 
@@ -223,6 +305,27 @@ def group_rates_null(model: AggCVAE, n_demo: int, n_samples: int = EVAL_S) -> np
     di = torch.full((n_samples,), n_demo, dtype=torch.long, device=DEVICE)
     probs = model.decode_probs(z, di).mean(dim=0)
     return probs.T.reshape(1, -1).cpu().numpy()
+
+
+@torch.no_grad()
+def group_participation(model: AggCVAE, n_demo: int,
+                        n_samples: int = EVAL_S) -> tuple[np.ndarray, np.ndarray]:
+    """群ごとの (日次参加率 (D, n_act), 行動者平均スロット数 (D, n_act))。
+
+    行動者平均継続時間は恒等式 E[スロット数] = E[スロット数 | 参加]·P(参加) より
+    dur = E_z[Σ_t p_t] / E_z[1 − Π_t(1 − p_t)] で計算（×15分で分に換算可能）。
+    """
+    model.eval()
+    parts, durs = [], []
+    for d in range(n_demo):
+        z = torch.randn(n_samples, Z_DIM, device=DEVICE)
+        di = torch.full((n_samples,), d, dtype=torch.long, device=DEVICE)
+        probs = model.decode_probs(z, di)                      # (n, 96, n_act)
+        part = participation_probs(probs).mean(dim=0)          # (n_act,)
+        tot  = probs.sum(dim=-2).mean(dim=0)                   # 期待スロット数 (n_act,)
+        parts.append(part.cpu().numpy())
+        durs.append((tot / part.clamp(min=1e-6)).cpu().numpy())
+    return np.stack(parts), np.stack(durs)
 
 
 @torch.no_grad()
