@@ -32,3 +32,6 @@ wandb/
 .claude/*
 CLAUDE.md
 CLAUDE_EXPERIMENT.md
+
+# generated
+slides/
