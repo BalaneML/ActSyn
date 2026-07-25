@@ -4,18 +4,17 @@ model.py
 集計マッチ学習のための CVAE（AggCVAE）
 
 CVAE / CVAE_Embedding との差分（★が本モデルの新規部分）:
-    - encoder      : ★無条件（条件を入力しない）。個票にデモグラベルが無い設定のため
-    - decoder 条件 : ★単一の群インデックス d を nn.Embedding で埋め込み
-                    （CVAE の one-hot 連結 / CVAE_Embedding の5属性 Embedding に対応）
-                    ★埋め込みは null トークン（index = n_demo）を1つ持ち、
+    - encoder     : ★無条件; 個票にデモグラベルが無い設定のため
+    - decoder     : ★単一の群インデックス d を nn.Embedding で埋め込み
+                    ★埋め込みは null トークンを1つ持ち、
                     Stage1 のラベル無し学習では全個票を null に固定する
     - 損失         : cvae_loss は CVAE と同一（96スロット cross-entropy + β*KL）
     - 学習         : ★2段階
                     Stage 1 (train_elbo)      : ELBO 学習（null 固定=無条件 / 真ラベル=skyline）
                     Stage 2 (aggregate_match) : 群埋め込み+デコーダのみを集計マッチ損失
-                                                MSE(P μ̂, ν) で微調整。個票ラベル不使用
+                                                MSE(P μ̂, ν) で微調整; 個票ラベル不使用
     - 生成         : 群レベルの期待行動者率 μ̂(d)（group_rates）が主目的
-                    個票サンプリングは sample_schedules（CVAE の generate に対応）
+                    個票サンプリングは sample_schedules
 
 このファイルは単体実行しない（データ読み込みは実験ごとに異なるため実験スクリプトが担当）:
     uv run python src/models/CVAE_Aggregate/aggmatch_experiment.py    (D2-b シミュレーション)
@@ -36,8 +35,8 @@ NUM_SLOTS   = 96      # 15分刻み × 96 = 24時間
 
 # モデル
 HIDDEN_DIM  = 512  
-Z_DIM       = 64
-DEMO_EMB    = 16      # ★群埋め込みの次元（CVAE_Embedding の COND_EMB_DIM に対応）
+Z_DIM       = 64      
+DEMO_EMB    = 16      # ★群埋め込みの次元
 BETA        = 0.5
 
 # Stage 1: ELBO 学習（pretrain / skyline）
@@ -77,7 +76,6 @@ class AggCVAE(nn.Module):
                 demo index が null の時，無条件を意味する (ラベルなし学習用)
                 Decoderは条件 (群埋め込み) を入力に取る設計 
                     -> 余分に確保した15番目を「無条件条件」として入力する
-
     """
 
     def __init__(self, n_act: int, n_demo: int):
@@ -85,8 +83,8 @@ class AggCVAE(nn.Module):
         self.n_act = n_act
         x_dim = NUM_SLOTS * n_act
 
-        # ★CVAE との差分: 条件を入力しない（個票にデモグラベルが無い設定）
-        # EN: x_onehot(96*n_act) -> hidden -> (mu, logvar)
+        # ★CVAE との差分: 条件を入力しない
+        # ENCODER: x_onehot(96*n_act) -> hidden -> (mu, logvar)
         self.encoder = nn.Sequential(
             nn.Linear(x_dim, HIDDEN_DIM),
             nn.ReLU(),
@@ -96,7 +94,12 @@ class AggCVAE(nn.Module):
         self.fc_mu     = nn.Linear(HIDDEN_DIM, Z_DIM)  # μ
         self.fc_logvar = nn.Linear(HIDDEN_DIM, Z_DIM)  # logσ^2
 
-        # ★CVAE との差分: 群埋め込み（+1 = null トークン）
+        # ★CVAE との差分: 群埋め込み（+1 = null トークン; ガイド §2.2）
+        # 埋め込みテーブルの構造:
+        #   行 0..n_demo-1 : 実在する群（性2×年齢7×就業2 = 28群）
+        #   行 n_demo      : null トークン =「条件なし」を表す特別な群
+        #                    Stage1 では全個票の条件をこの行に固定することで、
+        #                    実質無条件の生成器として学習する
         self.demo_emb  = nn.Embedding(n_demo + 1, DEMO_EMB)
 
         # decoder: [z(64) + demo_emb(16)] -> hidden -> 96*n_act ロジット
@@ -108,11 +111,11 @@ class AggCVAE(nn.Module):
             nn.Linear(HIDDEN_DIM, x_dim),
         )
 
-    # 群インデックス (B,) -> 埋め込み (B, DEMO_EMB)（CVAE_Embedding の embed_cond に対応）
+    # 群インデックス (B,) -> 埋め込み (B, DEMO_EMB)
     def embed_demo(self, demo_idx: torch.Tensor) -> torch.Tensor:
         return self.demo_emb(demo_idx)
 
-    # エンコーダー（★条件なし）
+    # エンコーダー q( z | x )
     def encode(self, x_onehot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.encoder(x_onehot)               # [x_onehot(96*n_act)] -> [h(512)]
         return self.fc_mu(h), self.fc_logvar(h)  # [h(512)] -> [μ(64)], [logσ^2(64)]
@@ -123,7 +126,7 @@ class AggCVAE(nn.Module):
         eps = torch.randn_like(std)    # N(0, I) からサンプリング（ε ～ N(0, I)）
         return mu + eps * std          # z = μ + ε·σ
 
-    # デコーダー（e は埋め込み済み群ベクトル）
+    # デコーダー（e は埋め込み済み群ベクトル） p( x | z, e )
     def decode(self, z: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
         logits = self.decoder(torch.cat([z, e], dim=1))  # [z(64) + demo_emb(16)] -> [logits(96*n_act)]
         return logits.view(-1, NUM_SLOTS, self.n_act)    # (B, 96, n_act)
@@ -155,8 +158,12 @@ def participation_probs(probs: torch.Tensor) -> torch.Tensor:
 
     probs: (..., NUM_SLOTS, n_act) -> (..., n_act)
     """
+    # log Π_t(1−p_t) = Σ_t log(1−p_t) の形で計算する（ガイド §5）:
+    #   ・1未満の数を96個直接掛けるとアンダーフローするので log の和にする
+    #   ・log(1-p) でなく log1p(-p) を使うのは p が小さいときの桁落ち防止
+    #   ・clamp は p_t=1 ちょうどのとき log(0)=−∞ になるのを回避
     log_none = torch.log1p(-probs.clamp(max=1.0 - 1e-6)).sum(dim=-2)
-    return 1.0 - torch.exp(log_none)
+    return 1.0 - torch.exp(log_none)  # 余事象: 1 −「全スロットで活動 a をしない確率」
 
 
 # ============================================================
@@ -169,11 +176,15 @@ def cvae_loss( logits: torch.Tensor,
                 beta: float = BETA
             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     '''
-    再構成: 
+    再構成:
         96スロットの cross-entropy（1サンプルあたり96スロット合計、バッチ平均）
         logits: デコーダ出力
         sched : 正解
     '''
+    # reduction="sum" で全サンプル×全スロットの CE を合計してから
+    # sched.size(0)（バッチ人数）で割る =「1人あたり96スロット分の合計CE」。
+    # スロット平均（さらに /96）にしないのは、KL とのスケール比（β の意味）を
+    # ELBO の定義 log p(x|z) = Σ_t log p(x_t|z) のまま保つため
     recon = F.cross_entropy(
         logits.reshape(-1, logits.size(-1)), sched.reshape(-1), reduction="sum"
     ) / sched.size(0)
@@ -210,8 +221,10 @@ def train_elbo( model : AggCVAE,
     """
     opt = torch.optim.Adam(model.parameters(), lr=LR_PRETRAIN)
     n = len(S_t)
-    prob = torch.as_tensor(w / w.sum())
+    prob = torch.as_tensor(w / w.sum())  # 調査ウェイト w を選択確率に正規化
     for ep in range(1, epochs + 1):
+        # 重み付き復元抽出で毎エポック n 本を引き直す（weighted bootstrap）。
+        # ウェイトの大きい個票ほど頻繁に提示される = 重み付き ELBO の近似
         idx = torch.multinomial(prob, n, replacement=True)
         model.train()
         ep_loss = 0.0
@@ -259,19 +272,31 @@ def aggregate_match(model: AggCVAE,
     if part_nu is not None and part_w > 0:
         part_t = torch.as_tensor(part_nu, dtype=torch.float32, device=DEVICE)  # (G, n_act)
     D = P.shape[1]
+    # ★encoder は optimizer に渡さない（凍結相当）。学習するのは以下の2つだけ:
+    #   demo_emb : ランダム初期化のまま Stage1 を素通りしている（null しか使われて
+    #              いない）ので、ゼロから大きく動かす必要がある → 高めの LR
+    #   decoder  : Stage1 で覚えた「スケジュールらしさ」を壊さない程度の微調整 → 低め LR
     opt = torch.optim.Adam([
         {"params": model.demo_emb.parameters(), "lr": LR_EMB},
         {"params": model.decoder.parameters(),  "lr": LR_DECODER},
     ])
     model.train()
     for step in range(1, steps + 1):
+        # z を事前分布 N(0,I) から全群まとめて D*S_TRAIN 本引く (D*S, 64)。
+        # z はパラメータに依存しないので再パラメータ化トリックは不要（Stage1 との違い）
         z  = torch.randn(D * S_TRAIN, Z_DIM, device=DEVICE)
+        # di = [0,0,...,0, 1,1,...,1, ...] 各群 S_TRAIN 本ずつの群番号 (D*S,)
         di = torch.arange(D, device=DEVICE).repeat_interleave(S_TRAIN)
+        # 群×サンプル別のスロット活動確率 (D, S, 96, n_act)
         probs = model.decode_probs(z, di).view(D, S_TRAIN, NUM_SLOTS, model.n_act)
-        mu_hat = probs.mean(dim=1).permute(0, 2, 1)            # (D, n_act, 96)
+        # S 本の MC 平均 = μ̂(d)。離散サンプリングせず「確率のまま」平均するので
+        # 勾配が softmax → decoder → 群埋め込みへ素直に流れる（微分可能性の核心）
+        mu_hat = probs.mean(dim=1).permute(0, 2, 1)            # (D, n_act, 96) 教師の act-major 並びに転置
+        # ν̂(g) = Σ_d P[g,d]·μ̂(d) セルごとの群加重平均（g=セル d=群 a=活動 f=時刻スロット）
         nu_hat = torch.einsum("gd,daf->gaf", P_t, mu_hat)      # (G, n_act, 96)
         loss = F.mse_loss(nu_hat, nu_t)
         if part_t is not None:
+            # 参加率も個人指示関数の期待値なのでセル集約が線形 → 同じ P がそのまま使える
             part_hat = participation_probs(probs).mean(dim=1)  # (D, n_act)
             loss = loss + part_w * F.mse_loss(P_t @ part_hat, part_t)
         opt.zero_grad()
@@ -321,9 +346,11 @@ def group_participation(model: AggCVAE, n_demo: int,
         z = torch.randn(n_samples, Z_DIM, device=DEVICE)
         di = torch.full((n_samples,), d, dtype=torch.long, device=DEVICE)
         probs = model.decode_probs(z, di)                      # (n, 96, n_act)
-        part = participation_probs(probs).mean(dim=0)          # (n_act,)
-        tot  = probs.sum(dim=-2).mean(dim=0)                   # 期待スロット数 (n_act,)
+        part = participation_probs(probs).mean(dim=0)          # 日次参加率 P(参加) (n_act,)
+        tot  = probs.sum(dim=-2).mean(dim=0)                   # 1人あたり期待スロット数 E[数] (n_act,)
         parts.append(part.cpu().numpy())
+        # 恒等式 E[数] = E[数|参加]·P(参加) の変形: E[数]/P(参加) =「参加した人だけ」の
+        # 平均スロット数。clamp は参加率ほぼ0の活動でのゼロ除算防止
         durs.append((tot / part.clamp(min=1e-6)).cpu().numpy())
     return np.stack(parts), np.stack(durs)
 

@@ -1,39 +1,45 @@
 """
-実転移腕: ATUS(米)条件付きpretrain → 社会生活基本調査(実公表集計)への集計マッチ転移
+実転移: ATUS(米)条件付きpretrain → 社会生活基本調査(実公表集計，日)への集計マッチ転移
 
-目的 (計画ファイル ステップ5-6):
+目的:
     日本個票なしで、実公表集計だけからデモグラ条件付き日本活動スケジュール生成を学習し、
     教師と評価を厳密に分離して転移の成否を測る。D2-b の教訓を反映:
-      - Stage1 は米国「真ラベル」での条件付き pretrain (米国の群偏差構造を持ち込む)
-      - Stage2 は群別率への直接マッチ (Pの逆問題を回避) + 関数空間アンカー
-      - uncond床・zero-shot・placebo・アンカー無し の対照を常設
+        - Stage1: 米国「真ラベル」での条件付き pretrain (米国の群偏差構造を持ち込む; 無条件nullは未使用)
+        - Stage2: 群別率への直接マッチ (Pの逆問題を回避) + 関数空間アンカー
 
-群定義: d = 性(2) × 年齢7区分(10歳) × 就業(有業/無業) = 28群 (共通12分類, OTHER_X除外)
+群定義:   d = 性(男/女) × 年齢7区分(10歳) × 就業(有業/無業) = 28群 
+活動分類: 共通12分類, OTHER_X除外
+
+スコープ = 平日 (曜日は条件化しない設計判断):
+    ATUS は平日 diary (day_of_week 2..6) のみ使用し、pretrain・マッチ・評価の推定対象を
+    「平日スケジュール生成器」に統一する (全曜日 pretrain だと anchor が平日/週末混合分布に
+    係留してしまう)。土日への拡張は daytype (平日/土/日) の条件トークン化として将来課題。
 
 教師/評価の分離 (統計量ホールドアウト; 全て平日・全国の実公表値):
     教師 = 公表の2つの「周辺」:
-        margin_ga: 性×年齢7 の時刻別行動者率 (就業=総数 の行)  [14行]
-        margin_ge: 性×就業 の時刻別行動者率 (年齢=総数 の行)   [4行]
-      モデル側は μ̂(d) を推定人口由来の π(e|g,a) / π(a|g,e) で混合して周辺を再構成しマッチ。
-    評価 = 公表の3元クロス (性×年齢7×就業) の時刻別行動者率 [28行] — 学習には一切使わない。
-    さらに土曜・日曜表への外挿誤差を副次評価として報告 (教師は平日のみ)。
+        margin_ga: 性2×年齢7 の時刻別行動者率 (就業=総数 の行)  [14行]
+        margin_ge: 性2×就業2 の時刻別行動者率 (年齢=総数 の行)   [4行]
+        モデル側は μ̂(d) を推定人口由来の π(e|g,a) / π(a|g,e) で混合して周辺を再構成しマッチ
+    評価 = 公表の群別行動者率 (性2×年齢7×就業2 = 28群別の時刻別行動者率) [28行] — 学習には一切使わない
 
-腕:
-    zero-shot : 米国pretrainのまま (転移なし) — 米国構造の持ち込みだけでどこまで合うか
+比較条件:
+    zero-shot : 米国pretrainのまま (転移なし) — 米国構造の持ち込みだけで日本集計にどこまで合うか
     matched   : 周辺マッチ + アンカー (本命)
     no-anchor : 周辺マッチのみ (アンカーの寄与のablation)
-    placebo   : 周辺教師の群ラベルをシャッフルしてマッチ (負の対照)
-    (床)      : 「全群=日本の人口平均」と予測したときの dev_rmse (判別ゼロの床; モデル不要)
+    shuffled  : 周辺教師の群ラベルをシャッフルしてマッチ (負の対照)
+    baseline  : 「全群=日本の人口平均」と予測する判別ゼロの参照条件 (モデル不要)。
+                他バリアントと同じ全指標 (rate_rmse, dev_rmse, 活動別RMSE) で結果CSVに1行として出力
 
-アンカー: 関数空間蒸留 — 同一 (z,d) での pretrain デコーダ出力確率との MSE。
-    率スケールとの整合が良く、ELBO係数の調整より安定。
+アンカー: 関数空間アンカー（pretrain デコーダ出力への正則化）
+    凍結CVAE(Stage1の後) と 集計マッチCVAE(Stage2中)の同一 (潜在変数z, 群d) でのデコーダ出力確率とのMSE
+    率スケールとの整合が良く、ELBO係数の調整より安定
 
 出力: data/processed/aggregates/japan_match_experiment.csv + コンソール要約
+        + バリアントごとのチェックポイント outputs/checkpoints/japan_match_{variant}.pt
 使い方: uv run python src/models/CVAE_Aggregate/japan_match_experiment.py [--reuse-pretrain]
 """
 
 import argparse
-import copy
 import sys
 from pathlib import Path
 from typing import cast
@@ -52,20 +58,20 @@ from model import (  # noqa: E402
 )
 
 PROC_DIR   = REPO_ROOT / "data" / "processed"
-ATUS_PATH  = PROC_DIR / "atus2024_common12_dataset.csv"
+ATUS_PATH  = PROC_DIR / "atus2024" / "atus2024_stula_common12_dataset.csv"
 STULA_DIR  = PROC_DIR / "stula"
-CKPT_PATH  = REPO_ROOT / "outputs" / "checkpoints" / "japan_pretrain_common12.pt"
+CKPT_PATH  = REPO_ROOT / "outputs" / "checkpoints" / "japan_pretrain_common12_weekday.pt"
 OUT_CSV    = PROC_DIR / "aggregates" / "japan_match_experiment.csv"
 
 SLOT_COLS  = [f"s{j}" for j in range(NUM_SLOTS)]
 
-# 群定義: (gender 0男/1女) × (age7) × (emp 0無業/1有業) — d = g*14 + a*2 + e
+# 群定義: (gender 0男/1女) × (age7) × (emp 0無業/1有業); d = g*14 + a*2 + e -> g in {0..27}
 N_G, N_A, N_E = 2, 7, 2
 D_GROUPS = N_G * N_A * N_E
-AGE16_TO_7 = {i: min((i - 1) // 2, 6) for i in range(1, 16)}  # 社基調5歳16区分→10歳7区分
+AGE15_TO_7 = {i: min((i - 1) // 2, 6) for i in range(1, 16)}  # 社基調5歳15区分→10歳7区分
 
 MATCH_STEPS = 600
-ANCHOR_W    = 1.0     # 関数空間アンカーの重み (no-anchor 腕では0)
+ANCHOR_W    = 1.0     # 関数空間アンカーの重み (no-anchor バリアントでは0)
 SEED        = 42
 
 # 事前登録リスト (米日差の報告軸)
@@ -81,35 +87,52 @@ def d_index(g: int, a: int, e: int) -> int:
 # 社基調ターゲットの構築 (平日/土曜/日曜の各表から)
 # ============================================================
 def load_stula_targets(name: str) -> dict:
-    """timeband CSV -> {cross (28,12,96), margin_ga (14,12,96), margin_ge (4,12,96),
-                        pi_e (2,7,2: e|g,a), pop (2,7,2)} 率は[0,1], NaN=非公表"""
-    df = pd.read_csv(STULA_DIR / f"{name}.csv")
+    """
+    timeband CSV  ->  { group_rates_tbl (28,12,96), (demo, act, sche)
+                        margin_ga (14,12,96),       (gender × age, act, sche)
+                        margin_ge (4,12,96),        (gender × employ, act, sche)
+                        pi_e (2,7,2: e|g,a),        (employ, age, gender)
+                        pop (2,7,2)                 (employ, age, gender) 
+                    } 率は[0,1], NaN=非公表
+    """
+    df = pd.read_csv(STULA_DIR / f"{name}.csv")  
     df = cast(pd.DataFrame, df[df["region"] == "00_全国"])
     com = stula_to_common(df)   # activity20 -> common12 に率を集約
     com["g"] = com["gender"].map({"1_男": 0, "2_女": 1})  # type: ignore
     com["e"] = com["employment"].map({"1_有業者": 1, "2_無業者": 0})  # type: ignore
-    com["a16"] = com["age_class"].str[:2].map(lambda c: int(c) if c.isdigit() and c != "00" else np.nan)
-    com["a7"] = com["a16"].map(AGE16_TO_7)  # type: ignore
+    com["a15"] = com["age_class"].str[:2].map(lambda c: int(c) if isinstance(c, str) and c.isdigit() and c != "00" else np.nan)
+    com["a7"] = com["a15"].map(AGE15_TO_7)  # type: ignore
     cidx = {c.name: int(c) for c in Common}
     com["ci"] = com["common"].map(cidx)  # type: ignore
 
-    # 人口 (推定人口千人): 元dfの行動=総数行から。5歳16区分 (pop16) と10歳7区分 (pop) の両方を持つ
+    # 人口 (推定人口千人): 元dfの行動=総数行から。5歳15区分 (pop15) と10歳7区分 (pop) の両方を持つ
     pop_src = cast(pd.DataFrame, df[(df["activity"].str.startswith("00_"))])
     pop_src = pop_src.assign(
         g=pop_src["gender"].map({"1_男": 0, "2_女": 1}),  # type: ignore
         e=pop_src["employment"].map({"1_有業者": 1, "2_無業者": 0}),  # type: ignore
-        a16=pop_src["age_class"].str[:2].map(lambda c: int(c) if c.isdigit() and c != "00" else np.nan),
-    ).dropna(subset=["g", "e", "a16"])
-    pop16 = np.zeros((N_G, 16, N_E))   # a16 は 1..15 (index 1..15 を使用)
-    for (g, a16, e), grp in pop_src.groupby(["g", "a16", "e"]):  # type: ignore
-        pop16[int(g), int(a16), int(e)] = grp["population_k"].iloc[0]
+        a15=pop_src["age_class"].str[:2].map(lambda c: int(c) if isinstance(c, str) and c.isdigit() and c != "00" else np.nan),
+    ).dropna(subset=["g", "e", "a15"])
+    pop15 = np.zeros((N_G, 16, N_E))   # a15 は 1..15 (index 1..15 を使用)
+    for (g, a15, e), grp in pop_src.groupby(["g", "a15", "e"]):  # type: ignore
+        pop15[int(g), int(a15), int(e)] = grp["population_k"].iloc[0]  # type: ignore
+    # 社基調の公表は5歳15区分だが、モデルの群定義は10歳7区分。
+    # 5歳2区分ぶんの人口を足し合わせて7区分へ集約する（率でなく人数なので単純加算でよい）
     pop = np.zeros((N_G, N_A, N_E))
-    for a16, a7 in AGE16_TO_7.items():
-        pop[:, a7, :] += pop16[:, a16, :]
+    for a15, a7 in AGE15_TO_7.items():
+        pop[:, a7, :] += pop15[:, a15, :]
+    # π(e|g,a): 性g・年齢a の人のうち就業状態 e の割合（e 軸で正規化）。
+    # margin_match の「全確率の公式による周辺再構成」の混合重みになる
     pi_e = pop / pop.sum(axis=2, keepdims=True)   # π(e|g,a)
 
     def rates_block(sub: pd.DataFrame, keys: list[str], shape: tuple) -> np.ndarray:
-        """keys でインデックスした率テンソル (…, 12, 96)。行の重みは wrow 列 (人口重み平均)。"""
+        """keys でインデックスした率テンソル (…, 12, 96)。行の重みは wrow 列 (人口重み平均)。
+
+        同じインデックスに公表行が複数落ちる場合（5歳2区分→10歳1区分の集約など）は
+        wrow（人口）で加重平均する。率の集約は人数重みの加重平均でないと正しくない
+        （人数の多い5歳区分の率が10歳区分の率をより強く決めるべき）。
+        NaN（非公表）はスロット単位で分子 acc・分母 wsum の両方から外し、
+        全行 NaN のスロットは 0/0 = NaN のまま返す（後段の m_ga/m_ge マスクで除外）。
+        """
         wsum = np.zeros(shape + (NUM_COMMON, NUM_SLOTS))
         acc  = np.zeros(shape + (NUM_COMMON, NUM_SLOTS))
         for _, r in sub.iterrows():
@@ -121,58 +144,109 @@ def load_stula_targets(name: str) -> dict:
         with np.errstate(invalid="ignore"):
             return acc / wsum
 
-    # cross: 性×年齢×就業 (公表3元クロス; 5歳2区分を5歳人口重みで10歳へ集約)
+    # group_rates_tbl: 群別行動者率 (公表の性×年齢×就業=28群別; 5歳2区分を5歳人口重みで10歳へ集約)
     sub = com.dropna(subset=["g", "e", "a7"]).copy()
-    sub["wrow"] = [pop16[int(g), int(a16), int(e)]
-                   for g, a16, e in zip(sub["g"], sub["a16"], sub["e"])]
-    cross = rates_block(sub, ["g", "a7", "e"], (N_G, N_A, N_E)).reshape(D_GROUPS, NUM_COMMON, NUM_SLOTS)
+    sub["wrow"] = [pop15[int(g), int(a15), int(e)]
+                    for g, a15, e in zip(sub["g"], sub["a15"], sub["e"])]
+    group_rates_tbl = rates_block(sub, ["g", "a7", "e"], (N_G, N_A, N_E)).reshape(D_GROUPS, NUM_COMMON, NUM_SLOTS)
     # margin_ga: 就業=総数 の行 (性×年齢; 5歳→10歳は e 合計人口で重み付け)
     sub = cast(pd.DataFrame, com[(com["employment"] == "0_総数")]).dropna(subset=["g", "a7"]).copy()
-    sub["wrow"] = [pop16[int(g), int(a16), :].sum() for g, a16 in zip(sub["g"], sub["a16"])]
+    sub["wrow"] = [pop15[int(g), int(a15), :].sum() for g, a15 in zip(sub["g"], sub["a15"])]
     margin_ga = rates_block(sub, ["g", "a7"], (N_G, N_A))
     # margin_ge: 年齢=総数 の行 (性×就業; 1セル1行なので重みは1)
     sub = cast(pd.DataFrame, com[(com["age_class"] == "00_総数")]).dropna(subset=["g", "e"]).copy()
     sub["wrow"] = 1.0
     margin_ge = rates_block(sub, ["g", "e"], (N_G, N_E))
-    return {"cross": cross, "margin_ga": margin_ga, "margin_ge": margin_ge,
+    return {"group_rates_tbl": group_rates_tbl, "margin_ga": margin_ga, "margin_ge": margin_ge,
             "pi_e": pi_e, "pop": pop}
 
 
 # ============================================================
 # Stage 2: 周辺マッチ + 関数空間アンカー (model.aggregate_match の周辺マッチ変種)
 # ============================================================
-def margin_match(model: AggCVAE, pre: AggCVAE, tgt: dict, mask_c: np.ndarray,
-                 anchor_w: float, tag: str, shuffle_groups: np.ndarray | None = None):
-    """margin_ga/margin_ge にマッチ。shuffle_groups は placebo 用の群置換 (μ̂ 側に適用)。
-    model.aggregate_match との違い: P の逆問題を回避して公表周辺 (性×年齢, 性×就業) を
-    π で混合再構成して直接マッチ + pretrain デコーダへの関数空間アンカー項。"""
-    mga = torch.as_tensor(tgt["margin_ga"], dtype=torch.float32, device=DEVICE)  # (2,7,12,96)
-    mge = torch.as_tensor(tgt["margin_ge"], dtype=torch.float32, device=DEVICE)  # (2,2,12,96)
-    pi_e = torch.as_tensor(tgt["pi_e"], dtype=torch.float32, device=DEVICE)      # (2,7,2)
-    pop  = torch.as_tensor(tgt["pop"], dtype=torch.float32, device=DEVICE)
-    pi_a = pop / pop.sum(dim=1, keepdim=True)                                    # π(a|g,e)
-    mc   = torch.as_tensor(mask_c, device=DEVICE)
-    m_ga, m_ge = ~torch.isnan(mga), ~torch.isnan(mge)
-    mga, mge = torch.nan_to_num(mga), torch.nan_to_num(mge)
+def margin_match(   model         : AggCVAE,
+                    pre           : AggCVAE,
+                    tgt           : dict,
+                    mask_c        : np.ndarray,
+                    anchor_w      : float,
+                    tag           : str,
+                    shuffle_groups: np.ndarray | None = None
+                ):
+    """
+    margin_ga/margin_ge にマッチさせる
+    shuffle_groups は shuffled 用の群置換 (μ̂ 側に適用)
+    model.aggregate_match (ここでは使わない) との違い: 
+        P の逆問題を回避して公表周辺 (性×年齢, 性×就業) を
+        π で混合再構成して直接マッチ + pretrain デコーダへの関数空間アンカー項。
 
+    args:
+        model         : 微調整するモデル
+        pre           : Stage1までのPretrainモデル
+        tgt           : 社基調の教師データ一式 (周辺2表，人口シェアπ，推定人口)
+        mask_c        : 比較不能な活動 OHTER_Xを損失から外すマスク
+        anchor_w      : アンカー重み; matchedは1.0, no-anchorでは0.0
+        shuffle_groups: 群置換をして間違った対応で学習させる．0〜27 を並べ替えた1本の順列 (None: 通常の対応で学習)
+    """
+    mga = torch.as_tensor(tgt["margin_ga"], dtype=torch.float32, device=DEVICE)  # 教師1: 性×年齢の時刻別行動者率 (2,7,12,96), (sex, age, act, sched)
+    mge = torch.as_tensor(tgt["margin_ge"], dtype=torch.float32, device=DEVICE)  # 教師2: 性×就業の時刻別行動者率 (2,2,12,96), (sex, employment, act, sched)
+    pi_e = torch.as_tensor(tgt["pi_e"], dtype=torch.float32, device=DEVICE)      # π(就業|性,年齢): 性g・年齢a の人のうち、就業状態が e である人口シェア, (2,7,2), (sex, age, employment)
+    pop  = torch.as_tensor(tgt["pop"], dtype=torch.float32, device=DEVICE)       # 28群の推定人口, (2,7,2)
+    pi_a = pop / pop.sum(dim=1, keepdim=True)                                    # π(年齢|性,就業): 性g・就業e の人のうち、年齢が a である人口シェア
+    mc   = torch.as_tensor(mask_c, device=DEVICE)                                # 共通12分類のうち、米日で比較不能として除外する OTHER_X
+    m_ga, m_ge = ~torch.isnan(mga), ~torch.isnan(mge)                            # NaNマスク
+    mga, mge = torch.nan_to_num(mga), torch.nan_to_num(mge)                      # NaNを0に置き換える．値としての0に意味はない
+
+    # 学習速度の違いのため2つに分ける
     opt = torch.optim.Adam([
-        {"params": model.demo_emb.parameters(), "lr": LR_EMB},
-        {"params": model.decoder.parameters(),  "lr": LR_DECODER},
+        {"params": model.demo_emb.parameters(), "lr": LR_EMB},      # 群埋め込みを学習する
+        {"params": model.decoder.parameters(),  "lr": LR_DECODER},  # 群対応するスケジュール生成を学習する
     ])
+
+    # shuffled に対しては壊れた群対応を渡す（通常時は恒等順列 = そのままの対応）。
+    # 群番号を並べ替えると「教師の行 g と、モデルが生成する群 d」の対応が崩れるので、
+    # 正しい対応があるから効く、という機構主張の反証条件になる
     perm = torch.arange(D_GROUPS, device=DEVICE) if shuffle_groups is None \
         else torch.as_tensor(shuffle_groups, device=DEVICE)
+
+    # 学習モード
     model.train()
+
+    # 集計マッチループ
     for step in range(1, MATCH_STEPS + 1):
-        z  = torch.randn(D_GROUPS * S_TRAIN, Z_DIM, device=DEVICE)
-        di = perm.repeat_interleave(S_TRAIN)
-        probs = model.decode_probs(z, di).view(D_GROUPS, S_TRAIN, NUM_SLOTS, NUM_COMMON)
+        z  = torch.randn(D_GROUPS * S_TRAIN, Z_DIM, device=DEVICE)  # 潜在変数z (28*128=3584, 64); 事前分布 N(0,I) から引くだけなので再パラメータ化不要
+        di = perm.repeat_interleave(S_TRAIN)  # (28*128=3584,), [0,0,...(128個)...,0, 1,1,...,1, 2,...], 最初の128本を群0,次の128本を群1,...,最後の128本を群27
+        probs = model.decode_probs(z, di).view(D_GROUPS, S_TRAIN, NUM_SLOTS, NUM_COMMON)  # (28*128=3584,96,n_act) -> (28群, 128人, 96時刻, 12活動)
+
+        # 各郡の期待行動者率: (28群, 128人, 96時刻, 12活動) --各群で平均--> (28, 96, 12) --並び替え(教師側に合わせる)--> (28, 12 96) --群を3軸に展開--> (2, 7, 2, 12, 96)
         mu = probs.mean(dim=1).permute(0, 2, 1).view(N_G, N_A, N_E, NUM_COMMON, NUM_SLOTS)
-        # 周辺の再構成: π で混合
+
+        # 周辺の再構成: π で混合（全確率の公式; ガイド §4）
+        # 公表周辺 margin_ga は「性g・年齢a の全員（有業+無業を合わせた総数）」の
+        # 行動者率。モデルは (g,a,e) 別の μ̂ しか持たないので、全確率の公式
+        #     μ(g,a) = Σ_e π(e|g,a) · μ(g,a,e)
+        # で就業をつぶした周辺を再構成する。具体例:
+        #   40代男性の行動者率 = (有業割合)×(有業40代男性の率) + (無業割合)×(無業40代男性の率)
+        # π は推定人口から計算した既知の人口シェアなので、これは定数重みの
+        # 加重平均にすぎず微分可能（勾配は μ̂ 側に流れる）。
+        #   pi_e (2,7,2): この性・年齢の中で、有業/無業は何割か → e 軸(dim=2)をつぶす
+        #   pi_a (2,7,2): この性・就業の中で、各年齢は何割か   → a 軸(dim=1)をつぶす
+        # [..., None, None] は π を μ (2,7,2,12,96) にブロードキャストするための
+        # 軸合わせ（活動・時刻の2軸を追加）
         mu_ga = (mu * pi_e[..., None, None]).sum(dim=2)   # Σ_e π(e|g,a) μ -> (2,7,12,96)
         mu_ge = (mu * pi_a[..., None, None]).sum(dim=1)   # Σ_a π(a|g,e) μ -> (2,2,12,96)
+
+        # マッチ損失: 周辺2表それぞれと MSE。
+        # [..., mc, :] で比較不能活動 OTHER_X の列を落とし、
+        # [m_ga...] で非公表 NaN のセルを損失から除外（マスクの二段がけ）
         loss = (F.mse_loss(mu_ga[..., mc, :][m_ga[..., mc, :]], mga[..., mc, :][m_ga[..., mc, :]])
                 + F.mse_loss(mu_ge[..., mc, :][m_ge[..., mc, :]], mge[..., mc, :][m_ge[..., mc, :]]))
-        if anchor_w > 0:   # 関数空間アンカー: pretrain デコーダとの出力距離
+        if anchor_w > 0:   # 関数空間アンカー: pretrain デコーダとの出力距離（ガイド §4）
+            # 周辺2表（14+4=18行）だけで28群×12活動×96スロットを拘束するのは
+            # 劣決定（自由度が余る）。放置すると decoder が Stage1 で覚えた
+            # 「スケジュールらしさ」を捨てて周辺だけ合わせる退化解に行きうる。
+            # そこで同じ (z,d) に対する凍結 pretrain の出力確率との MSE を罰則に足す。
+            # 「重み空間で動くな」でなく「出力（関数）空間で離れるな」という正則化なので
+            # 率のスケールと直接整合する（ELBO 係数の調整より安定）
             with torch.no_grad():
                 probs_pre = pre.decode_probs(z, di).view_as(probs)
             loss = loss + anchor_w * F.mse_loss(probs, probs_pre)
@@ -184,50 +258,62 @@ def margin_match(model: AggCVAE, pre: AggCVAE, tgt: dict, mask_c: np.ndarray,
 # ============================================================
 # 評価
 # ============================================================
+def nan_renorm_pop_weights(grp_tbl: np.ndarray, pi_d: np.ndarray) -> np.ndarray:
+    """セル (活動,時刻) ごとに非公表 NaN の群を除外し再正規化した人口重み (28,12,96)。
+    全群 NaN のセルは 0/0=NaN (評価マスク m で除外されるので害はない)"""
+    w = np.where(np.isnan(grp_tbl), 0.0, pi_d[:, None, None])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return w / w.sum(axis=0)
+
+
 def eval_against(mu_hat: np.ndarray, tgt: dict, mask_c: np.ndarray) -> dict:
-    """μ̂ (28, 12*96 act-major) vs 公表3元クロス。OTHER_X と NaN を除外して RMSE 等を計算"""
-    cross = tgt["cross"]                                    # (28,12,96)
+    """μ̂ (28, 12*96 act-major) vs 公表の群別行動者率。OTHER_X と NaN を除外して RMSE 等を計算"""
+    grp_tbl = tgt["group_rates_tbl"]                        # (28,12,96)
     mh = mu_hat.reshape(D_GROUPS, NUM_COMMON, NUM_SLOTS)
     pop = tgt["pop"].reshape(D_GROUPS)
     pi_d = pop / pop.sum()
-    m = ~np.isnan(cross) & mask_c[None, :, None]
-    rmse = float(np.sqrt(((mh - cross)[m] ** 2).mean()))
-    # 群偏差 (人口平均からの差): 条件付け能力
-    mean_t = np.nansum(cross * pi_d[:, None, None], axis=0)
-    mean_h = (mh * pi_d[:, None, None]).sum(axis=0)
-    dev_rmse = float(np.sqrt((((mh - mean_h) - (cross - mean_t))[m] ** 2).mean()))
-    per_act = {c.name: float(np.sqrt(((mh - cross)[:, int(c)][m[:, int(c)]] ** 2).mean()))
-               for c in Common if mask_c[int(c)]}
+    m = ~np.isnan(grp_tbl) & mask_c[None, :, None]
+    rmse = float(np.sqrt(((mh - grp_tbl)[m] ** 2).mean()))
+    # 群偏差 (人口平均からの差): 条件付け能力。
+    # 非公表 NaN の群をセルごとに除外して π を再正規化し、モデル側の平均も
+    # 同じ群集合で取る (教師とモデルで比較対象の「人口平均」を揃える)
+    W = nan_renorm_pop_weights(grp_tbl, pi_d)
+    mean_t = np.nansum(grp_tbl * W, axis=0)
+    mean_h = np.nansum(mh * W, axis=0)
+    dev_rmse = float(np.sqrt((((mh - mean_h) - (grp_tbl - mean_t))[m] ** 2).mean()))
+    per_act = {c.name: float(np.sqrt(((mh - grp_tbl)[:, int(c)][m[:, int(c)]] ** 2).mean()))
+                for c in Common if mask_c[int(c)]}
     return {"rate_rmse": rmse, "dev_rmse": dev_rmse, **{f"rmse_{k}": v for k, v in per_act.items()}}
 
 
 def main():
+    # --- コマンドライン引数の受け取りと乱数シードの固定 ---
     ap = argparse.ArgumentParser(description="ATUS pretrain → 社基調 実集計マッチ転移")
-    ap.add_argument("--reuse-pretrain", action="store_true")
+    ap.add_argument("--reuse-pretrain", action="store_true")  # 事前学習モデルを使用する (Stage 2から始める) コマンド
     args = ap.parse_args()
     torch.manual_seed(SEED)
     rng = np.random.default_rng(SEED)
 
-    # --- ATUS (共通12分類) と米国真ラベル (g×a7×e) ---
-    df = pd.read_csv(ATUS_PATH)
-    S_t = torch.as_tensor(df[SLOT_COLS].to_numpy(dtype=np.int64))
-    w   = df["TUFINLWGT"].to_numpy(dtype=np.float64)
-    a7  = np.clip((df["age"].to_numpy() - 15) // 10, 0, 6)
-    emp = df["telfs"].isin([1, 2]).to_numpy().astype(int)
-    demo_of = np.array([d_index(g, a, e) for g, a, e in zip(df["gender"], a7, emp)])
+    # --- ATUS (共通12分類・平日のみ) と米国真ラベル (g2×a7×e2) ---
+    df = pd.read_csv(ATUS_PATH)  # 102列 -> (ID, w, age, gender, day, telfs, s0..s95)
+    df = df[df["day_of_week"].between(2, 6)].reset_index(drop=True)  # 平日 (月..金) のみ: スコープ=平日
+    S_t = torch.as_tensor(df[SLOT_COLS].to_numpy(dtype=np.int64))  # (N, 96); dfからスロット部分を取り出し -> numpy tensor
+    w   = df["TUFINLWGT"].to_numpy(dtype=np.float64)  # (7439,); dfかから重み部分を取り出し -> numpy tensor
+    a7  = np.clip((df["age"].to_numpy() - 15) // 10, 0, 6)   # 15歳起点10歳刻みの7区分 (15-24→0, ..., 75+→6)
+    emp = df["telfs"].isin([1, 2]).to_numpy().astype(int)    # ATUS 就業状態: 1,2(就業or休業中) = 有業（社基調の有業/無業に対応付け）
+    demo_of = np.array([d_index(g, a, e) for g, a, e in zip(df["gender"], a7, emp)])  # 各人物に対応する群番号を割り当てている 
     print(f"ATUS: N={len(df)}  D={D_GROUPS}  device={DEVICE}")
 
-    # --- 社基調ターゲット ---
+    # --- 社基調ターゲット (平日) ---
     tgt_wd  = load_stula_targets("timeband_weekday")
-    tgt_sat = load_stula_targets("timeband_saturday")
-    tgt_sun = load_stula_targets("timeband_sunday")
-    mask_c = np.array([c not in (Common.OTHER_X,) for c in Common])   # ③除外
-    # 床: 「全群=人口平均」の dev_rmse (モデル不要)
-    cross, pop = tgt_wd["cross"], tgt_wd["pop"].reshape(D_GROUPS)
+    mask_c = np.array([c not in (Common.OTHER_X,) for c in Common])   # OTHER_X（米日で対応が取れない残差カテゴリ）を教師・評価の両方から除外
+    # ベースライン: 「全群=人口平均」と予測する判別ゼロの参照条件 (モデル不要)
+    # μ̂ を全群共通の人口平均にして他バリアントと同じ eval_against に通し、
+    # 全指標 (rate_rmse / dev_rmse / 活動別RMSE) を結果CSVに載せる
+    grp_tbl, pop = tgt_wd["group_rates_tbl"], tgt_wd["pop"].reshape(D_GROUPS)
     pi_d = pop / pop.sum()
-    m = ~np.isnan(cross) & mask_c[None, :, None]
-    floor_dev = float(np.sqrt(((cross - np.nansum(cross * pi_d[:, None, None], axis=0))[m] ** 2).mean()))
-    print(f"日本クロスの群偏差RMS (判別ゼロの床) = {floor_dev:.4f}")
+    W0 = nan_renorm_pop_weights(grp_tbl, pi_d)
+    baseline_mu = np.broadcast_to(np.nansum(grp_tbl * W0, axis=0), grp_tbl.shape)
 
     # --- Stage 1: 米国真ラベルで条件付き pretrain ---
     pre = AggCVAE(NUM_COMMON, D_GROUPS).to(DEVICE)
@@ -240,38 +326,61 @@ def main():
         CKPT_PATH.parent.mkdir(parents=True, exist_ok=True)
         torch.save(pre.state_dict(), CKPT_PATH)
 
-    # --- 腕の実行 ---
+    # --- バリアントの実行 ---
     def fork() -> AggCVAE:
         m_ = AggCVAE(NUM_COMMON, D_GROUPS).to(DEVICE)
         m_.load_state_dict(pre.state_dict())
         return m_
 
-    arms: dict[str, AggCVAE] = {"zero-shot": pre}
-    m_ = fork(); margin_match(m_, pre, tgt_wd, mask_c, ANCHOR_W, "matched")
-    arms["matched"] = m_
-    m_ = fork(); margin_match(m_, pre, tgt_wd, mask_c, 0.0, "no-anchor")
-    arms["no-anchor"] = m_
-    m_ = fork(); margin_match(m_, pre, tgt_wd, mask_c, ANCHOR_W, "placebo",
-                              shuffle_groups=rng.permutation(D_GROUPS))
-    arms["placebo"] = m_
+    # --- Stage 2:  --
+    print("Stage2: 社会生活基本調査・周辺マッチング ...")
 
-    # --- 評価: 平日クロス (ホールドアウト) + 土日 (外挿) ---
+    # --- Stage 2: zero-shot --
+    variants: dict[str, AggCVAE] = {"zero-shot": pre}
+
+    # --- Stage 2: matched --
+    m_ = fork()
+    margin_match(m_, pre, tgt_wd, mask_c, ANCHOR_W, "matched")
+    variants["matched"] = m_
+
+    # --- Stage 2: no-anchor --
+    m_ = fork()
+    margin_match(m_, pre, tgt_wd, mask_c, 0.0, "no-anchor")
+    variants["no-anchor"] = m_
+
+    # --- Stage 2: shuffled --
+    m_ = fork()
+    margin_match(m_, pre, tgt_wd, mask_c, ANCHOR_W, "shuffled",
+                shuffle_groups=rng.permutation(D_GROUPS))
+    variants["shuffled"] = m_
+
+    # --- バリアントごとのチェックポイント保存 (ノートブック等での追加分析用) ---
+    for variant, m_ in variants.items():
+        variant_path = CKPT_PATH.parent / f"japan_match_{variant}.pt"
+        torch.save(m_.state_dict(), variant_path)
+        print(f"saved variant checkpoint -> {variant_path}")
+
+    # --- 評価: 平日の群別行動者率 (統計量ホールドアウト) ---
     records = []
-    for arm, model in arms.items():
+    for variant, model in variants.items():
         mu_hat = group_rates(model, D_GROUPS)
-        for tgt_name, tgt in [("weekday_cross", tgt_wd), ("saturday_extrap", tgt_sat),
-                              ("sunday_extrap", tgt_sun)]:
-            records.append({"arm": arm, "eval": tgt_name, **eval_against(mu_hat, tgt, mask_c)})
+        records.append({"variant": variant, "eval": "weekday_groups",
+                        **eval_against(mu_hat, tgt_wd, mask_c)})
+    records.append({"variant": "baseline", "eval": "weekday_groups",
+                    **eval_against(baseline_mu, tgt_wd, mask_c)})
     res = pd.DataFrame(records)
     OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     res.to_csv(OUT_CSV, index=False)
 
-    main_cols = ["arm", "eval", "rate_rmse", "dev_rmse"] + \
+    main_cols = ["variant", "eval", "rate_rmse", "dev_rmse"] + \
                 [f"rmse_{k}" for k in BREAK_CANDIDATES + PRESERVE_CANDIDATES]
+    act_cols  = [f"rmse_{c.name}" for c in Common if mask_c[int(c)]]
     with pd.option_context("display.width", 220, "display.float_format", "{:.4f}".format):
-        print("\n=== 平日クロス(28群)=統計量ホールドアウト / 土日=外挿 ===")
+        print("\n=== 平日の群別行動者率(28群)=統計量ホールドアウト ===")
         print(res[main_cols].to_string(index=False))
-    print(f"\n床 (判別ゼロ dev_rmse): {floor_dev:.4f} / 事前登録: 破れ候補={BREAK_CANDIDATES} 保存候補={PRESERVE_CANDIDATES}")
+        print("\n=== 活動別 RMSE (全活動分類; OTHER_X除外) ===")
+        print(res[["variant"] + act_cols].to_string(index=False))
+    print(f"\n事前登録: 破れ候補={BREAK_CANDIDATES} 保存候補={PRESERVE_CANDIDATES}")
     print(f"saved -> {OUT_CSV}")
 
 
