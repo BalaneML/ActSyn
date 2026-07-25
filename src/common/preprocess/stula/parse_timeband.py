@@ -1,5 +1,5 @@
 """
-社会生活基本調査 (令和3年, 調査票A) 公表「時間帯編」Excel表のパーサ
+社会生活基本調査 (令和3年, 調査票A) 公表「時間帯編」Excel表をCSVに変換するパーサ
 
 データ入手 (e-Stat 統計コード00200533 / 時間帯編47表, curl はブラウザ相当UA+Refererで可):
     data/raw/opened/STULA2021/<statInfId>.xlsx に配置済みの表を処理する。
@@ -14,14 +14,20 @@
     行10-: データ。キー値は "コード_ラベル" 形式 (例 '1_平日', '01_睡眠', '03_25～29歳')
     時刻区分: 01_0:00-0:15 .. 96_23:45-24:00 の96列 (%表記)。総数行の率は '-'
     行動: 20分類 + 00_総数 + R1-R3_(再掲)1〜3次活動
-    年齢: 5歳階級16区分 (01_15～19歳 .. 15_85歳以上) + 総数 + 再掲R1-R6
+    年齢: 5歳階級15区分 (01_15～19歳 .. 15_85歳以上) + 総数 + 再掲R1-R6
 
 処理:
     1. 行9からキー列、行7から時刻96列を自動検出 (表ごとのキー構成差を吸収)
     2. 0:00起点の96列を **04:00起点へ回転** (ATUS前処理の diary day と整合):
-       出力 s_j = 原表の時刻列 (j+16) mod 96  (s0 = 04:00-04:15)
-    3. '-' は NaN。率は % のまま保持 (0..100)
-    4. 検証: 行動01..20の率を層内で合計すると各スロット ≈100% (主行動は排他的)
+        出力 s_j = 原表の時刻列 (j+16) mod 96  (s0 = 04:00-04:15)
+    3. 欠損マーカーの区別 (e-Stat 慣行):
+        '-'  = 該当数字なし = 行動者ゼロ -> 率 0.0
+        '…' / '...' / 'X' 等 = 非公表 -> NaN
+        ただし (a) 行動=00_総数 行の率は非定義 -> NaN,
+        (b) 全20行動×全スロットが '-' の層は標本なし (地方ブロックのみ) -> NaN に戻す
+        推定人口列は従来どおり非数値 -> NaN
+    4. 率は % のまま保持 (0..100)
+    5. 検証: 行動01..20の率を層内で合計すると各スロット ≈100% (主行動は排他的)
 
 出力: data/processed/stula/<name>.csv (wide形式: キー列 + population_k + s0..s95)
 """
@@ -52,8 +58,12 @@ SLOT_LABEL_ROW  = 7   # 時刻区分ラベルの行
 
 # キー列名の正規化 (表側の日本語ヘッダ -> 出力列名)
 KEY_RENAME = {
-    "曜日": "daytype", "地域区分": "region", "男女": "gender",
-    "ふだんの就業状態": "employment", "行動の種類": "activity", "年齢": "age_class",
+    "曜日": "daytype",
+    "地域区分": "region",
+    "男女": "gender",
+    "ふだんの就業状態": "employment",
+    "行動の種類": "activity",
+    "年齢": "age_class",
 }
 
 
@@ -74,26 +84,52 @@ def parse_table(path: Path) -> pd.DataFrame:
     # 推定人口列: キー列と時刻列の間の残り1列 (行8の単位=千人)
     pop_col = [c for c in range(min(slot_cols)) if c not in key_cols][-1]
 
-    def to_rate(v):
-        # 欠損マーカーは複数種 ('-', '…', '...', 'X' 等) → 数値化できないものは一律 NaN
+    def to_num(v):
+        # 推定人口列用: 非数値 ('-', '…' 等) は一律 NaN
         try:
             return float(v)
         except (TypeError, ValueError):
             return np.nan
 
+    def to_rate(v):
+        # 率セル: '-' は「該当数字なし」= 行動者ゼロ → 0.0。'…'/'...'/'X' 等の非公表のみ NaN
+        if isinstance(v, str) and v.strip() == "-":
+            return 0.0
+        return to_num(v)
+
     records = []
     for row in rows:
         if row[list(key_cols)[0]] is None:
             continue
-        rec = {KEY_RENAME.get(name, name): str(row[c]).strip() for c, name in key_cols.items()}
-        rec["population_k"] = to_rate(row[pop_col])
+        rec: dict[str, str | float] = {KEY_RENAME.get(name, name): str(row[c]).strip() for c, name in key_cols.items()}
+        rec["population_k"] = to_num(row[pop_col])
         vals = np.full(N_SLOTS, np.nan)
         for c, k0 in slot_cols.items():
             vals[(k0 - ROT) % N_SLOTS] = to_rate(row[c])   # 04:00起点へ回転
         for j in range(N_SLOTS):
             rec[f"s{j}"] = vals[j]
         records.append(rec)
-    return pd.DataFrame(records)
+    return fix_rate_semantics(pd.DataFrame(records))
+
+
+def fix_rate_semantics(df: pd.DataFrame) -> pd.DataFrame:
+    """'-'→0.0 変換の例外処理: 率が定義されない行と標本なし層を NaN に戻す"""
+    if "activity" not in df.columns:
+        return df
+    slot_cols = [f"s{j}" for j in range(N_SLOTS)]
+    # (a) 行動=00_総数 行の率は非定義 ('-' はゼロの意味ではない)
+    df.loc[df["activity"].str.startswith("00_"), slot_cols] = np.nan
+    # (b) 全20行動×全スロットが 0 の層 = 元が全 '-' の標本なし層。
+    #     実在層は主行動の排他性よりスロット合計≈100%になるため 0 と判別できる
+    act20 = df["activity"].str.match(r"^(0[1-9]|1\d|20)_")
+    keys = [c for c in df.columns if c not in ("activity", "population_k") and not c.startswith("s")]
+    totals = df[act20].groupby(keys, observed=True)[slot_cols].sum().sum(axis=1)
+    empty = totals[totals == 0].index
+    if len(empty):
+        mask = df.set_index(keys).index.isin(empty)
+        df.loc[mask, slot_cols] = np.nan
+        print(f"  標本なし層 (全行動 '-'): {len(empty)} 層を NaN 化")
+    return df
 
 
 def validate(df: pd.DataFrame, name: str):

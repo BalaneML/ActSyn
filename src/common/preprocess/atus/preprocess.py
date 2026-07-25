@@ -9,12 +9,8 @@ ATUS生データ(time-use diary) -> 活動スケジュール(96スロット) + �
             -> atusact_2024.dat   (Activity file: 1行=1エピソード)
         atusresp-2024.zip 
             -> atusresp_2024.dat  (Respondent file: 重み・曜日・就業状態)
-        atusrost-2024.zip 
+        atusrost-2024.zip
             -> atusrost_2024.dat  (Roster file: 年齢・性別)
-        atuscps-2024.zip  
-            -> atuscps-2024/atuscps_2024.dat (CPS file: 地域変数
-            GEREG=センサス4地域, GESTFIPS=州FIPS, GTMETSTA=都市圏区分
-            デモグラ属性はCPS第8回面接から継承 [articles/atus-users-guide])
 
 処理の流れ:
     1. Activity file を diary (TUCASEID) ごとに 04:00起点 1440分タイムラインへ展開
@@ -36,15 +32,12 @@ ATUS生データ(time-use diary) -> 活動スケジュール(96スロット) + �
     age         : TEAGE (15..85)
     gender      : TESEX 1=male->0, 2=female->1
     day_of_week : TUDIARYDAY 1=Sunday .. 7=Saturday (将来の条件追加用に保持)
-    telfs       : TELFS 労働力状態の生コード (将来の条件追加用に保持)
-    region      : GEREG 1=Northeast 2=Midwest 3=South 4=West (CPS由来)
-    state_fips  : GESTFIPS 州FIPSコード (CPS由来; σ_min(P) の地域セル層別用)
-    metro       : GTMETSTA 1=metropolitan 2=non-metro 3=not identified (CPS由来)
+    telfs       : TELFS 労働力状態の生コード (就業/無業の判定用)
 
 出力:
-    data/processed/atus2024_weighted_dataset.csv
-        (TUCASEID, TUFINLWGT, age, gender, day_of_week, telfs, region, state_fips, metro, s0..s95)
-    data/processed/atus2024_episodes.csv (連続時刻を保持した生エピソード; 将来の連続表現用)
+    data/processed/atus2024/atus2024_weighted_dataset.csv
+        (TUCASEID, TUFINLWGT, age, gender, day_of_week, telfs, s0..s95)
+    data/processed/atus2024/atus2024_episodes.csv (連続時刻を保持した生エピソード; 将来の連続表現用)
         (TUCASEID, TUACTIVITY_N, start_min, stop_min, duration_min, tier1, tier2, tewhere, act_idx, trcode)
         (start/stop_min は 04:00 起点の経過分。tier-50 処理「前」の生データ)
 
@@ -68,8 +61,7 @@ RAW_DIR   = REPO_ROOT / "data" / "raw" / "opened" / f"ATUS{YEAR}"
 ACT_PATH  = RAW_DIR / f"atusact_{YEAR}.dat"
 RESP_PATH = RAW_DIR / f"atusresp_{YEAR}.dat"
 ROST_PATH = RAW_DIR / f"atusrost_{YEAR}.dat"
-CPS_PATH  = RAW_DIR / f"atuscps-{YEAR}" / f"atuscps_{YEAR}.dat"
-OUT_DIR   = REPO_ROOT / "data" / "processed"
+OUT_DIR   = REPO_ROOT / "data" / "processed" / f"atus{YEAR}"
 OUT_DATASET  = OUT_DIR / f"atus{YEAR}_weighted_dataset.csv"
 OUT_EPISODES = OUT_DIR / f"atus{YEAR}_episodes.csv"
 
@@ -154,7 +146,7 @@ def slots_from_categories(dur: np.ndarray, cats: np.ndarray, num_cat: int) -> tu
     for k in range(N_SLOTS):
         seg = tl[k * SLOT_MIN:(k + 1) * SLOT_MIN]
         counts = np.bincount(seg, minlength=num_cat)
-        sched[k] = counts.argmax()
+        sched[k] = counts.argmax()  # 同数の場合，小さい活動番号の活動が割り当たる
         if (counts > 0).sum() > 1:
             lost_short += int(counts.sum() - counts.max())
     return sched, lost_short
@@ -193,7 +185,7 @@ def build_schedules(act: pd.DataFrame):
 # ==================================================================
 def build_episodes(act: pd.DataFrame) -> pd.DataFrame:
     ep = act[["TUCASEID", "TUACTIVITY_N", "TUACTDUR24", "TUTIER1CODE", "TUTIER2CODE",
-              "TEWHERE", "TRCODE"]].copy()
+                "TEWHERE", "TRCODE"]].copy()
     # 04:00起点の経過分: 累積 TUACTDUR24 から導出 (エピソードは連続していて隙間がない)
     cum = ep.groupby("TUCASEID")["TUACTDUR24"].cumsum()
     ep["stop_min"]  = cum
@@ -202,7 +194,7 @@ def build_episodes(act: pd.DataFrame) -> pd.DataFrame:
     ep = ep.rename(columns={"TUACTDUR24": "duration_min", "TUTIER1CODE": "tier1",
                             "TUTIER2CODE": "tier2", "TEWHERE": "tewhere", "TRCODE": "trcode"})
     return ep[["TUCASEID", "TUACTIVITY_N", "start_min", "stop_min",
-               "duration_min", "tier1", "tier2", "tewhere", "act_idx", "trcode"]]
+                "duration_min", "tier1", "tier2", "tewhere", "act_idx", "trcode"]]
 
 
 # ==================================================================
@@ -211,36 +203,29 @@ def build_episodes(act: pd.DataFrame) -> pd.DataFrame:
 def load_activity() -> pd.DataFrame:
     """Activity file を (TUCASEID, TUACTIVITY_N) 順で読む"""
     act = pd.read_csv(ACT_PATH, usecols=["TUCASEID", "TUACTIVITY_N", "TUACTDUR24", "TUSTARTTIM",
-                                         "TUTIER1CODE", "TUTIER2CODE", "TEWHERE", "TRCODE"])
+                                            "TUTIER1CODE", "TUTIER2CODE", "TEWHERE", "TRCODE"])
     return act.sort_values(["TUCASEID", "TUACTIVITY_N"])
 
 
 # 統合CSVに書き出す条件・重み列
-COND_COLS = ["TUCASEID", "TUFINLWGT", "age", "gender", "day_of_week", "telfs",
-             "region", "state_fips", "metro"]
+COND_COLS = ["TUCASEID", "TUFINLWGT", "age", "gender", "day_of_week", "telfs"]
 
 
 def attach_conditions(case_ids: np.ndarray) -> pd.DataFrame:
-    """採用 diary の case_ids に Roster/Respondent/CPS の条件・重み・地域を結合"""
+    """採用 diary の case_ids に Roster/Respondent の条件・重みを結合"""
     resp = pd.read_csv(RESP_PATH, usecols=["TUCASEID", "TUFINLWGT", "TUDIARYDAY", "TELFS"])
     rost = pd.read_csv(ROST_PATH, usecols=["TUCASEID", "TULINENO", "TEAGE", "TESEX"])
-    cps  = pd.read_csv(CPS_PATH, usecols=["TUCASEID", "TULINENO", "GEREG", "GESTFIPS", "GTMETSTA"])
     respondent = rost[rost["TULINENO"] == 1].copy()  # TULINENO==1 が diary 回答者本人
-    cps_resp   = cps[cps["TULINENO"] == 1].drop(columns="TULINENO")
     cond = pd.DataFrame({"TUCASEID": case_ids}).merge(respondent, on="TUCASEID", how="left")
     cond = cond.merge(resp, on="TUCASEID", how="left")
-    cond = cond.merge(cps_resp, on="TUCASEID", how="left")
-    assert not cond[["TEAGE", "TESEX", "TUFINLWGT", "GESTFIPS"]].isna().any().any(), \
-        "roster/resp/cps 結合に欠損"
+    assert not cond[["TEAGE", "TESEX", "TUFINLWGT"]].isna().any().any(), \
+        "roster/resp 結合に欠損"
     assert (cond["TUCASEID"].to_numpy() == case_ids).all()
 
     cond["age"]         = cond["TEAGE"].astype(int)
     cond["gender"]      = (cond["TESEX"] == 2).astype(int)  # 1=male->0, 2=female->1
     cond["day_of_week"] = cond["TUDIARYDAY"].astype(int)    # 1=Sun .. 7=Sat
     cond["telfs"]       = cond["TELFS"].astype(int)
-    cond["region"]      = cond["GEREG"].astype(int)         # 1=NE 2=MW 3=South 4=West
-    cond["state_fips"]  = cond["GESTFIPS"].astype(int)
-    cond["metro"]       = cond["GTMETSTA"].astype(int)      # 1=metro 2=non-metro 3=unidentified
     return cond
 
 
