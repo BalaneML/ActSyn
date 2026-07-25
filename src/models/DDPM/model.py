@@ -49,7 +49,7 @@ import wandb
 # ============================================================
 # 実行ディレクトリに依存しないよう、スクリプト位置からリポジトリルートを解決
 REPO_ROOT   = Path(__file__).resolve().parents[3]   # src/models/DDPM -> repo root
-DATA_PATH   = REPO_ROOT / 'data' / 'processed' / 'atus2024_weighted_dataset.csv'
+DATA_PATH   = REPO_ROOT / 'data' / 'processed' / 'atus2024' / 'atus2024_weighted_dataset.csv'
 MODEL_SAVE_PATH = REPO_ROOT / 'outputs' / 'checkpoints' / 'ddpm_atus.pt'
 GEN_SAVE_PATH   = REPO_ROOT / 'outputs' / 'generated' / 'ddpm_atus_schedules.csv'
 
