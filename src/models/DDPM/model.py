@@ -465,8 +465,8 @@ def train():
             if 0 < EARLY_STOP_PATIENCE <= epochs_no_improve:
                 best_ep = best_state["epoch"] if best_state else ep
                 print(f"early stopping at epoch {ep} "
-                      f"(no val improvement for {epochs_no_improve} epochs; "
-                      f"best {best_val:.4f} @ epoch {best_ep})")
+                        f"(no val improvement for {epochs_no_improve} epochs; "
+                        f"best {best_val:.4f} @ epoch {best_ep})")
                 break
 
     # ベスト時点の重みへ巻き戻してから保存・評価する
@@ -521,7 +521,7 @@ def sanity_check(model):
     GEN_SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
     out = pd.concat(
         [cond_raw.reset_index(drop=True),
-         pd.DataFrame(gen, columns=[f"s{i}" for i in range(NUM_SLOTS)])],
+            pd.DataFrame(gen, columns=[f"s{i}" for i in range(NUM_SLOTS)])],
         axis=1,
     )
     out.to_csv(GEN_SAVE_PATH, index=False)
@@ -537,7 +537,7 @@ def sanity_check(model):
     # 夜間帯 (22:00-04:00 = s72..s95) の PERSONAL_CARE(睡眠含む) 比率
     night = slice(72, 96)
     print(f"夜間PERSONAL_CARE比率 real={(sched[:, night]==0).mean():.3f}  "
-          f"gen={(gen[:, night]==0).mean():.3f}")
+            f"gen={(gen[:, night]==0).mean():.3f}")
 
     # 17クラス時間シェア + 参加率曲線の JSD (base2; eval notebook と同じ流儀)
     real_share = np.bincount(sched.ravel(), minlength=NUM_ACT) / sched.size
