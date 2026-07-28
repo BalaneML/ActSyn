@@ -11,13 +11,14 @@ CVAE / CVAE_Embedding との差分（★が本モデルの新規部分）:
     - 損失         : cvae_loss は CVAE と同一（96スロット cross-entropy + β*KL）
     - 学習         : ★2段階
                     Stage 1 (train_elbo)      : ELBO 学習（null 固定=無条件 / 真ラベル=skyline）
+                                                ★最適化は AdamW + WEIGHT_DECAY（重み行列のみ）。
+                                                β*KL だけでは decoder が個票を暗記するため
                     Stage 2 (aggregate_match) : 群埋め込み+デコーダのみを集計マッチ損失
                                                 MSE(P μ̂, ν) で微調整; 個票ラベル不使用
     - 生成         : 群レベルの期待行動者率 μ̂(d)（group_rates）が主目的
                     個票サンプリングは sample_schedules
 
 このファイルは単体実行しない（データ読み込みは実験ごとに異なるため実験スクリプトが担当）:
-    uv run python src/models/CVAE_Aggregate/aggmatch_experiment.py    (D2-b シミュレーション)
     uv run python src/models/CVAE_Aggregate/japan_match_experiment.py (社基調への実転移)
 """
 import numpy as np
@@ -34,15 +35,28 @@ import torch.nn.functional as F
 NUM_SLOTS   = 96      # 15分刻み × 96 = 24時間
 
 # モデル
-HIDDEN_DIM  = 512  
-Z_DIM       = 64      
+HIDDEN_DIM  = 256  
+Z_DIM       = 32      
 DEMO_EMB    = 16      # ★群埋め込みの次元
-BETA        = 0.5
+BETA        = 1.0
 
 # Stage 1: ELBO 学習（pretrain / skyline）
-PRETRAIN_EPOCHS = 200
+PRETRAIN_EPOCHS = 100
 BATCH_SIZE      = 1024
 LR_PRETRAIN     = 1e-3
+WEIGHT_DECAY    = 3.0     # ★AdamW の減衰率（重み行列のみ; バイアスと群埋め込みは除外）
+                            # decoder のパラメータ数に対し訓練個票は数千本しかなく、
+                            # 正則化が β·KL だけでは decoder が日記を暗記する。
+                            # 値が通常の 1e-2 級より3桁大きいのは総更新数が少ないため:
+                            # AdamW の減衰は1ステップあたり (1 − LR·WD) の乗法的縮小で、
+                            # N≈3千・BATCH_SIZE=1024 だと 1エポック=3ステップ、
+                            # 400エポックでも 1,200ステップしかない。
+                            #   wd=1e-2 → 累積 0.988（無効）  wd=3.0 → 累積 0.027
+                            # ⇒ LR_PRETRAIN・BATCH_SIZE・PRETRAIN_EPOCHS を変えたら
+                            #   この値も --holdout-only で取り直すこと。
+                            # ATUS平日 (train 2,988 / val 748) での検証ELBO最小値:
+                            #   wd=0 → 97.90 (ep130), 3.0 → 94.02 (ep230), 10.0 → 104.76 (過剰)
+                            # 主効果は最小値より「暴走の停止」: epoch400 の val が 137.2 → 95.3
 
 # Stage 2: 集計マッチ微調整 ★
 AGG_STEPS   = 600
@@ -200,13 +214,71 @@ def cvae_loss( logits: torch.Tensor,
 # ============================================================
 # 5. 学習
 # ============================================================
+def decay_param_groups(model: nn.Module, wd: float) -> list[dict]:
+    """weight decay を重み行列だけに掛けるパラメータ群を作る（AdamW 用）。
+
+    除外する2種:
+        バイアス   : decoder 最終層のバイアスは「時刻×活動のロジットのベースライン」で、
+                    ここを 0 へ引くと活動の周辺分布が一様側へ歪む。過学習の抑制とは
+                    無関係な副作用なので減衰させない
+        demo_emb   : 群埋め込みを 0 へ引くと全群のベクトルが縮んで互いに近づき、
+                    条件付け（群偏差）そのものが弱まる。μ̂(d) の群差が主目的なので除外
+    """
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        (no_decay if name.endswith("bias") or name.startswith("demo_emb") else decay).append(p)
+    return [{"params": decay,    "weight_decay": wd},
+            {"params": no_decay, "weight_decay": 0.0}]
+
+
+@torch.no_grad()
+def eval_elbo(  model : AggCVAE,
+                S_t   : torch.Tensor,
+                demo_t: torch.Tensor,
+                w     : npt.NDArray[np.float64],
+                beta  : float = BETA,
+                mc    : int = 4
+                ) -> tuple[float, float, float]:
+    """調査ウェイト付き平均の (loss, recon, kl) を eval モードで計算する。
+
+    train_elbo の学習損失は重み付きブートストラップ抽出の下での期待値なので、
+    同じ重み付き平均をここで計算すれば train 分割と val 分割を同一尺度で比較できる
+    （抽出のばらつきを介さない分、過学習ギャップの読み取りが安定する）。
+    recon は cvae_loss と同じく「1個票あたり96スロット合計の CE」、kl は個票あたりの
+    KL( q(z|x) || N(0,I) )。z のサンプリング由来のノイズを抑えるため mc 本を平均する。
+    """
+    model.eval()
+    wt = torch.as_tensor(w, dtype=torch.float64)
+    w_sum = float(wt.sum())
+    recon_acc = kl_acc = 0.0
+    for _ in range(mc):
+        for b in range(0, len(S_t), BATCH_SIZE):
+            sched = S_t[b:b + BATCH_SIZE].to(DEVICE)
+            demo  = demo_t[b:b + BATCH_SIZE].to(DEVICE)
+            wb    = wt[b:b + BATCH_SIZE]   # MPS は float64 非対応なのでウェイトは CPU に置く
+            logits, mu, logvar = model(sched, demo)
+            # reduction="none" で個票ごとの値を取り出してから調査ウェイトで加重する
+            # （cvae_loss は単純バッチ平均なのでウェイトを掛けられない）
+            recon_i = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), sched.reshape(-1), reduction="none"
+            ).view(sched.size(0), -1).sum(dim=1)                       # (B,) 96スロット合計
+            kl_i = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)  # (B,)
+            recon_acc += float((recon_i.cpu().double() * wb).sum())
+            kl_acc    += float((kl_i.cpu().double() * wb).sum())
+    recon = recon_acc / (w_sum * mc)
+    kl    = kl_acc / (w_sum * mc)
+    return recon + beta * kl, recon, kl
+
+
 def train_elbo( model : AggCVAE,
                 S_t   : torch.Tensor,
                 demo_t: torch.Tensor,
                 w     : npt.NDArray[np.float64],
                 epochs: int,
-                tag   : str
-                ) -> None:
+                tag   : str,
+                val   : tuple[torch.Tensor, torch.Tensor, npt.NDArray[np.float64]] | None = None,
+                eval_every: int = 10
+                ) -> list[dict]:
     """
     Stage 1: 重み付きサンプラで ELBO 学習（CVAE の train() に対応）
     demo_t = null トークンで無条件 pretrain / 真ラベルで skyline (天井性能)
@@ -218,10 +290,22 @@ def train_elbo( model : AggCVAE,
         w     : サンプル重み (N,)
         epochs: 学習エポック数
         tag   : ログ出力用
+        val   : 検証分割 (S_val, demo_val, w_val)。渡すと eval_every エポックごとに
+                train/val 双方の重み付き ELBO を eval モードで記録する（過学習診断用）。
+                None なら従来どおり学習のみ
+        eval_every: 検証を回すエポック間隔
+
+    returns:
+        val=None なら空リスト。val を渡した場合は
+        [{epoch, train_loss, train_recon, train_kl, val_loss, val_recon, val_kl}, ...]
     """
-    opt = torch.optim.Adam(model.parameters(), lr=LR_PRETRAIN)
+    # Adam ではなく AdamW: Adam の weight_decay は L2 項を勾配に足す実装で、
+    # 適応的な学習率スケーリングに巻き込まれて減衰の強さがパラメータごとに変わる。
+    # AdamW は減衰を勾配から切り離して掛けるので、WEIGHT_DECAY が意図どおりに効く
+    opt = torch.optim.AdamW(decay_param_groups(model, WEIGHT_DECAY), lr=LR_PRETRAIN)
     n = len(S_t)
     prob = torch.as_tensor(w / w.sum())  # 調査ウェイト w を選択確率に正規化
+    history: list[dict] = []
     for ep in range(1, epochs + 1):
         # 重み付き復元抽出で毎エポック n 本を引き直す（weighted bootstrap）。
         # ウェイトの大きい個票ほど頻繁に提示される = 重み付き ELBO の近似
@@ -237,8 +321,20 @@ def train_elbo( model : AggCVAE,
             loss.backward()
             opt.step()
             ep_loss += loss.item() * len(bi)
+        if val is not None and (ep % eval_every == 0 or ep == 1):
+            tr_l, tr_r, tr_k = eval_elbo(model, S_t, demo_t, w)
+            va_l, va_r, va_k = eval_elbo(model, val[0], val[1], val[2])
+            history.append({"epoch": ep,
+                            "train_loss": tr_l, "train_recon": tr_r, "train_kl": tr_k,
+                            "val_loss":   va_l, "val_recon":   va_r, "val_kl":   va_k})
         if ep % 50 == 0 or ep == 1:
-            print(f"  [{tag}] epoch {ep:3d}  loss {ep_loss / n:8.3f}")
+            msg = f"  [{tag}] epoch {ep:3d}  loss {ep_loss / n:8.3f}"
+            if history and history[-1]["epoch"] == ep:
+                h = history[-1]
+                msg += (f"  | train {h['train_loss']:8.3f}  val {h['val_loss']:8.3f}"
+                        f"  gap {h['val_loss'] - h['train_loss']:7.3f}")
+            print(msg)
+    return history
 
 
 def aggregate_match(model: AggCVAE,
@@ -357,7 +453,9 @@ def group_participation(model: AggCVAE, n_demo: int,
 
 @torch.no_grad()
 def sample_schedules(model: AggCVAE, d: int, n: int) -> np.ndarray:
-    """群 d の離散スケジュール (n,96) をスロット別カテゴリカルサンプリングで生成"""
+    """
+    群 d の離散スケジュール (n,96) をスロット別カテゴリカルサンプリングで生成
+    """
     model.eval()
     z = torch.randn(n, Z_DIM, device=DEVICE)
     di = torch.full((n,), d, dtype=torch.long, device=DEVICE)
