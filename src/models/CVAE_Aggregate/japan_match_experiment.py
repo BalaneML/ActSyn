@@ -28,9 +28,15 @@
     no-anchor : 周辺マッチのみ (アンカーの寄与のablation)
     shuffled  : 周辺教師の群ラベルをシャッフルしてマッチ (負の対照)
     baseline  : 「全群=日本の人口平均」と予測する判別ゼロの参照条件 (モデル不要)。
-                他バリアントと同じ全指標 (rate_mae/rmse, dev_mae/rmse, 活動別MAE/RMSE) で
+                他バリアントと同じ全指標 (rate_mae/mse/rmse, dev_mae/rmse, 活動別MAE/RMSE) で
                 結果CSVに1行として出力。稀な活動では baseline が MAE で有利になるので
                 (「ほぼゼロと出す」だけで下がる)、MAE 単独でなく RMSE と併読すること
+
+指標の読み分け:
+    margin_mse : 教師(周辺2表)への当てはまり。Stage2 の学習目的関数そのもの (アンカー項を除く)
+    rate_*     : 非教師(28群)への汎化。margin_mse と並べると汎化ギャップが読める
+    rate_mse   : rate_rmse の二乗。順位情報は rate_rmse と同一で、損失(MSE)と単位を
+                    揃えるためだけに置く。解釈・考察は rate_rmse / rate_mae 側で行うこと
 
 アンカー: 関数空間アンカー（pretrain デコーダ出力への正則化）
     凍結CVAE(Stage1の後) と 集計マッチCVAE(Stage2中)の同一 (潜在変数z, 群d) でのデコーダ出力確率とのMSE
@@ -384,8 +390,40 @@ def nan_renorm_pop_weights(grp_tbl: np.ndarray, pi_d: np.ndarray) -> np.ndarray:
         return w / w.sum(axis=0)
 
 
+def margin_fit_mse(mu_hat: np.ndarray, tgt: dict, mask_c: np.ndarray) -> float:
+    """μ̂ (28, 12*96 act-major) の周辺2表への当てはまり = 学習目的関数の値。
+
+    margin_match の損失 (L284-285) と同一定義:
+        MSE(Σ_e π(e|g,a) μ̂, margin_ga) + MSE(Σ_a π(a|g,e) μ̂, margin_ge)
+    アンカー項 (anchor_w * MSE(probs, probs_pre)) は含めない。これは正則化であって
+    データ項ではなく、バリアント間で重みが異なる (matched=1.0, no-anchor=0.0) ため、
+    足すと「教師への当てはまり」の比較にならないから。
+
+    eval_against が非教師の28群 (統計量ホールドアウト) を測るのに対し、こちらは
+    学習で最小化した教師そのものを測る。両者を並べて汎化ギャップを読む。
+
+    shuffled バリアントの注意: 学習は置換された群対応で行われるが、ここでは
+    eval_against と同じ μ̂ (恒等対応で生成) を渡す。したがって shuffled の値は
+    「学習ログの loss」ではなく「正しい対応で測り直した当てはまり」であり、
+    他バリアントと同じ土俵の量になる。
+    """
+    mu = mu_hat.reshape(N_G, N_A, N_E, NUM_COMMON, NUM_SLOTS)
+    pop  = tgt["pop"]                                   # (2,7,2)
+    pi_e = tgt["pi_e"]                                  # π(就業|性,年齢) (2,7,2)
+    pi_a = pop / pop.sum(axis=1, keepdims=True)         # π(年齢|性,就業) (2,7,2)
+    total = 0.0
+    for mu_m, tgt_m in (((mu * pi_e[..., None, None]).sum(axis=2), tgt["margin_ga"]),
+                        ((mu * pi_a[..., None, None]).sum(axis=1), tgt["margin_ge"])):
+        # OTHER_X 列を落とし (mask_c)、非公表 NaN セルを除外 (学習時と同じ二段マスク)。
+        # 活動軸は末尾から2番目なので、学習側の mga[..., mc, :] と同じく ... で位置を合わせる
+        m = ~np.isnan(tgt_m[..., mask_c, :])
+        e = (mu_m[..., mask_c, :] - tgt_m[..., mask_c, :])[m]
+        total += float((e ** 2).mean())
+    return total
+
+
 def eval_against(mu_hat: np.ndarray, tgt: dict, mask_c: np.ndarray) -> dict:
-    """μ̂ (28, 12*96 act-major) vs 公表の群別行動者率。OTHER_X と NaN を除外して MAE / RMSE を計算。
+    """μ̂ (28, 12*96 act-major) vs 公表の群別行動者率。OTHER_X と NaN を除外して MAE / MSE / RMSE を計算。
 
     MAE と RMSE を必ず併記する。教師セル (28群×11活動×96スロット) は率<0.01 のセルが
     約半数を占める強い偏りがあり、両者は別のものを測るため:
@@ -393,6 +431,8 @@ def eval_against(mu_hat: np.ndarray, tgt: dict, mask_c: np.ndarray) -> dict:
                 「稀な活動をほぼゼロと出す」だけで下がる (多様性を犠牲にすると得をする)。
         RMSE = 二乗和が誤差上位セルに集中するため、実質「ピーク帯 (WORK 昼・SLEEP 深夜)
                 がどれだけ合うか」の指標。裾に敏感な補助指標として残す。
+        MSE  = RMSE の二乗であり順位情報は RMSE と同一。学習損失 (MSE) と単位を
+                揃えて読むためだけに置く。解釈は RMSE 側で行うこと。
     """
     grp_tbl = tgt["group_rates_tbl"]                        # (28,12,96)
     mh = mu_hat.reshape(D_GROUPS, NUM_COMMON, NUM_SLOTS)
@@ -401,7 +441,8 @@ def eval_against(mu_hat: np.ndarray, tgt: dict, mask_c: np.ndarray) -> dict:
     m = ~np.isnan(grp_tbl) & mask_c[None, :, None]
     err = (mh - grp_tbl)[m]
     mae  = float(np.abs(err).mean())
-    rmse = float(np.sqrt((err ** 2).mean()))
+    mse  = float((err ** 2).mean())
+    rmse = float(np.sqrt(mse))
     # 群偏差 (人口平均からの差): 条件付け能力。
     # 非公表 NaN の群をセルごとに除外して π を再正規化し、モデル側の平均も
     # 同じ群集合で取る (教師とモデルで比較対象の「人口平均」を揃える)
@@ -418,7 +459,7 @@ def eval_against(mu_hat: np.ndarray, tgt: dict, mask_c: np.ndarray) -> dict:
         e = (mh - grp_tbl)[:, int(c)][m[:, int(c)]]
         per_act[f"mae_{c.name}"]  = float(np.abs(e).mean())
         per_act[f"rmse_{c.name}"] = float(np.sqrt((e ** 2).mean()))
-    return {"rate_mae": mae, "rate_rmse": rmse,
+    return {"rate_mae": mae, "rate_mse": mse, "rate_rmse": rmse,
             "dev_mae": dev_mae, "dev_rmse": dev_rmse, **per_act}
 
 
@@ -513,23 +554,32 @@ def main():
         print(f"saved variant checkpoint -> {variant_path}")
 
     # --- 評価: 平日の群別行動者率 (統計量ホールドアウト) ---
+    # margin_mse (教師=周辺2表への当てはまり) と rate_* (非教師=28群) を同じ μ̂ から出し、
+    # 1行で「教師にどれだけ合ったか」対「非教師にどれだけ汎化したか」を読めるようにする
     records = []
     for variant, model in variants.items():
         mu_hat = group_rates(model, D_GROUPS)
         records.append({"variant": variant, "eval": "weekday_groups",
+                        "margin_mse": margin_fit_mse(mu_hat, tgt_wd, mask_c),
                         **eval_against(mu_hat, tgt_wd, mask_c)})
     records.append({"variant": "baseline", "eval": "weekday_groups",
+                    "margin_mse": margin_fit_mse(baseline_mu, tgt_wd, mask_c),
                     **eval_against(baseline_mu, tgt_wd, mask_c)})
     res = pd.DataFrame(records)
     OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     res.to_csv(OUT_CSV, index=False)
 
-    main_cols = ["variant", "eval", "rate_mae", "rate_rmse", "dev_mae", "dev_rmse"] + \
+    main_cols = ["variant", "eval", "margin_mse",
+                 "rate_mae", "rate_mse", "rate_rmse", "dev_mae", "dev_rmse"] + \
                 [f"{p}_{k}" for k in BREAK_CANDIDATES + PRESERVE_CANDIDATES for p in ("mae", "rmse")]
     act_names = [c.name for c in Common if mask_c[int(c)]]
     with pd.option_context("display.width", 220, "display.float_format", "{:.4f}".format):
+        # margin_mse / rate_mse は率の二乗 (1e-4 オーダー) なので 4桁だと 0.0000 に潰れる。
+        # 主表だけ6桁で出す
         print("\n=== 平日の群別行動者率(28群)=統計量ホールドアウト ===")
-        print(res[main_cols].to_string(index=False))
+        print("    margin_mse = 教師(周辺2表)への当てはまり / rate_*・dev_* = 非教師(28群)への汎化")
+        with pd.option_context("display.float_format", "{:.6f}".format):
+            print(res[main_cols].to_string(index=False))
         print("\n=== 活動別 MAE (全活動分類; OTHER_X除外) ===")
         print(res[["variant"] + [f"mae_{n}" for n in act_names]].to_string(index=False))
         print("\n=== 活動別 RMSE (全活動分類; OTHER_X除外) ===")
