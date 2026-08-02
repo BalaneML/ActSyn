@@ -19,7 +19,9 @@
 cd "${PBS_O_WORKDIR}"
 source jobs/_common.sh
 
-EPOCHS=300
+# 環境変数で上書きできる（`EPOCHS=1000 qsub -v EPOCHS jobs/train_ddpm.sh`）。
+# train_ddpm_tang.sh と同じ流儀に揃えてある。
+EPOCHS="${EPOCHS:-300}"
 LOG="${WORK}/logs/ddpm_train_${PBS_JOBID:-manual}.log"
 
 echo "log: ${LOG}"
