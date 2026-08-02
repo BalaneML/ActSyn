@@ -1,0 +1,59 @@
+# DomainTransfer_trial 実験用 Singularity イメージ定義
+#
+# ビルド場所: SQUID の HPDA フロントエンド（squidhpda.hpc.cmc.osaka-u.ac.jp）
+#   SQUID でイメージをビルドできるのは HPDA フロントエンドのみ。HPC フロントエンド
+#   （squidhpc）では pull しかできない。
+#
+# ビルド手順は container/README.md を参照。
+#
+# ベースイメージのタグについて:
+#   nvcr.io/nvidia/pytorch:25.02-py3 は Ubuntu 24.04 / Python 3.12 / PyTorch 2.7.0a0 /
+#   CUDA 12.8.0 / cuDNN 9.7.1 を含む。
+#   ドライバ要件は「570 以降」だが、データセンタ GPU（SQUID の A100 が該当）では
+#   470.57 / 525.85 / 535.86 以降の R470・R525・R535 系でも forward-compatibility により動作する。
+#   実機のドライバ版は INTG キューの会話型ジョブで nvidia-smi を実行して確認すること
+#   （手順は container/README.md §1）。合わない場合はここのタグだけを差し替えて再ビルドする。
+
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:25.02-py3
+
+%files
+    # ビルド時のカレントディレクトリ（= リポジトリルート）からの相対パス
+    container/requirements-container.txt /opt/requirements-container.txt
+
+%post
+    # 非対話でのインストールを保証する
+    export DEBIAN_FRONTEND=noninteractive
+
+    # torch と numpy は NGC 同梱版を維持する。requirements-container.txt 側で
+    # 両者を列挙していないため、pip はこれらを再インストールしない。
+    pip install --no-cache-dir -r /opt/requirements-container.txt
+
+    # NGC 同梱の torch がそのまま残っているかをビルド時点で確認する。
+    # ここで失敗すれば、壊れたイメージがジョブ投入前に検出できる。
+    python -c "import torch, numpy, pandas, sklearn, scipy, matplotlib, wandb; \
+print('torch', torch.__version__); print('numpy', numpy.__version__); print('pandas', pandas.__version__)"
+
+%environment
+    # ホスト側の ~/.local/lib/python3.*/site-packages をコンテナ内へ持ち込ませない。
+    # これを入れないと、フロントエンドで --user インストールしたパッケージが
+    # コンテナ内の同名パッケージを黙って上書きし、再現性が壊れる。
+    export PYTHONNOUSERSITE=1
+
+    # 標準出力をバッファリングしない。ジョブ実行中でもログが追える。
+    export PYTHONUNBUFFERED=1
+
+%labels
+    Project      DomainTransfer_trial
+    BaseImage    nvcr.io/nvidia/pytorch:25.02-py3
+    Purpose      DDPM / CVAE training and sampling on SQUID GPU nodes
+
+%help
+    DomainTransfer_trial の学習・サンプリング用イメージ。
+
+    実行例（--nv を付けないとコンテナ内から GPU が見えない）:
+        singularity run --nv domaintransfer.sif python src/models/DDPM_Aggregate/model.py --smoke
+
+    singularity exec ではなく run を使うこと。NGC イメージのエントリポイントが
+    ホストドライバとの CUDA 互換レイヤを設定するため、これを飛ばすと
+    古いドライバの環境で CUDA 初期化に失敗する。
