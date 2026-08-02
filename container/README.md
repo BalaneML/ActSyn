@@ -62,35 +62,54 @@ Driver Version: 590.48.01
 
 ## 2. イメージをビルドする
 
-**ビルドは HPDA フロントエンド（`squidhpda`）でのみ可能。**
-HPC フロントエンド（`squidhpc`）では `singularity pull` しかできない。
+**HPC フロントエンド（`squidhpc`）でビルドできる。ただし作業領域と出力先は
+ノードのローカルディスク（`/tmp`）に置く。**
+
+work 領域（`/sqfs/work`）は singularity がビルド用に作るマウント名前空間の中から
+見えない。`SINGULARITY_TMPDIR` に指定すると rootfs の展開で、出力先に指定すると
+SIF の書き出しで失敗する（→「つまずきやすい点」）。
+名前空間の外で動くダウンロードキャッシュ（`SINGULARITY_CACHEDIR`）だけは work 領域でよい。
 
 ```bash
-ssh <利用者番号>@squidhpda.hpc.cmc.osaka-u.ac.jp
+ssh <利用者番号>@squidhpc.hpc.cmc.osaka-u.ac.jp
 
 # work 領域を使う前に必要
 newgrp <グループ名>
 
 export WORK=/sqfs/work/<グループ名>/<利用者番号>
 
-# ビルド時の一時ファイルとキャッシュを work 領域へ逃がす。
+# blob のダウンロードキャッシュを work 領域へ逃がす。
 # 既定では home（10GB 上限）に置かれ、NGC イメージのサイズで容易に溢れる。
+# SINGULARITY_TMPDIR は設定しない（既定の /tmp を使う）。
 export SINGULARITY_CACHEDIR=$WORK/.cache/singularity
-export SINGULARITY_TMPDIR=$WORK/.tmp/singularity
-mkdir -p "$SINGULARITY_CACHEDIR" "$SINGULARITY_TMPDIR" "$WORK/containers"
+mkdir -p "$SINGULARITY_CACHEDIR" "$WORK/containers"
 
 # リポジトリを配置（フロントエンドは外部ネットワークへ接続できる）
 cd $WORK
 git clone https://github.com/BalaneML/DomainTransfer_trial.git
 cd DomainTransfer_trial
 
+# /tmp の空きを確認する。rootfs の展開に約 25GB、SIF に約 11GB 必要。
+df -h /tmp
+
 # def ファイル内の %files がリポジトリルート相対のため、ここで実行する
-singularity build -f $WORK/containers/domaintransfer.sif container/domaintransfer.def
+singularity build -F -f /tmp/domaintransfer.sif container/domaintransfer.def
+
+# 完成後に work へ移す。cp は名前空間の外で動くので work へ書ける。
+cp /tmp/domaintransfer.sif $WORK/containers/ && rm /tmp/domaintransfer.sif
+ls -lh $WORK/containers/domaintransfer.sif
 ```
 
 - `-f` は fakeroot ビルド。SQUID では root 権限なしでビルドするためこれが必要。
-- ビルドには数十分かかる。`%post` の最後で torch / numpy / pandas の import と
+- `-F` は既存 SIF の上書き。`-f` とは別のオプションなので両方指定する。
+- ベースイメージの pull から通して数十分、キャッシュ済みなら約 5 分。完成する SIF は約 11GB。
+- `%post` の最後で torch / numpy / pandas の import と
   バージョン表示を行うので、ここで失敗すれば依存の衝突がジョブ投入前に検出できる。
+- `%post` の冒頭に出る `15:4: not a valid test operator` は、NGC の `/etc/shinit_v2` を
+  `/bin/sh` で source したことによる警告。ビルドは正常に継続するので無視してよい。
+- ビルド後、work 領域のキャッシュ（`$WORK/.cache/singularity`、約 20GB）は削除してよい。
+
+> 実績: 2026-08-02、`squidhpc3` でビルド成功（ドライバ 590.48.01）。
 
 ---
 
@@ -162,7 +181,10 @@ wandb sync $WORK/wandb/offline-run-*
 | コンテナ内で `torch.cuda.is_available()` が False | `--nv` が付いていない。`jobs/_common.sh` の `run_gpu` を使う |
 | CUDA の初期化でエラー | `singularity exec` を使っている。`run` に変えて NGC のエントリポイント（CUDA 互換レイヤの設定）を通す |
 | ローカルと結果が食い違う | ホストの `~/.local` のパッケージが混入している。`domaintransfer.def` の `PYTHONNOUSERSITE=1` が効いているか確認する |
-| ビルドが容量不足で失敗 | `SINGULARITY_CACHEDIR` / `SINGULARITY_TMPDIR` が home を指している |
+| ビルドが `packer failed to pack: ... mkdir rootfs: no such file or directory` で失敗 | `SINGULARITY_TMPDIR` が work 領域を指している。ビルドの名前空間から `/sqfs/work` は見えない。`unset SINGULARITY_TMPDIR` して既定の `/tmp` を使う |
+| `%post` は成功するのに SIF の書き出しが `permission denied` で失敗 | 出力先が work 領域。`/tmp` に出力してから `cp` で work へ移す |
+| ビルドが容量不足で失敗 | `SINGULARITY_CACHEDIR` が home を指している。または `/tmp` の空きが 40GB 未満（`df -h /tmp`） |
+| work 領域が `permission denied` で読み書きできない | `newgrp <グループ名>` を実行していない |
 | ジョブが書き込みエラーで落ちる | 出力先が home（10GB 上限）。`jobs/_common.sh` が work 領域を指しているか確認する |
 | ジョブ最後のコマンドが実行されない | ジョブスクリプト末尾に改行が無い |
 

@@ -19,10 +19,10 @@
 3. [離散スケジュールを連続拡散に載せる](#3-離散スケジュールを連続拡散に載せる)
 4. [条件付け（28群）と classifier-free guidance](#4-条件付け28群と-classifier-free-guidance)
 5. [denoiser（1D-UNet）の構造](#5-denoiser1d-unetの構造)
-6. [学習ループ](#6-学習ループ)
-7. [サンプリング — ancestral と DDIM](#7-サンプリング--ancestral-と-ddim)
-8. [Stage 2 — 指数傾けによる集計マッチ](#8-stage-2--指数傾けによる集計マッチ)
-9. [評価デザインと実測結果](#9-評価デザインと実測結果)
+6. [学習ループ](#6-学習ループ)（**アルゴリズム 1**）
+7. [サンプリング — ancestral と DDIM](#7-サンプリング--ancestral-と-ddim)（**アルゴリズム 2・3**）
+8. [Stage 2 — 指数傾けによる集計マッチ](#8-stage-2--指数傾けによる集計マッチ)（**アルゴリズム 4**）
+9. [評価デザインと実測結果](#9-評価デザインと実測結果)（**アルゴリズム 5**）
 10. [実行手順と計算コスト](#10-実行手順と計算コスト)
 11. [よくある勘違い](#11-よくある勘違い)
 12. [コードを読むときの注意点](#12-コードを読むときの注意点)
@@ -381,6 +381,61 @@ $\hat{x}_0$ の復元式が $x_t / \sqrt{\bar\alpha_t}$ という素直な値か
 
 `train()`（L483-558）。通常の PyTorch 学習ループに、以下の 3 つの工夫が加わっているだけである。
 
+### アルゴリズム 1: Stage 1 学習（条件付き DDPM + CFG）
+
+記号: $x_0$ = 個票スケジュールの $\pm1$ 表現 (B,12,96)、$c$ = 条件インデックス (B,3)、
+$\epsilon_\theta$ = `UNet1D`、$\varnothing$ = 学習可能な無条件埋め込み `null_emb`。
+
+```text
+入力: ATUS 平日個票 {(sched_i, c_i, w_i)}_{i=1..N}   N = 3,736, w = 調査ウェイト TUFINLWGT
+定数: T = 1000, β_t = linspace(1e-4, 0.02, T), ᾱ_t = Π_{s≤t}(1-β_s)
+      B = 256, lr = 2e-4 (AdamW, wd = 0), p_uncond = 0.1
+      E_max = 1000, patience = 200, δ_min = 1e-4, decay_EMA = 0.999
+出力: EMA 重み θ̄（生成に使うのはこちら）
+
+ 1  (train, val) ← 9 : 1 のランダム分割（seed = 42）
+ 2  θ ← UNet1D の初期化（out_conv の重み・バイアスはゼロ初期化）
+ 3  θ̄ ← θ                                        # EMA shadow
+ 4  best ← +∞ ;  no_improve ← 0
+ 5  for epoch = 1 .. E_max do
+ 6      # ---- 学習パス ----
+ 7      for バッチ (sched, c) ← train を w に比例した復元抽出でサンプル do   # 14 バッチ/epoch
+ 8          x_0    ← 2·one_hot(sched) − 1                      # (B,12,96) ∈ {−1,+1}
+ 9          t      ~ Uniform{0, …, T−1}                        # ★サンプルごとに独立
+10          ε      ~ N(0, I)                                   # (B,12,96)
+11          x_t    ← √ᾱ_t · x_0 + √(1−ᾱ_t) · ε                 # forward を 1 発で
+12          drop   ~ Bernoulli(p_uncond)                       # (B,)  CFG の条件 dropout
+13          c̃      ← where(drop, ∅, c)
+14          L      ← ‖ ε − ε_θ(x_t, t, c̃) ‖²                    # 単なる MSE
+15          θ      ← AdamW_step(θ, ∇_θ L)
+16          θ̄      ← decay_EMA · θ̄ + (1 − decay_EMA) · θ        # 毎ステップ更新
+17      # ---- 検証パス（非加重・勾配なし。8–14 行と同じ L を平均） ----
+18      val ← mean over val バッチ of L                        # t・ε・drop を引き直す
+19      # ---- early stopping ----
+20      if val < best − δ_min then
+21          best ← val ;  no_improve ← 0 ;  (θ*, θ̄*) ← (θ, θ̄)   # 最良エポックを退避
+22      else
+23          no_improve ← no_improve + 1
+24          if no_improve ≥ patience then break
+25  (θ, θ̄) ← (θ*, θ̄*)                                          # 最良エポックへ巻き戻す
+26  チェックポイントに θ と θ̄ の両方を保存
+27  return θ̄
+```
+
+対応するコード: 7–16 行が `Diffusion.loss`（L369-377）と `run_epoch`、
+17–27 行が `train()`（L483-558）。
+
+読むときの要点 4 つ:
+
+- **9 行目**が拡散モデル学習の肝である。$t$ を 1 → 1000 と順に回すのではなく、
+  サンプルごとに独立に 1 個引く。11 行目が一発で $x_t$ を作れるので中間状態は不要
+- **12–13 行目**が CFG の学習側。1 つのネットワークに条件付きと無条件を同居させる
+- **18 行目の検証は学習と同じ `Diffusion.loss` を通る**ので、$t$・$\epsilon$・条件 dropout を
+  毎回引き直す確率的な指標である。エポック間で値が揺れるのはこのためで、
+  生成品質の代理にはならない（→ [6.3](#63-early-stopping)）
+- **21・25 行目**で raw 重み $\theta$ と EMA 重み $\bar\theta$ を**対で**退避・復元する。
+  片方だけ戻すと、EMA が別エポックの平均になって生成品質が崩れる
+
 ### 6.1 調査ウェイトによる重み付きサンプリング
 
 ATUS の個票には標本設計に由来する調査ウェイト `TUFINLWGT` が付いている。
@@ -420,6 +475,39 @@ shadow ← decay · shadow + (1 - decay) · weights     # decay = 0.999、毎ス
 
 ## 7. サンプリング — ancestral と DDIM
 
+### アルゴリズム 2: ancestral サンプリング（既定）
+
+```text
+入力: 学習済み EMA 重み ε_θ̄, 条件 c (M,3), guidance scale w = 1.25
+定数: T = 1000, ᾱ_t, および後方係数
+      coef_x0(t) = β_t√ᾱ_{t−1}/(1−ᾱ_t),  coef_xt(t) = (1−ᾱ_{t−1})√α_t/(1−ᾱ_t),
+      post_var(t) = β_t(1−ᾱ_{t−1})/(1−ᾱ_t)
+出力: スケジュール (M, 96) の活動ラベル整数
+
+ 1  x ~ N(0, I)                                          # (M,12,96) = x_T
+ 2  for t = T−1, T−2, …, 0 do                            # 999 → 0
+ 3      # ---- CFG 込みの ε 予測（前向き計算 2 回） ----
+ 4      ε_c ← ε_θ̄(x, t, c)
+ 5      if w = 1 then  ε̂ ← ε_c                            # 前向き計算は 1 回で済む
+ 6      else           ε_u ← ε_θ̄(x, t, ∅) ;  ε̂ ← ε_u + w · (ε_c − ε_u)
+ 7      # ---- ε から x_0 を復元 ----
+ 8      x̂_0 ← (x − √(1−ᾱ_t) · ε̂) / √ᾱ_t
+ 9      x̂_0 ← clamp(x̂_0, −1, +1)                          # ★増幅した誤差を押さえ込む
+10      # ---- q(x_{t−1} | x_t, x̂_0) から 1 ステップ戻る ----
+11      μ ← coef_x0(t) · x̂_0 + coef_xt(t) · x
+12      if t > 0 then  x ← μ + √post_var(t) · z,  z ~ N(0, I)
+13      else           x ← μ                              # 最終ステップはノイズを足さない
+14  return argmax over チャネル軸 of x                     # (M,96) 連続値 → 活動ラベル
+```
+
+対応するコード: `Diffusion.sample`（L388-402）、4–6 行が `Diffusion._eps`（L379-386）。
+
+- **1 ステップあたり前向き計算 2 回**（条件付き + 無条件）。$w = 1$ のときだけ 1 回に短縮される
+- **9 行目の clamp が必須**な理由は [2.4](#24-reverse-過程ancestral-sampling) のとおり。
+  $t$ が大きいと $1/\sqrt{\bar\alpha_t} \approx 156$ 倍の増幅が起きる
+- **14 行目の argmax** がこの実装の性格を決めている。連続値のぼやけが
+  そのままスロット単位のちらつき（断片化）になる（→ [3.3](#33-この表現の帰結重要)）
+
 ### 7.1 DDIM とは
 
 ancestral sampling は 1000 ステップすべてを辿るため遅い。
@@ -435,6 +523,37 @@ $\eta$ が逆過程の確率性の強さを決める:
 
 - $\eta = 0$: $\sigma = 0$ で**決定的**。$x_T$ を決めれば出力が一意に決まる（ODE を解くのと等価）
 - $\eta = 1$: ancestral と同じ後方分散になり、確率的な逆過程に戻る
+
+### アルゴリズム 3: DDIM サンプリング（高速経路）
+
+アルゴリズム 2 との差分は **2 行目の $t$ 列**と **11–14 行目の更新式**だけである。
+
+```text
+入力: ε_θ̄, 条件 c (M,3), w = 1.25, ステップ数 S = 50, η = 1.0
+出力: スケジュール (M, 96)
+
+ 1  x ~ N(0, I)
+ 2  (t_0, …, t_{S−1}) ← round(linspace(0, T−1, S)) を降順に並べたもの   # 例: 999, 979, …, 0
+ 3  for i = 0 .. S−1 do
+ 4      t ← t_i
+ 5      ε̂ ← CFG 込みの ε 予測（アルゴリズム 2 の 4–6 行と同一）
+ 6      x̂_0 ← clamp( (x − √(1−ᾱ_t)·ε̂) / √ᾱ_t , −1, +1)
+ 7      if i = S−1 then
+ 8          x ← x̂_0                                       # 最終ステップは x_0 をそのまま返す
+ 9          break
+10      t_prev ← t_{i+1}
+11      σ ← η · √( (1−ᾱ_{t_prev})/(1−ᾱ_t) · (1 − ᾱ_t/ᾱ_{t_prev}) )
+12      dir ← √(max(1 − ᾱ_{t_prev} − σ², 0)) · ε̂          # 「x_t 方向」の成分
+13      x ← √ᾱ_{t_prev} · x̂_0 + dir
+14      if η > 0 then  x ← x + σ · z,  z ~ N(0, I)
+15  return argmax over チャネル軸 of x
+```
+
+対応するコード: `Diffusion.ddim_sample`（L404-434）。
+
+$\eta = 1$ とすれば 11 行目の $\sigma$ は ancestral の後方分散に一致するが、
+**間引きによって $x_0$ がぼやける効果は消えない**ため、断片化は ancestral に届かない
+（次節の実測を参照）。既定では使わない。
 
 ### 7.2 本コードでは DDIM を既定にしていない
 
@@ -544,6 +663,75 @@ $$\frac{\partial g}{\partial \lambda_{ga}} = \nu_{ga} - \hat\mu_{ga}(\lambda,\et
 さらに、プールを固定した後の問題は**「$M$ 本の日記への重み配分を決める有限次元の凸問題」**
 と厳密に一致する。連続分布を近似しているのではなく、離散版を厳密に解いている。
 
+### アルゴリズム 4: Stage 2 指数傾け（双対の L-BFGS 解法）
+
+[8.3](#83-双対をゆっくり展開) の双対 $g(\lambda,\eta)$ を最大化する
+（実装は $-g$ の最小化）。**生成器には一切触れない**。
+
+```text
+入力: プール pool (D, M, 96)  — 凍結 DDPM の群別サンプル = 提案分布 p_d
+      公表周辺 ν_ga (2,7,12,96)・ν_ge (2,2,12,96)  — 未公表セルは NaN
+      人口シェア π(e|g,a) (2,7,2), π(a|g,e) (2,7,2)  — 社基調の推定人口から算出
+      活動マスク mask_c (12,)  — 比較不能な OTHER_X が False
+定数: ridge = 1e-2, LBFGS_ITER = 200, RESTARTS = 8
+出力: 重み w (D, M)（群ごとに和 1）, 診断 diag
+計算環境: ★CPU / float64 固定（MPS は float64 非対応、float32 では残差が頭打ち）
+
+ 1  # ---- マスク: 未公表セルと OTHER_X を λ,η の両方から落とす ----
+ 2  m_ga ← ¬isnan(ν_ga) ∧ mask_c ;  m_ge ← ¬isnan(ν_ge) ∧ mask_c
+ 3  ν_ga ← nan_to_num(ν_ga) ;  ν_ge ← nan_to_num(ν_ge)
+ 4  λ ← 0 (2,7,12,96) ;  η ← 0 (2,2,12,96)                # 自由変数は公表 18 行分だけ
+ 5
+ 6  function θ_of(λ, η):                                   # (D,12,96)
+ 7      θ_(g,a,e) ← π(e|g,a)·(λ_ga ⊙ m_ga) + π(a|g,e)·(η_ge ⊙ m_ge)
+ 8      return reshape に d = g·(A·E) + a·E + e の順で並べ替え
+ 9
+10  function scores(θ):                                    # (D,M)
+11      s_{d,m} ← Σ_t θ_d[ pool[d,m,t], t ]                # ★one-hot を作らず gather
+12
+13  function neg_dual():                                   # −g(λ,η)
+14      s ← scores(θ_of(λ, η))
+15      logmgf ← Σ_d ( logsumexp_m(s_{d,·}) − log M )      # log E_{p_d}[e^s] の MC 推定
+16      lin    ← ⟨λ ⊙ m_ga, ν_ga⟩ + ⟨η ⊙ m_ge, ν_ge⟩
+17      reg    ← (ridge/2)·( ‖λ ⊙ m_ga‖² + ‖η ⊙ m_ge‖² )   # ★省略不可（識別性の回復）
+18      return logmgf − lin + reg
+19
+20  # ---- 凸最小化: L-BFGS + 履歴の張り直し ----
+21  prev ← +∞ ;  best ← None
+22  for restart = 1 .. RESTARTS do
+23      (λ, η) ← LBFGS_step(neg_dual, max_iter = LBFGS_ITER, strong_wolfe)
+24      cur ← neg_dual()
+25      if cur が非有限 then break
+26      if cur < prev then best ← (λ, η)                   # 最良反復を退避
+27      if |prev − cur| ≤ 1e-15·max(1,|cur|) then break    # 目的関数が動かなくなった
+28      prev ← cur
+29  (λ, η) ← best
+30
+31  # ---- 最適乗数から重みと診断を作る ----
+32  s   ← scores(θ_of(λ, η))
+33  w   ← softmax_m(s)                                     # (D,M) q_d(x) ∝ p_d(x)e^{⟨θ_d,φ⟩}
+34  μ̂   ← scatter_add over t of w                          # (D,12,96) 群別行動者率
+35  μ̂_ga ← Σ_e π(e|g,a)·μ̂ ;  μ̂_ge ← Σ_a π(a|g,e)·μ̂        # 教師と同じ形へ周辺化
+36  resid ← concat( (μ̂_ga − ν_ga)[m_ga], (μ̂_ge − ν_ge)[m_ge] )
+37  ESS_d ← 1 / Σ_m w_{d,m}²                               # 有効サンプル数
+38  KL_d  ← Σ_m w_{d,m}·( log w_{d,m} + log M )            # KL(q_d ‖ p_d)
+39  return w, {resid_mae, resid_max, ess_median, ess_min, kl_mean, grad_norm}
+```
+
+対応するコード: `exponential_tilt`（L172-303）。
+
+読むときの要点 5 つ:
+
+- **4 行目**: 最適化変数は $\lambda, \eta$（公表 18 行分、$18\times11\times96 = 19{,}008$ 要素）だけで、
+  28 群分のパラメータは持たない。群の傾け $\theta_d$ は 7 行目で $\pi$ から**決まる**
+- **11 行目**: $\varphi$ が指示関数なので、内積は「実際に取った活動の $\theta$ を 96 個拾って足す」で済む
+- **17 行目**: `ridge` を外すと双対に平坦方向が残り、$q$ が変わらないまま $\lambda$ が発散して
+  ESS が枯れる（→ [8.5](#85-ridge--0-が必須である理由)）
+- **22–28 行目のリスタート**: PyTorch の L-BFGS は履歴が飽和すると `tolerance_change` で
+  早々に止まる。履歴を張り直して押し切る。`ridge` が極小のときは行き過ぎた反復で
+  ESS だけが落ちるため、**目的関数が最良だった反復を退避して最後に戻す**
+- **33 行目**: 双対最適が決まれば重みは softmax の一発で出る。反復は $\lambda, \eta$ 側だけにある
+
 ### 8.4 実装（`exponential_tilt`, L172-303）
 
 | コード | 形状 | 意味 |
@@ -638,6 +826,60 @@ $$\sum_a \pi(a \mid g)\,\nu_{ga} \;=\; \sum_{a,e} \pi(a,e \mid g)\,\mu \;=\; \su
 ---
 
 ## 9. 評価デザインと実測結果
+
+### アルゴリズム 5: Stage 2 実験パイプライン（`main()`）
+
+アルゴリズム 4 を 4 つのバリアントに掛けて、ホールドアウト評価まで回す手順。
+
+```text
+入力: Stage1 チェックポイント（EMA 重み）, 社基調 平日の公表表
+定数: M = 2000, ridge = 1e-2, seed = 42
+出力: 3 つの CSV（評価指標 / 傾けの診断 / 系列構造の距離）
+
+ 1  tgt ← load_stula_targets("timeband_weekday")           # ★CVAE 版から import（出所を 1 つに）
+ 2  mask_c ← [c ∉ EXCLUDED for c in Common]                # OTHER_X を落とす
+ 3
+ 4  # ---- 提案分布のプール（アルゴリズム 2 を D×M 本ぶん） ----
+ 5  if --reuse-pool かつ npz が存在 かつ メタデータ一致 then
+ 6      pool ← npz["pool"][:, :M]                          # メタ = sampler / steps / η / w / ckpt+mtime
+ 7  else
+ 8      model ← load_pretrained(EMA)
+ 9      pool  ← group_pool(model, M)                       # (28, 2000, 96)
+10      npz に pool とメタデータを保存
+11
+12  # ---- 4 バリアント（比較条件は 9.3 節） ----
+13  μ̂_zero    ← pool_to_rates(pool)                        # zero-shot: 一様重み
+14  for r in ridges do                                     # 単発なら [--ridge]、掃引なら 5 値
+15      w_r, diag ← 指数傾け(pool, tgt, mask_c, ridge = r)   # ← アルゴリズム 4
+16      μ̂_tilt   ← pool_to_rates(pool, w_r)
+17  perm      ← 群インデックスのランダム置換
+18  w_s, diag ← 指数傾け(pool[perm], tgt, mask_c, ridge = --ridge)   # shuffled: 負の対照
+19  μ̂_base    ← 全群に人口平均を複製                        # baseline: モデル不要の床
+20
+21  # ---- 統計量ホールドアウト評価（28群クロス表。教師には未使用） ----
+22  for 各 μ̂ do records ← eval_against(μ̂, tgt, mask_c)     # rate_mae/rmse, dev_mae/rmse, 活動別
+23
+24  # ---- 系列構造が傾けで壊れていないかの独立検証 ----
+25  floor_jsd, floor_emd ← 実データ自身のブートストラップ 95% 上限   # ★有限標本のノイズ床
+26  for label in {zero-shot, tilted} do
+27      ww ← 群人口シェア π_d と（一様 or 傾け）重みの積
+28      断片化統計(切替・1スロットep比率・wrap_closure) と
+29      bigram_JSD・切替分布 EMD を実データと比較し、ノイズ床の内か外かを判定
+30  3 CSV に書き出す
+```
+
+対応するコード: `main()`（L344-481）。
+
+- **5–10 行目のメタデータ照合**が重要である。ancestral 由来のプールと DDIM 由来のプールは
+  断片化が大きく違う（切替 12.87 vs 17.70）ため、条件の違うプールを黙って再利用すると
+  結果の解釈を丸ごと誤る。合わなければ**再生成する**
+- **25 行目のノイズ床**: 実データ自身を 2 分割して測った距離の 95% 上限。
+  生成側の距離がこの床の内側なら、「実と値が違う」ことは乖離の証拠にならない。
+  傾けは日単位の重み付けなので個票の中身は変わらないが、
+  集団平均の系列統計は動きうる（→ [8.7](#87-指数傾けの-2-つの限界)）ため、
+  この検証を傾けの前後で行う
+- **18 行目の `shuffled` は `--ridge` の値を使う**（掃引で最良だった ridge ではない）。
+  負の対照として読むときは同じ ridge の `tilted` 行と比べる（→ [12 章 4 項](#12-コードを読むときの注意点)）
 
 ### 9.1 まず個票が実データ水準か（サニティチェック）
 

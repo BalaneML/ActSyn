@@ -1,8 +1,9 @@
 # DomainTransfer_trial 実験用 Singularity イメージ定義
 #
-# ビルド場所: SQUID の HPDA フロントエンド（squidhpda.hpc.cmc.osaka-u.ac.jp）
-#   SQUID でイメージをビルドできるのは HPDA フロントエンドのみ。HPC フロントエンド
-#   （squidhpc）では pull しかできない。
+# ビルド場所: SQUID の HPC フロントエンド（squidhpc.hpc.cmc.osaka-u.ac.jp）
+#   作業領域と出力先はノードのローカルディスク（/tmp）に置くこと。work 領域
+#   （/sqfs/work）はビルド用のマウント名前空間から見えず、rootfs の展開と
+#   SIF の書き出しが失敗する。完成後に cp で work へ移す。
 #
 # ビルド手順は container/README.md を参照。
 #
