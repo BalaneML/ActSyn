@@ -18,8 +18,14 @@ SIF="${WORK}/containers/domaintransfer.sif"
 
 # --- Singularity ---------------------------------------------------------
 # work 領域とジョブ投入ディレクトリをコンテナ内へ見せる。
-# readlink -f でシンボリックリンクを解決しておかないとバインドに失敗する。
-export SINGULARITY_BIND="$(readlink -f "${WORK}"),${PBS_O_WORKDIR:-${PWD}}"
+#
+# /sqfs/work はシンボリックリンクで、実体は /sqfs2/cmc/0/work にある。
+# readlink -f で解決しないとバインドに失敗するが、解決先をそのままの位置へ
+# マウントすると、コンテナ内の /sqfs/work/... は読み取り専用のままになる。
+# 下の MPLCONFIGDIR / XDG_CACHE_HOME / WANDB_DIR はいずれも /sqfs/work/... 表記
+# なので、それらが黙って /tmp へフォールバックする（＝ジョブ終了と同時に消える）。
+# `解決先:元のパス` の形でマウントし直し、ホストと同じパスで書けるようにする。
+export SINGULARITY_BIND="$(readlink -f "${WORK}"):${WORK},${PBS_O_WORKDIR:-${PWD}}"
 
 # pull/build 時の一時ファイルが home を埋めないようにする。
 export SINGULARITY_CACHEDIR="${WORK}/.cache/singularity"

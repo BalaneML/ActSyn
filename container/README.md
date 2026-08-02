@@ -168,9 +168,22 @@ qsub jobs/sample_japan_match.sh # 学習完了後
 学習ログの送信はジョブ完了後にフロントエンドで行う。計算ノードは
 外部ネットワークへ接続できないため、ジョブ中は `WANDB_MODE=offline` で記録される。
 
+**`wandb` コマンドはコンテナの中にしか無い。** フロントエンドの素の環境には
+入っていないので、送信もコンテナ経由で実行する。`--nv` は不要（GPU を使わない）。
+
 ```bash
-wandb sync $WORK/wandb/offline-run-*
+# 初回のみ: API キーを登録する。$HOME は既定でバインドされるため
+# ~/.netrc に保存され、次回以降は不要になる
+singularity run --bind "$WORK" $WORK/containers/domaintransfer.sif \
+    wandb login
+
+# 送信。WANDB_MODE=offline を引き継がないよう、_common.sh は source しない
+singularity run --bind "$WORK" $WORK/containers/domaintransfer.sif \
+    wandb sync $WORK/wandb/offline-run-*
 ```
+
+`--bind "$WORK"` が必要なのは、singularity が既定でバインドするのは
+`$HOME` とカレントディレクトリだけで、`/sqfs/work` は含まれないため。
 
 ---
 
@@ -185,6 +198,8 @@ wandb sync $WORK/wandb/offline-run-*
 | `%post` は成功するのに SIF の書き出しが `permission denied` で失敗 | 出力先が work 領域。`/tmp` に出力してから `cp` で work へ移す |
 | ビルドが容量不足で失敗 | `SINGULARITY_CACHEDIR` が home を指している。または `/tmp` の空きが 40GB 未満（`df -h /tmp`） |
 | work 領域が `permission denied` で読み書きできない | `newgrp <グループ名>` を実行していない |
+| フロントエンドで `wandb: command not found` | `wandb` はコンテナ内にしか無い。`singularity run --bind "$WORK" <SIF> wandb sync ...` の形で実行する（→ §5） |
+| コンテナ内から `$WORK` のファイルが見えない | `--bind "$WORK"` が無い。既定でバインドされるのは `$HOME` とカレントディレクトリのみ |
 | ジョブが書き込みエラーで落ちる | 出力先が home（10GB 上限）。`jobs/_common.sh` が work 領域を指しているか確認する |
 | ジョブ最後のコマンドが実行されない | ジョブスクリプト末尾に改行が無い |
 

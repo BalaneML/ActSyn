@@ -11,11 +11,11 @@ AggDDPM の denoiser を Tang et al. 2025 の構成に置き換えたバック�
 
 なぜこの論文を踏襲するか:
     - 同じドメイン（合成人口）・同じ離散データを DDPM で扱った先行研究で、
-      「baseline はどの構成か」を論文に一行で書ける。
+        「baseline はどの構成か」を論文に一行で書ける。
     - Tang 自身が「条件付き生成は未対応 (future work)」と明記しているので、
-      我々の CFG + 属性条件付け + 集計教師 (Stage2) がそのまま差分になる。
+        我々の CFG + 属性条件付け + 集計教師 (Stage2) がそのまま差分になる。
     - Tang の構成には位置符号化がある。現行 AggDDPM には時刻スロットの位置符号が
-      無く (src/eval/clock_diagnostics.py が診断中の問題)、踏襲すると同時に解消する。
+        無く (src/eval/clock_diagnostics.py が診断中の問題)、踏襲すると同時に解消する。
 
 Tang の構成 (Fig.3, D=13属性 / K=70語彙):
     one-hot(B,D,K) → FC(K,512) → 位置符号化 → double1dconv(D,64)
