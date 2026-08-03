@@ -46,4 +46,10 @@ echo "=== model smoke test (Tang backbone) ==="
 run_gpu python src/models/DDPM_Aggregate_Tang/model.py --smoke
 status_tang=$?
 
-echo "exit status: unet1d=${status_unet} tang=${status_tang}"
+# DiT バックボーンは畳み込みを一切持たない attention のみの構造なので、
+# U-Net 系2本が通ってもこちらが通るとは限らない。train_ddpm_dit.sh の本学習前に確認する。
+echo "=== model smoke test (DiT backbone) ==="
+run_gpu python src/models/DDPM_Aggregate_DiT/model.py --smoke
+status_dit=$?
+
+echo "exit status: unet1d=${status_unet} tang=${status_tang} dit=${status_dit}"

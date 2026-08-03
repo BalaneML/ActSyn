@@ -193,7 +193,9 @@ def cond_grid() -> npt.NDArray[np.int64]:
 # 3. データ整形
 # ============================================================
 def load_data(path: str | Path = DATA_PATH):
-    """CSV を読み、(条件インデックス, スケジュール, 調査ウェイト, 生条件列) を返す。"""
+    """
+    CSV を読み、(条件インデックス, スケジュール, 調査ウェイト, 生条件列) を返す
+    """
     df: pd.DataFrame = pd.read_csv(path)
 
     # ★平日 (月..金)。japan_match_experiment と同じ between(2,6) で揃える
@@ -214,7 +216,9 @@ def load_data(path: str | Path = DATA_PATH):
 
 
 def cond_to_d(cond_idx: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
-    """条件インデックス (N,3) -> 群インデックス (N,)"""
+    """
+    条件インデックス (N,3) -> 群インデックス (N,)
+    """
     return (cond_idx[:, 0] * (N_A * N_E) + cond_idx[:, 1] * N_E + cond_idx[:, 2])
 
 
@@ -453,13 +457,13 @@ class Diffusion:
         """
         標準 ε 予測 MSE + CFG 条件dropout
         """
-        x0 = sched_to_x0(sched)
-        t = torch.randint(0, T_STEPS, (x0.size(0),), device=x0.device)
-        eps = torch.randn_like(x0)
-        x_t = self.q_sample(x0, t, eps)
-        drop_mask = torch.rand(x0.size(0), device=x0.device) < P_UNCOND
-        eps_hat = model(x_t, t, cond_idx, drop_mask)
-        return F.mse_loss(eps_hat, eps)
+        x0 = sched_to_x0(sched)  # 真
+        t = torch.randint(0, T_STEPS, (x0.size(0),), device=x0.device)  # 一様
+        eps = torch.randn_like(x0)  # eps ~ N(0,I)
+        x_t = self.q_sample(x0, t, eps)  # 真
+        drop_mask = torch.rand(x0.size(0), device=x0.device) < P_UNCOND  # CFGの条件付け用
+        eps_hat = model(x_t, t, cond_idx, drop_mask)  # x_t, t, 条件cond_idx: (B,3), drop_mask:
+        return F.mse_loss(eps_hat, eps)  # ノイズ間のMSE
 
     def _eps(self, model, x, t_scalar, cond_idx, guidance_scale):
         """
@@ -571,9 +575,13 @@ def run_epoch(model, diffusion, loader, optimizer=None, ema=None):
     return sum_loss / n_samples
 
 
-def train(epochs: int = EPOCHS, use_wandb: bool = True, save_path: Path | None = MODEL_SAVE_PATH,
-          model_factory: Callable[[], nn.Module] = UNet1D,
-          backbone: str = "unet1d", extra_config: dict | None = None):
+def train(epochs: int = EPOCHS,
+            use_wandb: bool = True,
+            save_path: Path | None = MODEL_SAVE_PATH,
+            model_factory: Callable[[], nn.Module] = UNet1D,
+            backbone: str = "unet1d",
+            extra_config: dict | None = None
+        ):
     """
     save_path=None なら保存しない（--smoke が本番チェックポイントを潰さないため）
 
@@ -767,8 +775,8 @@ def memorization_report(gen: npt.NDArray[np.int64], sched_real: npt.NDArray[np.i
         最近傍距離は参照集合が大きいほど自然に小さくなる。train は holdout の
         約9倍あるので、素で比べると暗記が無くても DCR_gap が正に出る。
         実測: 実ホールドアウト個票（暗記があり得ない）の DCR は
-              train全体(N=3363) に対し 21.83、サイズを揃えた train(N=373) に対し 26.54。
-              サイズ差だけで 4.7 スロットずれる。
+                train全体(N=3363) に対し 21.83、サイズを揃えた train(N=373) に対し 26.54。
+                サイズ差だけで 4.7 スロットずれる。
         よって DCR/NNDR は train を holdout と同数に間引いてから比べる。
 
     ★ 床（帰無帯）を併記する:
