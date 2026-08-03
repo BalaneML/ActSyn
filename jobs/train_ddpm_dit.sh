@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -q SQUID-S
 #PBS --group=<グループ名>
-#PBS -l elapstim_req=04:00:00
+#PBS -l elapstim_req=01:00:00
 #PBS -l cpunum_job=38
 #PBS -l gpunum_job=1
 #PBS -N dt_dit_stage1
@@ -36,17 +36,16 @@
 #   PATCH=2 qsub -v PATCH jobs/train_ddpm_dit.sh        # 1トークン=30分。断片化への効果を見る
 #   （SIZE / PATCH を変えるとチェックポイント名も変わるので既定構成の結果は潰れない）
 #
-# elapstim_req=04:00:00 の根拠:
-#   実測 (Apple M系 MPS, fp32, size=xs / 1.85M params)
-#       学習 1 step (B=256)      0.737 s  → 13 step/epoch + val 2 batch ≈ 11 s/epoch
-#       推論 1 forward (B=1024)  0.944 s
-#   これを積むと MPS で 学習 1000ep ≈ 2.9h、生成 7バッチ×1000ステップ×2(CFG) ≈ 3.7h。
-#   A100 は本ワークロードで MPS のおおむね 10 倍前後を見込み、学習 ≈ 20m + 生成 ≈ 22m。
-#   ここに squid_guide.md の安全率 1.2〜1.5 倍を掛けても 1h 弱だが、速度比の見込み違いに
-#   耐えるよう 4h を確保する（Tang バックボーンの 8h の半分。DiT の方が実測で約3倍速い:
-#   Tang w0.5 は 2.16 s/step・3.11 s/forward）。
-#   ★初回実行後は下の "elapsed" 行を見て切り詰めること
-#   （ポイントは要求経過時間に効くため、過大な要求はそのまま浪費になる）。
+# elapstim_req=01:00:00 の根拠:
+#   ★SQUID 実機の実績を基準にする（MPS からの外挿ではない）。
+#     Tang w0.5 (3.83M params) のジョブ 1048975 は、1000ep 指定・540ep で early stop・
+#     28群×256個票の ancestral 生成まで含めて **elapsed 0h 8m**（8h 要求に対し 1/60）。
+#     ポイントは要求経過時間に効くので、8h 要求はそのまま浪費だった。
+#   DiT の既定 size=xs は 1.85M params で Tang w0.5 の半分、MPS 実測でも約3倍速い
+#     (0.737 vs 2.16 s/step, 0.944 vs 3.11 s/forward)。early stopping が効かず
+#     1000ep を走り切る最悪ケースでも Tang の 8m を大きく超えないと見込める。
+#   よって 1h（実績比 約7倍のマージン）を要求する。
+#   ★初回実行後は下の "elapsed" 行を見てさらに切り詰めること。
 #   ★SIZE=s (32.4M) は既定の 17 倍の params なので、この見積りは使えない。
 #     elapstim_req を上げてから投入すること。
 #
