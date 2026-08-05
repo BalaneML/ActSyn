@@ -137,7 +137,7 @@ BATCH_SIZE  = 256
 # ★平日のみで N=3,736 -> 3,736×0.9/256 ≈ 13 step/epoch。DDPM/model.py の総ステップ数
 #   (約40k) に揃えるため、エポック数を 1500 -> 3000 に倍化する
 EPOCHS      = 1000
-LR          = 2e-4
+LR          = 2e-4  # 0.0002
 EMA_DECAY   = 0.999
 VAL_RATIO   = 0.1
 SEED        = 42
@@ -171,15 +171,18 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_availabl
 # 2. 群インデックスと条件の相互変換 ★
 # ============================================================
 def d_index(g: int, a: int, e: int) -> int:
-    """(性, 年齢7区分, 就業) -> 群インデックス d。japan_match_experiment.d_index と同一"""
+    """
+    (性, 年齢7区分, 就業) -> 群インデックス d
+    """
     return g * (N_A * N_E) + a * N_E + e
 
 
 def cond_grid() -> npt.NDArray[np.int64]:
-    """全28群の条件インデックス (D, 3)。行 d が群 d に対応する（順序が命）。
+    """
+    全28群の条件インデックス (D, 3)
+    行 d が群 d に対応する
 
-    COND_SPEC の並び (gender, age, telfs) と一致させること。ここがずれると
-    群別行動者率の評価が別の群と突き合わされて静かに壊れる。
+    COND_SPEC の並び (gender, age, telfs) と一致させる
     """
     grid = np.zeros((D_GROUPS, len(COND_SPEC)), dtype=np.int64)
     for g in range(N_G):
@@ -235,12 +238,14 @@ class ScheduleDataset(Dataset):
 
 
 def split_indices(n: int) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
-    """学習/ホールドアウトの行インデックス (train_idx, val_idx)。
+    """
+    学習/評価 - ホールドアウトの行インデックス (train_idx, val_idx)
 
-    ★ make_loaders から抽出した。暗記チェック（individual_metrics.memorization）が
-        「生成物が学習集合にだけ近いか」を測るには、学習に使った行と使わなかった行を
-        同じ規則で再現する必要がある。分割規則を2箇所に書くと静かにずれるので、
-        唯一の出所をここに置く。乱数の使い方は抽出前と同一。
+    make_loaders から抽出
+    暗記チェック（individual_metrics.memorization）が
+    「生成物が学習集合にだけ近いか」を測るには、学習に使った行と使わなかった行を
+    同じ規則で再現する必要がある。分割規則を2箇所に書くと静かにずれるので、
+    唯一の出所をここに置く。乱数の使い方は抽出前と同一。
     """
     g = torch.Generator().manual_seed(SEED)
     perm = torch.randperm(n, generator=g).numpy()
@@ -266,6 +271,7 @@ def make_loaders(cond_idx, sched, weight):
 
 def sched_to_x0(sched: torch.Tensor) -> torch.Tensor:
     """
+    活動スケジュール (index表現) を onehot~{-1,+1} に変換
     スケジュール (B,96) int -> 拡散空間 (B,12,96) ∈ {-1,+1}
     """
     onehot = F.one_hot(sched, NUM_ACT).float().permute(0, 2, 1)
@@ -278,11 +284,12 @@ def sched_to_x0(sched: torch.Tensor) -> torch.Tensor:
 def timestep_embedding(t: torch.Tensor, dim: int = 128) -> torch.Tensor:
     """
     sinusoidal timestep embedding (B,) -> (B, dim)
+    dim=128
     """
-    half = dim // 2
+    half = dim // 2  # sin, cosのために, dimを2分割
     freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / half)
     args = t.float()[:, None] * freqs[None, :]
-    return torch.cat([torch.cos(args), torch.sin(args)], dim=1)
+    return torch.cat([torch.cos(args), torch.sin(args)], dim=1)  # (B,128)
 
 
 class ResBlock1D(nn.Module):
@@ -294,9 +301,11 @@ class ResBlock1D(nn.Module):
         self.norm1 = nn.GroupNorm(8, c_in)
         self.conv1 = nn.Conv1d(c_in, c_out, 3, padding=1)
         self.emb_proj = nn.Linear(emb_dim, c_out)
+
         self.norm2 = nn.GroupNorm(8, c_out)
         self.dropout = nn.Dropout(DROPOUT)
         self.conv2 = nn.Conv1d(c_out, c_out, 3, padding=1)
+
         self.skip = nn.Conv1d(c_in, c_out, 1) if c_in != c_out else nn.Identity()
 
     def forward(self, x, emb):
@@ -323,46 +332,57 @@ class AttnBlock1D(nn.Module):
 
 class UNet1D(nn.Module):
     """
-    ε予測ネットワーク: (B,12,96) + t + cond -> (B,12,96)
-    ノイズεの shape は予測するデータの shape と同じ
+    ε予測ネットワーク: (B,12,96) + 拡散ステップt + 条件cond -> (B,12,96)
+    ノイズεの shape は予測するデータ (活動系列) の shape と同じ
     """
     def __init__(self):
         super().__init__()
         c1, c2 = BASE_CH, BASE_CH * 2
 
+        # sinusoidal ベクトル (B,128) を (B,256) に持ち上げる MLP
         self.time_mlp = nn.Sequential(
             nn.Linear(128, TIME_EMB_DIM), 
             nn.SiLU(),
             nn.Linear(TIME_EMB_DIM, TIME_EMB_DIM),
         )
+
+        # Condition Embedding
         self.cond_embeds = nn.ModuleList([
             nn.Embedding(card, dim) for card, dim in zip(COND_CARD, EMB_DIMS)
         ])
         self.cond_proj = nn.Linear(sum(EMB_DIMS), TIME_EMB_DIM)
         self.null_emb = nn.Parameter(torch.zeros(TIME_EMB_DIM))
 
+        # Down h1
         self.in_conv = nn.Conv1d(IN_CH, c1, 3, padding=1)
         self.d1a, self.d1b = ResBlock1D(c1, c1), ResBlock1D(c1, c1)
         self.ds1 = nn.Conv1d(c1, c1, 3, stride=2, padding=1)
 
+        # Down h2
         self.d2a, self.d2b = ResBlock1D(c1, c2), ResBlock1D(c2, c2)
         self.attn2 = AttnBlock1D(c2)
         self.ds2 = nn.Conv1d(c2, c2, 3, stride=2, padding=1)
 
+        # Down h3
         self.d3a, self.d3b = ResBlock1D(c2, c2), ResBlock1D(c2, c2)
         self.attn3 = AttnBlock1D(c2)
 
+        # Bottleneck (middle)
         self.m1, self.m_attn, self.m2 = ResBlock1D(c2, c2), AttnBlock1D(c2), ResBlock1D(c2, c2)
 
+        # Up with h3
         self.u3 = ResBlock1D(c2 + c2, c2)
 
+        # Up with h2
         self.us2 = nn.Conv1d(c2, c2, 3, padding=1)
         self.u2 = ResBlock1D(c2 + c2, c2)
         self.u2_attn = AttnBlock1D(c2)
 
+        # Up with h1
         self.us1 = nn.Conv1d(c2, c1, 3, padding=1)
         self.u1 = ResBlock1D(c1 + c1, c1)
 
+        # 最終出力層
         self.out_norm = nn.GroupNorm(8, c1)
         self.out_conv = nn.Conv1d(c1, IN_CH, 3, padding=1)
         nn.init.zeros_(self.out_conv.weight)
@@ -372,7 +392,9 @@ class UNet1D(nn.Module):
 
     @property
     def in_channels(self) -> int:
-        """拡散空間のチャネル数。バックボーン実装に依らない共通の入口。
+        """
+        拡散空間のチャネル数
+        バックボーン実装に依らない共通の入口
 
         clock_diagnostics が純ノイズ x_T を作るのに使う。実装内部の層名
         (in_conv 等) に触らせないための薄い契約。
@@ -380,17 +402,24 @@ class UNet1D(nn.Module):
         return IN_CH
 
     def embed_cond(self, cond_idx, batch: int, drop_mask=None):
+        """
+        条件 (性・年齢・就業) を256次元のベクトルにまとめる
+        """
         if cond_idx is None:
             return self.null_emb.expand(batch, -1)
-        c = torch.cat([emb(cond_idx[:, i]) for i, emb in enumerate(self.cond_embeds)], dim=1)
-        c = self.cond_proj(c)
+
+        c = torch.cat([emb(cond_idx[:, i]) for i, emb in enumerate(self.cond_embeds)], dim=1)  # (B,4)⊕(B,8)⊕(B,4)->(B,16)
+        c = self.cond_proj(c)  # (B,16) -> (B,256)
+
         if drop_mask is not None:
             c = torch.where(drop_mask[:, None], self.null_emb.expand_as(c), c)
-        return c
+        return c  # (B, 256)
 
     def _encode(self, x_t, emb):
         """
-        下り経路の中間特徴。forward と features の共通部分（分岐させない）。
+        下り経路の中間特徴
+        forward と features の共通部分（分岐させない）
+
         """
         h1 = self.d1b(self.d1a(self.in_conv(x_t), emb), emb)
         h2 = self.attn2(self.d2b(self.d2a(self.ds1(h1), emb), emb))
@@ -399,23 +428,30 @@ class UNet1D(nn.Module):
 
     def features(self, x_t, t, cond_idx=None) -> dict[str, torch.Tensor]:
         """
-        ★中間特徴 {h1:(B,64,96), h2:(B,128,48), h3:(B,128,24)}。
-
-        clock_diagnostics の位置プローブ用。このバックボーンには時刻スロットの
-        位置符号が無く（AttnBlock1D は素の MultiheadAttention）、絶対位置は
-        Conv1d の境界パディングが階層を伝播する副産物としてしか入らない。
-        その「漏れ」がどれだけあるかを特徴から直接測るための出口。
+        中間特徴 {h1:(B,64,96), h2:(B,128,48), h3:(B,128,24)}
         """
         emb = self.time_mlp(timestep_embedding(t)) + self.embed_cond(cond_idx, x_t.size(0))
         h1, h2, h3 = self._encode(x_t, emb)
         return {"h1": h1, "h2": h2, "h3": h3}
 
     def forward(self, x_t, t, cond_idx=None, drop_mask=None):
-        emb = self.time_mlp(timestep_embedding(t)) \
+        """
+        UNetのforward
+        ε_θ(x_t, t, c) -> ノイズを予測する
+        """
+        # Embedding (拡散ステップt + 社会属性条件cond)
+        emb = (
+            self.time_mlp(timestep_embedding(t)) 
             + self.embed_cond(cond_idx, x_t.size(0), drop_mask)
+        )  # (B, 256)
 
+        # Down
         h1, h2, h3 = self._encode(x_t, emb)
-        m = self.m2(self.m_attn(self.m1(h3, emb)), emb)
+
+        # BottleNeck (middle)
+        m = self.m2(self.m_attn(self.m1(h3, emb)), emb)  # Res1D -> Attn -> Res1D
+
+        # Up
         u = self.u3(torch.cat([m, h3], dim=1), emb)
         u = self.us2(F.interpolate(u, scale_factor=2, mode='nearest'))
         u = self.u2_attn(self.u2(torch.cat([u, h2], dim=1), emb))
@@ -432,22 +468,36 @@ class Diffusion:
     β schedule と派生バッファを事前計算し、q_sample / loss / sample / ddim_sample
     """
     def __init__(self, device=DEVICE):
-        betas = torch.linspace(BETA_START, BETA_END, T_STEPS, device=device)  #　 # 0.0001 (t=1) -> .. -> t=T:0.02 (t=T, 1000)
+        """
+        (1000,)ベクトル
+        args:
+            betas: 拡散ステップtにおいてのノイズの強さ
+            alphas: 1-betas
+            acp: alphaの累積積
+            acp_prev: acpの1つずらした
+            sprt_acp: √{\bar(α)}
+            sqrt_1m_acp: √{1-\bar(α)}
+            post_var: 1ステップ前のvar
+            post_coef_x0: 
+            post_coef_xt:
+        """
+        betas = torch.linspace(BETA_START, BETA_END, T_STEPS, device=device)  # 0.0001 (t=1) -> .. -> t=T:0.02 (t=T, 1000)
         alphas = 1.0 - betas
         acp = torch.cumprod(alphas, dim=0)  # 累積積
         acp_prev = torch.cat([torch.ones(1, device=device), acp[:-1]])
         self.device = device
         self.betas = betas
         self.alphas = alphas
-        self.acp = acp
-        self.sqrt_acp = acp.sqrt()
-        self.sqrt_1m_acp = (1.0 - acp).sqrt()
+        self.acp = acp  # \bar(α)
+        self.sqrt_acp = acp.sqrt()  # √{\bar(α)}
+        self.sqrt_1m_acp = (1.0 - acp).sqrt()  # √{1-\bar(α)}
         self.post_var = betas * (1.0 - acp_prev) / (1.0 - acp)
         self.post_coef_x0 = betas * acp_prev.sqrt() / (1.0 - acp)
         self.post_coef_xt = (1.0 - acp_prev) * alphas.sqrt() / (1.0 - acp)
 
     def q_sample(self, x0, t, eps):
-        """x0 から任意のtステップ先の x_t を求める
+        """
+        x0 から任意のtステップ先の x_t を求める
         x_t = √ᾱ_t·x0 + √(1-ᾱ_t)·ε
         """
         return (self.sqrt_acp[t][:, None, None] * x0
@@ -457,12 +507,14 @@ class Diffusion:
         """
         標準 ε 予測 MSE + CFG 条件dropout
         """
-        x0 = sched_to_x0(sched)  # 真
-        t = torch.randint(0, T_STEPS, (x0.size(0),), device=x0.device)  # 一様
-        eps = torch.randn_like(x0)  # eps ~ N(0,I)
-        x_t = self.q_sample(x0, t, eps)  # 真
+        x0 = sched_to_x0(sched)  # (B,96)->(B,12,96)∈{-1,1} 活動系列をonehotにする
+        t = torch.randint(0, T_STEPS, (x0.size(0),), device=x0.device)  # t~U{1,T}, T=1000
+        eps = torch.randn_like(x0)  # eps~N(0,I), (B,12,96)
+        x_t = self.q_sample(x0, t, eps)  # q(x_t|x0), x0からx_tを求める
+
         drop_mask = torch.rand(x0.size(0), device=x0.device) < P_UNCOND  # CFGの条件付け用
-        eps_hat = model(x_t, t, cond_idx, drop_mask)  # x_t, t, 条件cond_idx: (B,3), drop_mask:
+
+        eps_hat = model(x_t, t, cond_idx, drop_mask)  # 追加されたノイズを予測(ノイズ付きデータx_t, 拡散ステップt, 条件cond_idx)
         return F.mse_loss(eps_hat, eps)  # ノイズ間のMSE
 
     def _eps(self, model, x, t_scalar, cond_idx, guidance_scale):
@@ -479,11 +531,13 @@ class Diffusion:
     @torch.no_grad()
     def sample(self, model, cond_idx, guidance_scale=GUIDANCE_SCALE, verbose=False):
         """
-        ancestral DDPM + CFG。cond_idx (M,K) -> スケジュール (M,96) int
+        ancestral DDPM + CFG
+        cond_idx (M,K) -> スケジュール (M,96) int
         """
         model.eval()
         m = cond_idx.size(0)
-        x = torch.randn(m, IN_CH, NUM_SLOTS, device=cond_idx.device)
+        
+        x = torch.randn(m, IN_CH, NUM_SLOTS, device=cond_idx.device)  # x_T~N(0,I)
         for ti in reversed(range(T_STEPS)):
             eps_hat = self._eps(model, x, ti, cond_idx, guidance_scale)
             x0_hat = (x - self.sqrt_1m_acp[ti] * eps_hat) / self.sqrt_acp[ti]
@@ -550,7 +604,7 @@ class EMA:
 # ============================================================
 # 7. 学習
 # ============================================================
-def run_epoch(model, diffusion, loader, optimizer=None, ema=None):
+def run_epoch(model, diffusion: Diffusion, loader, optimizer=None, ema=None):
     """
     1エポック分の学習または評価を実行し、平均 ε-MSE を返す。
     """
@@ -614,7 +668,7 @@ def train(epochs: int = EPOCHS,
     cond_idx, sched, weight, _ = load_data(DATA_PATH)
     train_loader, val_loader = make_loaders(cond_idx, sched, weight)
 
-    model = model_factory().to(DEVICE)
+    model = model_factory().to(DEVICE)  # UNet
     diffusion = Diffusion()
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.0)
     ema = EMA(model)
@@ -854,9 +908,13 @@ def sanity_check(model, n_per_group: int = 256, sampler: str = SAMPLER,
     pool = group_pool(model, n_per_group, sampler=sampler, ddim_steps=ddim_steps, verbose=True)
     gen = pool.reshape(-1, NUM_SLOTS)
 
-    # 実データの群構成に合わせた生成側の重み（プールは群一様なので群人数で重みづけ）
-    counts = np.bincount(d_real, minlength=D_GROUPS).astype(float)
-    w_gen = np.repeat(counts / counts.sum() / n_per_group, n_per_group)
+    # 実データの群構成に合わせた生成側の重み。プールは群一様なので、群別の
+    # 「調査ウェイト加重シェア ÷ 群内本数」を各行へ配る。
+    # ★ 非加重の人数比 (np.bincount(d_real)/N) ではない。両者は ATUS 平日で
+    #   総変動距離 0.139 ずれ、ここで使い分けると学習ログのサニティと
+    #   clock_diagnostics の数値が食い違う。重みの出所は group_reweight ただ一つ。
+    gen_d = np.repeat(np.arange(D_GROUPS), n_per_group)
+    w_gen = im.group_reweight(gen_d, w_real, d_real, D_GROUPS)
 
     r = fragmentation_stats(sched_real, w_real)
     g = fragmentation_stats(gen, w_gen)
@@ -887,7 +945,7 @@ def sanity_check(model, n_per_group: int = 256, sampler: str = SAMPLER,
     save_path.parent.mkdir(parents=True, exist_ok=True)
     grid = cond_grid()
     meta = pd.DataFrame(np.repeat(grid, n_per_group, axis=0), columns=["gender", "age7", "employment"])
-    meta.insert(0, "group_d", np.repeat(np.arange(D_GROUPS), n_per_group))
+    meta.insert(0, "group_d", gen_d)   # w_gen と同一の群割り当て（ずれ得ない）
     # ★サンプラをCSVに残す。どの逆過程で作った個票かが後から判別できないと、
     #   断片化の数値（ancestral 12.87 vs DDIM 17.70）を取り違える
     meta.insert(1, "sampler", sampler if sampler == 'ancestral' else f"ddim{ddim_steps}_eta{DDIM_ETA}")
