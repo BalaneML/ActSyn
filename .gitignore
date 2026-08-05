@@ -33,6 +33,9 @@ wandb/
 CLAUDE.md
 CLAUDE_EXPERIMENT.md
 
+# src
+viz/
+
 # generated
 slides/
 outputs/
