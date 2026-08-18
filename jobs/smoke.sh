@@ -52,4 +52,11 @@ echo "=== model smoke test (DiT backbone) ==="
 run_gpu python src/models/DDPM_Aggregate_DiT/model.py --smoke
 status_dit=$?
 
-echo "exit status: unet1d=${status_unet} tang=${status_tang} dit=${status_dit}"
+# 簡素化版は他の3本と拡散設定そのものが違う（データ表現 {0,1}・DDIM なし・
+# 時刻埋め込み直結・EMA なし）ので、原本が通ってもこちらが通るとは限らない。
+# DDIM を持たないため生成は ancestral 1000 ステップ固定で、群あたり 2 本に絞ってある。
+echo "=== model smoke test (Simple: onehot{0,1} / no DDIM / no EMA) ==="
+run_gpu python src/models/DDPM_Aggregate_Simple/model.py --smoke
+status_simple=$?
+
+echo "exit status: unet1d=${status_unet} tang=${status_tang} dit=${status_dit} simple=${status_simple}"
