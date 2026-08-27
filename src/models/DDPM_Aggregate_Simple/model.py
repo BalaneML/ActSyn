@@ -523,7 +523,7 @@ class Diffusion:
         eps_hat = model(x_t, t, cond_idx, drop_mask)
         return F.mse_loss(eps_hat, eps)  # ノイズ間のMSE
 
-    def _eps(self, model, x, t_scalar, cond_idx, guidance_scale):
+    def _eps(self, model: UNet1D, x, t_scalar, cond_idx, guidance_scale):
         """
         CFG 込みの ε 予測。t_scalar は int
         """
@@ -531,11 +531,11 @@ class Diffusion:
         eps_c = model(x, t, cond_idx)
         if guidance_scale == 1.0:
             return eps_c
-        eps_u = model(x, t, None)
+        eps_u = model(x,  t, None)
         return eps_u + guidance_scale * (eps_c - eps_u)
 
     @torch.no_grad()
-    def sample(self, model, cond_idx, guidance_scale=GUIDANCE_SCALE, verbose=False):
+    def sample(self, model: UNet1D, cond_idx, guidance_scale=GUIDANCE_SCALE, verbose=False):
         """
         ancestral DDPM + CFG
         cond_idx (M,K) -> スケジュール (M,96) int
