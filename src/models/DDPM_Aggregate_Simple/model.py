@@ -129,6 +129,11 @@ BETA_END    = 0.02        # linear schedule (Ho et al. 2020 / Tang et al. 2025 �
 BASE_CH     = 64
 DROPOUT     = 0.1         # 小データ(平日 ~3.7k)の過学習対策
 ATTN_HEADS  = 4
+# 畳み込みの受容野。既定 3 が本編の設定で、--kernel で 1/5/7 に振れる。
+# 「隣接スロットを見る畳み込み」が断片化の一致にどれだけ効いているかを測るための軸。
+# 1 にすると畳み込み経路から局所混合が完全に消え、スロット間の情報は
+# attention（48/24 解像度の3ブロック）と最近傍アップサンプルだけを通る。
+KERNEL_SIZE = 3
 # ★時刻埋め込みの次元。sinusoidal をこの次元で直接作り、MLP を通さずに足す。
 #   条件埋め込み (cond_proj) の出力次元と null_emb の次元もこれに揃う
 TIME_EMB_DIM = 256
@@ -301,13 +306,14 @@ class ResBlock1D(nn.Module):
     """
     def __init__(self, c_in: int, c_out: int, emb_dim: int = TIME_EMB_DIM):
         super().__init__()
+        k, pad = KERNEL_SIZE, KERNEL_SIZE // 2
         self.norm1 = nn.GroupNorm(8, c_in)
-        self.conv1 = nn.Conv1d(c_in, c_out, 3, padding=1)
+        self.conv1 = nn.Conv1d(c_in, c_out, k, padding=pad)
         self.emb_proj = nn.Linear(emb_dim, c_out)
 
         self.norm2 = nn.GroupNorm(8, c_out)
         self.dropout = nn.Dropout(DROPOUT)
-        self.conv2 = nn.Conv1d(c_out, c_out, 3, padding=1)
+        self.conv2 = nn.Conv1d(c_out, c_out, k, padding=pad)
 
         self.skip = nn.Conv1d(c_in, c_out, 1) if c_in != c_out else nn.Identity()
 
@@ -355,15 +361,17 @@ class UNet1D(nn.Module):
         self.cond_proj = nn.Linear(sum(EMB_DIMS), TIME_EMB_DIM)
         self.null_emb = nn.Parameter(torch.zeros(TIME_EMB_DIM))
 
+        k, pad = KERNEL_SIZE, KERNEL_SIZE // 2
+
         # Down h1
-        self.in_conv = nn.Conv1d(IN_CH, c1, 3, padding=1)
+        self.in_conv = nn.Conv1d(IN_CH, c1, k, padding=pad)
         self.d1a, self.d1b = ResBlock1D(c1, c1), ResBlock1D(c1, c1)
-        self.ds1 = nn.Conv1d(c1, c1, 3, stride=2, padding=1)
+        self.ds1 = nn.Conv1d(c1, c1, k, stride=2, padding=pad)
 
         # Down h2
         self.d2a, self.d2b = ResBlock1D(c1, c2), ResBlock1D(c2, c2)
         self.attn2 = AttnBlock1D(c2)
-        self.ds2 = nn.Conv1d(c2, c2, 3, stride=2, padding=1)
+        self.ds2 = nn.Conv1d(c2, c2, k, stride=2, padding=pad)
 
         # Down h3
         self.d3a, self.d3b = ResBlock1D(c2, c2), ResBlock1D(c2, c2)
@@ -376,18 +384,18 @@ class UNet1D(nn.Module):
         self.u3 = ResBlock1D(c2 + c2, c2)
 
         # Up with h2
-        self.us2 = nn.Conv1d(c2, c2, 3, padding=1)
+        self.us2 = nn.Conv1d(c2, c2, k, padding=pad)
         self.u2 = ResBlock1D(c2 + c2, c2)
         self.u2_attn = AttnBlock1D(c2)
 
         # Up with h1
-        self.us1 = nn.Conv1d(c2, c1, 3, padding=1)
+        self.us1 = nn.Conv1d(c2, c1, k, padding=pad)
         self.u1 = ResBlock1D(c1 + c1, c1)
 
         # 最終出力層。ゼロ初期化により学習開始時の ε̂ が恒等的に 0 になる。
         # ε̂=0 は E[ε]=0 より「最適な定数予測器」であり、A/B で収束後の val が良かった
         self.out_norm = nn.GroupNorm(8, c1)
-        self.out_conv = nn.Conv1d(c1, IN_CH, 3, padding=1)
+        self.out_conv = nn.Conv1d(c1, IN_CH, k, padding=pad)
         nn.init.zeros_(self.out_conv.weight)
         out_bias = self.out_conv.bias
         if out_bias is not None:
@@ -977,7 +985,26 @@ if __name__ == "__main__":
     ap.add_argument("--epochs", type=int, default=EPOCHS)
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--smoke", action="store_true", help="短時間の動作確認のみ")
+    ap.add_argument("--kernel", type=int, default=None, choices=[1, 3, 5, 7],
+                    help="畳み込みの受容野。省略すると本編の設定 (3) で"
+                         "既定の保存先に書く。明示するとアブレーション扱いになり、"
+                         "保存先に _k{K} が付くので本編の成果物とは混ざらない")
     args = ap.parse_args()
+
+    if args.kernel is not None:
+        # ★モデル構築より前に差し替える。UNet1D/ResBlock1D は __init__ で
+        #   モジュール変数 KERNEL_SIZE を読むため、ここで決めた値が全層に効く。
+        KERNEL_SIZE = args.kernel
+        # --kernel を明示した実行は、値が 3 でもアブレーションとして別名に隔離する。
+        # スイープ一式を同じ規則で並べられるようにするため。
+        suffix = f"_k{args.kernel}"
+        MODEL_SAVE_PATH = MODEL_SAVE_PATH.with_name(
+            f"{MODEL_SAVE_PATH.stem}{suffix}{MODEL_SAVE_PATH.suffix}")
+        GEN_SAVE_PATH = GEN_SAVE_PATH.with_name(
+            f"{GEN_SAVE_PATH.stem}{suffix}{GEN_SAVE_PATH.suffix}")
+    print(f"[config] kernel_size={KERNEL_SIZE}")
+    print(f"[config] ckpt={MODEL_SAVE_PATH.name}")
+    print(f"[config] gen ={GEN_SAVE_PATH.name}")
 
     smoke_test()
     if args.smoke:
@@ -986,5 +1013,8 @@ if __name__ == "__main__":
         # 暗記チェックは参照集合に対してプールが小さすぎるので飛ばす
         sanity_check(model, n_per_group=2, save_path=None, with_memorization=False)
     else:
-        model = train(epochs=args.epochs, use_wandb=not args.no_wandb)
-        sanity_check(model)
+        # ★保存先は明示的に渡す。train/sanity_check の既定引数は定義時に
+        #   束縛済みで、上の再代入では差し替わらないため。
+        model = train(epochs=args.epochs, use_wandb=not args.no_wandb,
+                      save_path=MODEL_SAVE_PATH)
+        sanity_check(model, save_path=GEN_SAVE_PATH)
