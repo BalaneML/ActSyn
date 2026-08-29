@@ -162,7 +162,9 @@ def nan_renorm_pop_weights(grp_tbl: np.ndarray, pi_d: np.ndarray) -> np.ndarray:
 
 def eval_against(mu_hat: np.ndarray, tgt: dict,
                  mask_c: npt.NDArray[np.bool_]) -> dict:
-    """μ̂ (28, 12*96 act-major) vs 公表の群別行動者率。NaN と mask_c 外を除外して採点する。
+    """μ̂ (D, 12*96 act-major) vs 公表の群別行動者率。NaN と mask_c 外を除外して採点する。
+
+    D は教師テンソルの群数。全28群でも、LGO で絞った部分集合でも同じ定義で採点する。
 
     MAE と RMSE を必ず併記する。教師セルは率<0.01 のセルが約半数を占める強い偏りがあり、
     両者は別のものを測るため:
@@ -178,9 +180,13 @@ def eval_against(mu_hat: np.ndarray, tgt: dict,
     ★mask 列を返す。このリポジトリは数値の出所取り違えを2回起こしているので、
       11act/12act のどちらで測った値かを機械的に区別できる形にしておく（§9.4）。
     """
-    grp_tbl = tgt["group_rates_tbl"]                        # (28,12,96)
-    mh = mu_hat.reshape(D_GROUPS, NUM_COMMON, NUM_SLOTS)
-    pi_d = tgt["pop"].reshape(D_GROUPS) / tgt["pop"].sum()
+    # ★群数は教師テンソルから読む。28群固定にしないのは、LGO で教師群と held-out 群を
+    #   分けて採点するときに同じ定義をもう一度書かずに済ませるため（stage2_select）
+    grp_tbl = tgt["group_rates_tbl"]                        # (D,12,96)
+    n_d = grp_tbl.shape[0]
+    mh = mu_hat.reshape(n_d, NUM_COMMON, NUM_SLOTS)
+    pop = np.asarray(tgt["pop"]).reshape(-1)
+    pi_d = pop / pop.sum()
     m = ~np.isnan(grp_tbl) & mask_c[None, :, None]
     err = (mh - grp_tbl)[m]
     mse = float((err ** 2).mean())

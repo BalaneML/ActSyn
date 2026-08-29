@@ -113,9 +113,11 @@ def load_ckpt(path: Path,
         optimizer.load_state_dict(ckpt["optimizer"])
     # RNG は CPU 側を必ず戻す。CUDA 側は保存時と同じ基数のときだけ戻す
     # （GPU 数が変わると set_rng_state_all が落ちるので、学習は続けられる側に倒す）
-    torch.set_rng_state(ckpt["torch_rng"])
+    # ★.cpu() が必須。map_location を指定すると RNG 状態のテンソルまでそのデバイスへ
+    #   移り、set_rng_state が "RNG state must be a torch.ByteTensor" で落ちる
+    torch.set_rng_state(ckpt["torch_rng"].cpu())
     cuda_rng = ckpt.get("cuda_rng")
     if cuda_rng is not None and torch.cuda.is_available() \
             and len(cuda_rng) == torch.cuda.device_count():
-        torch.cuda.set_rng_state_all(cuda_rng)
+        torch.cuda.set_rng_state_all([s.cpu() for s in cuda_rng])
     return int(ckpt["step"]), dict(ckpt.get("config", {}))

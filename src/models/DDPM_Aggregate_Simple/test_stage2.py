@@ -1,7 +1,7 @@
 """
 Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
 
-対象は §10.2 の実装 1〜8:
+対象は §10.2 の実装 1〜9:
     1. 定期チェックポイントと再開            stage2_checkpoint.py
     2. 逆過程1ステップの切り出し             model.Diffusion._reverse_step
     3. 打ち切り逆伝播つきサンプラ             model.Diffusion.sample_differentiable
@@ -10,6 +10,7 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     6. 集計損失（split-batch 不偏推定）        stage2_loss.py
     7. 学習ループ                            stage2_finetune.py
     8. teacher_mask と --holdout-groups       stage2_finetune.py
+    9. 事後チェックポイント選択                stage2_select.py
 
 検証する内容:
     (ckpt) save_ckpt -> load_ckpt の往復で model/optimizer/step/RNG が戻る。
@@ -30,6 +31,7 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     (lr)   層別 LR の分割が条件経路と conv/attention を取り違えていない
     (mem)  K×D_sub×n の予算超過を学習前に落とす
     (lgo)  teacher_mask が損失群だけを外し、人口層化が大小を混ぜる
+    (sel)  事後選択が §9.4 の出所4列を必ず持ち、in-teacher と held-out を分ける
     (d_idx) stage2_targets.d_index が model.d_index と全28組で一致
 
 ★ 出口の零初期化について:
@@ -58,6 +60,16 @@ HERE = Path(__file__).resolve().parent
 
 
 def _load(name: str, path: Path):
+    """sys.modules に一意名で載せる。既に同じファイルが同じ名前で入っていれば使い回す。
+
+    ★使い回しが要点。同名で読み直すと sys.modules のエントリは置き換わるが、
+      先に読んだ側が掴んでいるモジュールオブジェクトは別のまま残る。すると
+      「model.T_STEPS を差し替えたのに、こちらから呼ぶ生成は 1000 ステップのまま」
+      のような、例外を出さずに黙って重くなる／数値が変わる食い違いが起きる。
+    """
+    cached = sys.modules.get(name)
+    if cached is not None and getattr(cached, "__file__", None) == str(path):
+        return cached
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -72,6 +84,7 @@ ck: Any = _load("simple_stage2_checkpoint", HERE / "stage2_checkpoint.py")
 st: Any = _load("simple_stage2_targets", HERE / "stage2_targets.py")
 sl: Any = _load("simple_stage2_loss", HERE / "stage2_loss.py")
 ft: Any = _load("simple_stage2_finetune", HERE / "stage2_finetune.py")
+se: Any = _load("simple_stage2_select", HERE / "stage2_select.py")
 DEVICE = "cpu"          # テストは決定性重視で CPU 固定
 T_SHORT = 12            # 全1000ステップは重いので、逆過程の往復は短い T で見る
 
@@ -152,6 +165,12 @@ def test_checkpoint_roundtrip() -> None:
             assert torch.equal(s1[i]["exp_avg_sq"], s2[i]["exp_avg_sq"])
         assert torch.equal(torch.get_rng_state(), rng_at_save), "RNG が復元されていない"
         print("  (2) load_ckpt: 重み・AdamWモーメント・step・config・RNG が復元される: OK")
+
+        # ★map_location を指定しても RNG が復元できること。指定すると RNG 状態の
+        #   テンソルまでそのデバイスへ移るので、CPU へ戻さないと set_rng_state が落ちる
+        step_ml, _ = ck.load_ckpt(path, model2, map_location=sm.DEVICE)
+        assert step_ml == 250
+        print(f"  (2b) map_location={sm.DEVICE} でも RNG を復元できる: OK")
 
         # 上書き保存しても既存が壊れない（atomic な差し替え）
         ck.save_ckpt(path, model, opt, 250, {"K": 1, "n": 256})
@@ -712,6 +731,71 @@ def test_teacher_mask_and_holdout() -> None:
     print("test_teacher_mask_and_holdout: OK")
 
 
+# ============================================================
+# 9. 事後チェックポイント選択
+# ============================================================
+def test_eval_against_subset() -> None:
+    """eval_against が群数非依存であること（LGO で教師群と held-out 群を分けて測る前提）。"""
+    tgt = st.load_stula_targets()
+    A = tgt["group_rates_tbl"]
+    sel = np.zeros(28, dtype=bool)
+    sel[[0, 3, 27]] = True
+    sub = {"group_rates_tbl": A[sel], "pop": tgt["pop"].reshape(28)[sel]}
+    r = st.eval_against(A[sel].reshape(3, st.NUM_COMMON * st.NUM_SLOTS), sub, st.mask_12act())
+    assert r["n_cells"] == 3 * 12 * 96 and r["rate_mae"] == 0.0
+    # 全28群でも同じ関数が動く（既存の呼び出しが壊れていない）
+    full = st.eval_against(A.reshape(28, -1), tgt, st.mask_12act())
+    assert full["n_cells"] == 32256 and full["rate_mae"] == 0.0
+    print("  (1) eval_against が3群でも28群でも同じ定義で動く: OK")
+    print("test_eval_against_subset: OK")
+
+
+def test_checkpoint_selection() -> None:
+    """(sel) 事後選択が §9.4 の出所4列を持ち、LGO で in-teacher と held-out を分けること。"""
+    model = _model()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    tgt = st.load_stula_targets()
+    cond_idx, sched_real, w_real, _ = sm.load_data()
+    d_real = sm.cond_to_d(cond_idx)
+
+    with tempfile.TemporaryDirectory() as tmp, _short_T():
+        d = Path(tmp)
+        # 教師28群（LGO なし）と、4群を外した LGO の2世代
+        ck.save_ckpt(ck.ckpt_path(d, 1), model, opt, 1, {"K": 1, "n": 4, "holdout": []})
+        ck.save_ckpt(ck.ckpt_path(d, 2), model, opt, 2, {"K": 1, "n": 4, "holdout": [0, 7, 14, 21]})
+
+        rows: list[dict] = []
+        for step in (1, 2):
+            rows.extend(se.evaluate_ckpt(ck.ckpt_path(d, step), tgt, sched_real, d_real,
+                                         w_real, n=2, device=DEVICE))
+
+    # ★§9.4 の出所4列。このリポジトリは数値の出所取り違えを2回起こしている
+    for r in rows:
+        for col in ("teacher_groups", "eval_kind", "reference", "mask"):
+            assert col in r, f"出所の列が欠けている: {col}"
+        assert r["reference"] == "teacher"
+        assert r["mask"] in ("11act", "12act")
+        assert r["eval_kind"] in ("in-teacher", "held-out")
+    print("  (1) (sel) 全行が teacher_groups / eval_kind / reference / mask を持つ: OK")
+
+    # LGO なしは in-teacher だけ2行（11act/12act）、LGO ありは held-out も出て4行
+    s1 = [r for r in rows if r["step"] == 1]
+    s2 = [r for r in rows if r["step"] == 2]
+    assert len(s1) == 2 and {r["eval_kind"] for r in s1} == {"in-teacher"}
+    assert all(r["teacher_groups"] == 28 for r in s1)
+    assert len(s2) == 4 and {r["eval_kind"] for r in s2} == {"in-teacher", "held-out"}
+    assert all(r["teacher_groups"] == 24 for r in s2)
+    held = [r for r in s2 if r["eval_kind"] == "held-out" and r["mask"] == "12act"][0]
+    assert held["n_cells"] == 4 * 12 * 96, "held-out のセル数が4群ぶんでない"
+    print("  (2) LGO 無しは in-teacher のみ、有りは held-out 4群が分かれて出る: OK")
+
+    # 軸2 のガードレールが全部載っていること（基準は zero-shot 値、§9.2）
+    for key in se.GUARDRAIL_KEYS:
+        assert key in rows[0] and math.isfinite(rows[0][key]), f"ガードレール欠落: {key}"
+    print(f"  (3) 軸2 のガードレール {len(se.GUARDRAIL_KEYS)} 指標が全行に載る: OK")
+    print("test_checkpoint_selection: OK")
+
+
 def main() -> None:
     test_checkpoint_roundtrip()
     test_reverse_step_matches_inline()
@@ -728,6 +812,8 @@ def main() -> None:
     test_layered_lr()
     test_memory_budget()
     test_teacher_mask_and_holdout()
+    test_eval_against_subset()
+    test_checkpoint_selection()
     print("\ntest_stage2: OK")
 
 

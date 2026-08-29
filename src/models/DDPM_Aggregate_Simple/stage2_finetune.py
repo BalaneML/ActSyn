@@ -60,11 +60,16 @@ HERE = Path(__file__).resolve().parent
 
 
 def _load(name: str, path: Path):
-    """sys.modules に一意名で載せる（model.py:76 と同じ様式）。
+    """sys.modules に一意名で載せる。既に同じファイルが同じ名前で入っていれば使い回す。
 
-    このリポジトリは model.py という同名ファイルを4つのモデルフォルダに持つので、
-    通常の import は sys.path の順序次第で静かに別モジュールを掴む。
+    ★使い回しが要点。同名で読み直すと sys.modules のエントリは置き換わるが、
+      先に読んだ側が掴んでいるモジュールオブジェクトは別のまま残る。すると
+      「model.T_STEPS を差し替えたのに、こちらから呼ぶ生成は 1000 ステップのまま」
+      のような、例外を出さずに黙って重くなる／数値が変わる食い違いが起きる。
     """
+    cached = sys.modules.get(name)
+    if cached is not None and getattr(cached, "__file__", None) == str(path):
+        return cached
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)

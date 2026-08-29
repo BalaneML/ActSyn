@@ -857,9 +857,13 @@ def group_pool(model, n_per_group: int, guidance_scale: float = GUIDANCE_SCALE,
     M が小さいと傾け後の有効サンプル数 (ESS) が枯れる。M は数千を想定。
 
     ★sampler / ddim_steps / eta 引数は持たない（ancestral のみ）
+    ★デバイスはモジュール定数 DEVICE ではなく model の実デバイスから取る。
+      Stage 2 の事後選択はチェックポイントを任意のデバイスへ載せて評価するので、
+      両者が食い違うと "Placeholder storage has not been allocated" で落ちる。
     """
-    diffusion = Diffusion()
-    grid = torch.as_tensor(cond_grid(), device=DEVICE)
+    dev = next(model.parameters()).device
+    diffusion = Diffusion(device=dev)
+    grid = torch.as_tensor(cond_grid(), device=dev)
     # (群, サンプル) を平坦化してからチャンクする。群ごとに切ると端数バッチが増えて
     # 逆過程 (1000ステップ) の呼び出し効率が落ちるため
     flat = grid.repeat_interleave(n_per_group, dim=0)              # (D*M, 3)
