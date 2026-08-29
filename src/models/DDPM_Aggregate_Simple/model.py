@@ -59,6 +59,7 @@ import importlib.util
 import math
 import sys
 from pathlib import Path
+from typing import Literal, overload
 
 import numpy as np
 import numpy.typing as npt
@@ -542,25 +543,68 @@ class Diffusion:
         eps_u = model(x,  t, None)
         return eps_u + guidance_scale * (eps_c - eps_u)
 
+    # 逆過程1ステップの式は、以前は sample の中と smoke_test の中に二重に書かれていた。
+    # Stage 2（Stage2_design.md §4.3）が微分可能な逆過程を要求するので、3箇所目を
+    # 作らずに済むよう1つの関数へ括り出してある。呼び出し元は sample /
+    # _sample_head / _sample_tail / smoke_test の4つ。
+    @overload
+    def _reverse_step(self, model: UNet1D, x: torch.Tensor, ti: int, cond_idx,
+                      guidance_scale: float, z: torch.Tensor | None = ...,
+                      return_aux: Literal[False] = ...) -> torch.Tensor: ...
+
+    @overload
+    def _reverse_step(self, model: UNet1D, x: torch.Tensor, ti: int, cond_idx,
+                      guidance_scale: float, z: torch.Tensor | None,
+                      return_aux: Literal[True]) -> tuple[torch.Tensor, torch.Tensor,
+                                                          torch.Tensor, torch.Tensor]: ...
+
+    def _reverse_step(self, model: UNet1D, x: torch.Tensor, ti: int, cond_idx,
+                      guidance_scale: float, z: torch.Tensor | None = None,
+                      return_aux: bool = False):
+        """
+        ancestral DDPM + CFG の逆過程を1ステップ進める。x_t -> x_{t-1}
+
+        args:
+            z         : そのステップで加える雑音 (B,12,96)。None なら新しく引く。
+                        ★2パス勾配蓄積は1パス目と同じ z を再注入する必要があるので
+                          引数で受け取れる形にしてある。randn_like 固定にすると2パス化できない
+            return_aux: True なら (x_next, eps_hat, x0_hat, mean) を返す。
+                        smoke_test の assert が中間量を見ているため
+
+        ★clamp は [0,1]。データ表現 {0,1} に合わせてある
+          （DDPM_Aggregate は表現が {-1,+1} なので [-1,1]）
+        ★in-place の clamp_ ではなく clamp を使う。勾配を流す区間で in-place 演算を
+          挟むと autograd がエラーを出す（sample 側の数値は変わらない）
+        ★ti == 0 では post_var[0] = 0 なので z を引かない。乱数の消費順が
+          切り出し前と同じになり、同一シードで sample の出力が1ビットも変わらない
+        """
+        eps_hat = self._eps(model, x, ti, cond_idx, guidance_scale)
+        x0_hat = (x - self.sqrt_1m_acp[ti] * eps_hat) / self.sqrt_acp[ti]
+        x0_hat = x0_hat.clamp(0.0, 1.0)
+        mean = self.post_coef_x0[ti] * x0_hat + self.post_coef_xt[ti] * x
+        if ti == 0:
+            x_next = mean          # post_var[0] = 0。ここが最終出力
+        else:
+            if z is None:
+                z = torch.randn_like(x)
+            x_next = mean + self.post_var[ti].sqrt() * z
+        return (x_next, eps_hat, x0_hat, mean) if return_aux else x_next
+
     @torch.no_grad()
     def sample(self, model: UNet1D, cond_idx, guidance_scale=GUIDANCE_SCALE, verbose=False):
         """
         ancestral DDPM + CFG
         cond_idx (M,K) -> スケジュール (M,96) int
 
-        ★clamp は [0,1]。データ表現 {0,1} に合わせてある
-          （DDPM_Aggregate は表現が {-1,+1} なので [-1,1]）
+        ★@torch.no_grad() はこのメソッドに付けたまま残すこと。_reverse_step 側へ移すと
+          sample_differentiable から呼んでも勾配が一切流れなくなり、しかも例外を出さない
         """
         model.eval()
         m = cond_idx.size(0)
 
         x = torch.randn(m, IN_CH, NUM_SLOTS, device=cond_idx.device)  # x_T~N(0,I)
         for ti in reversed(range(T_STEPS)):
-            eps_hat = self._eps(model, x, ti, cond_idx, guidance_scale)
-            x0_hat = (x - self.sqrt_1m_acp[ti] * eps_hat) / self.sqrt_acp[ti]
-            x0_hat.clamp_(0.0, 1.0)
-            mean = self.post_coef_x0[ti] * x0_hat + self.post_coef_xt[ti] * x
-            x = mean + self.post_var[ti].sqrt() * torch.randn_like(x) if ti > 0 else mean
+            x = self._reverse_step(model, x, ti, cond_idx, guidance_scale)
             if verbose and ti % 200 == 0:
                 print(f"  sampling t={ti}")
         return x.argmax(dim=1)
@@ -966,10 +1010,10 @@ def smoke_test():
     ci = torch.as_tensor(grid[:4], device=DEVICE)
     xt = torch.randn(4, IN_CH, NUM_SLOTS, device=DEVICE)
     with torch.no_grad():
-        eps_hat = d._eps(m, xt, T_STEPS - 1, ci, GUIDANCE_SCALE)
-        x0_hat = (xt - d.sqrt_1m_acp[-1] * eps_hat) / d.sqrt_acp[-1]
-        x0_hat.clamp_(0.0, 1.0)
-        mean = d.post_coef_x0[-1] * x0_hat + d.post_coef_xt[-1] * xt
+        # ★式を書き写さず _reverse_step を呼ぶ。書き写すと clamp などの修正が
+        #   片方にしか入らない事故が起きる。中間量は return_aux で受け取る
+        _, eps_hat, x0_hat, mean = d._reverse_step(
+            m, xt, T_STEPS - 1, ci, GUIDANCE_SCALE, None, True)
     assert eps_hat.shape == xt.shape and torch.isfinite(eps_hat).all()
     assert float(x0_hat.min()) >= 0.0 and float(x0_hat.max()) <= 1.0
     assert torch.isfinite(mean).all()

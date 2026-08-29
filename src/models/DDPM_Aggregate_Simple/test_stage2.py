@@ -1,12 +1,14 @@
 """
 Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
 
-対象は §10.2 の実装 1:
+対象は §10.2 の実装 1〜2:
     1. 定期チェックポイントと再開            stage2_checkpoint.py
+    2. 逆過程1ステップの切り出し             model.Diffusion._reverse_step
 
 検証する内容:
     (ckpt) save_ckpt -> load_ckpt の往復で model/optimizer/step/RNG が戻る。
            一時ファイルが残らない。latest_ckpt が step を数値順で選ぶ
+    (f2)   _reverse_step が旧インライン式と厳密一致し、smoke_test が通る
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは勾配の大きさが測れない。
@@ -115,8 +117,64 @@ def test_checkpoint_roundtrip() -> None:
     print("test_checkpoint_roundtrip: OK")
 
 
+# ============================================================
+# 2. 逆過程1ステップの切り出し
+# ============================================================
+def test_reverse_step_matches_inline() -> None:
+    """(f2) _reverse_step が切り出し前のインライン式と厳密一致すること。"""
+    model = _model()
+    diff = sm.Diffusion(device=DEVICE)
+    cond = _cond()
+    torch.manual_seed(0)
+    xt = torch.randn(cond.size(0), sm.IN_CH, sm.NUM_SLOTS, device=DEVICE)
+
+    for ti in (sm.T_STEPS - 1, 500, 1, 0):
+        with torch.no_grad():
+            # 切り出し前の式をそのまま書く（clamp_ だけは非 in-place に直してある）
+            eps_ref = diff._eps(model, xt, ti, cond, sm.GUIDANCE_SCALE)
+            x0_ref = ((xt - diff.sqrt_1m_acp[ti] * eps_ref) / diff.sqrt_acp[ti]).clamp(0.0, 1.0)
+            mean_ref = diff.post_coef_x0[ti] * x0_ref + diff.post_coef_xt[ti] * xt
+            x_next, eps, x0_hat, mean = diff._reverse_step(
+                model, xt, ti, cond, sm.GUIDANCE_SCALE, None, True)
+        assert torch.equal(eps, eps_ref), f"eps_hat が一致しない (ti={ti})"
+        assert torch.equal(x0_hat, x0_ref), f"x0_hat が一致しない (ti={ti})"
+        assert torch.equal(mean, mean_ref), f"mean が一致しない (ti={ti})"
+        # smoke_test が見ている4つの assert と同じもの
+        assert eps.shape == xt.shape and torch.isfinite(eps).all()
+        assert float(x0_hat.min()) >= 0.0 and float(x0_hat.max()) <= 1.0
+        assert torch.isfinite(mean).all()
+        assert int(mean.argmax(dim=1).max()) < sm.NUM_ACT
+    print("  (1) return_aux の4返り値が旧インライン式と厳密一致: OK")
+
+    # ti=0 は雑音を加えない（post_var[0] は厳密に 0）
+    with torch.no_grad():
+        x_next, _, x0_hat, mean = diff._reverse_step(
+            model, xt, 0, cond, sm.GUIDANCE_SCALE, None, True)
+    assert float(diff.post_var[0]) == 0.0 and float(diff.post_coef_xt[0]) == 0.0
+    assert torch.equal(x_next, mean), "ti=0 で x_next が mean と一致しない"
+    # ★x0_hat とは厳密には一致しない。post_coef_x0[0] は実数では 1 だが
+    #   float32 では 0.99983406（1-acp[0] の桁落ち）。相対 1.7e-4 のスケール差が残る
+    assert abs(float(diff.post_coef_x0[0]) - 1.0) < 2e-4
+    rel = float((mean - x0_hat).abs().max() / x0_hat.abs().max())
+    assert rel < 1e-3, f"ti=0 のスケール差が想定より大きい: {rel}"
+    print(f"  (2) ti=0: post_var=0, x_next==mean, x0_hat との相対差 {rel:.2e}: OK")
+
+    # 同じ z を渡せば同じ x_next になる（2パス蓄積の乱数再現性の前提）
+    z = torch.randn_like(xt)
+    with torch.no_grad():
+        a = diff._reverse_step(model, xt, 500, cond, sm.GUIDANCE_SCALE, z)
+        b = diff._reverse_step(model, xt, 500, cond, sm.GUIDANCE_SCALE, z)
+    assert torch.equal(a, b), "同じ z を渡しても結果が変わる"
+    print("  (3) z を渡すと決定的: OK")
+
+    sm.smoke_test()   # ★重複除去したハンドコピーが通ること
+    print("  (4) model.smoke_test() が _reverse_step 経由で通る: OK")
+    print("test_reverse_step_matches_inline: OK")
+
+
 def main() -> None:
     test_checkpoint_roundtrip()
+    test_reverse_step_matches_inline()
     print("\ntest_stage2: OK")
 
 
