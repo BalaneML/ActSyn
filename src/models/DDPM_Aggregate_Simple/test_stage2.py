@@ -1,13 +1,14 @@
 """
 Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
 
-対象は §10.2 の実装 1〜6:
+対象は §10.2 の実装 1〜7:
     1. 定期チェックポイントと再開            stage2_checkpoint.py
     2. 逆過程1ステップの切り出し             model.Diffusion._reverse_step
     3. 打ち切り逆伝播つきサンプラ             model.Diffusion.sample_differentiable
     4. straight-through デコーダ             model.straight_through
     5. 教師 A* と28群表への採点              stage2_targets.py
     6. 集計損失（split-batch 不偏推定）        stage2_loss.py
+    7. 学習ループ                            stage2_finetune.py
 
 検証する内容:
     (ckpt) save_ckpt -> load_ckpt の往復で model/optimizer/step/RNG が戻る。
@@ -25,6 +26,8 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     (b)    split-batch 推定が合成データで不偏（多様性への罰が消えている）
     (i)    ε=inf で ω が全要素1、χ² の損失値が素の MSE と一致
     (j)    ★ω の平均が 1。正規化を忘れると実効学習率が24倍ずれる
+    (lr)   層別 LR の分割が条件経路と conv/attention を取り違えていない
+    (mem)  K×D_sub×n の予算超過を学習前に落とす
     (d_idx) stage2_targets.d_index が model.d_index と全28組で一致
 
 ★ 出口の零初期化について:
@@ -66,6 +69,7 @@ sm: Any = _load("simple_model", HERE / "model.py")
 ck: Any = _load("simple_stage2_checkpoint", HERE / "stage2_checkpoint.py")
 st: Any = _load("simple_stage2_targets", HERE / "stage2_targets.py")
 sl: Any = _load("simple_stage2_loss", HERE / "stage2_loss.py")
+ft: Any = _load("simple_stage2_finetune", HERE / "stage2_finetune.py")
 DEVICE = "cpu"          # テストは決定性重視で CPU 固定
 T_SHORT = 12            # 全1000ステップは重いので、逆過程の往復は短い T で見る
 
@@ -625,6 +629,57 @@ def test_jsd_loss() -> None:
     print("test_jsd_loss: OK")
 
 
+# ============================================================
+# 7. 学習ループ
+# ============================================================
+def test_layered_lr() -> None:
+    """(lr) 層別 LR の分割（§8.3）。条件経路と conv/attention を取り違えていないこと。"""
+    model = _model()
+    opt = ft.build_optimizer(model)
+    assert len(opt.param_groups) == 2
+    cond_g, conv_g = opt.param_groups
+    assert cond_g["lr"] == ft.LR_COND and conv_g["lr"] == ft.LR_CONV
+    assert ft.LR_COND > ft.LR_CONV, "条件経路の方が高い LR でなければならない"
+
+    cond_names = [n for n, _ in model.named_parameters()
+                  if any(k in n for k in ft.COND_PATH_KEYS)]
+    conv_names = [n for n, _ in model.named_parameters()
+                  if not any(k in n for k in ft.COND_PATH_KEYS)]
+    # 条件経路に入るべきもの / 入ってはいけないもの
+    assert any("cond_embeds" in n for n in cond_names)
+    assert any("cond_proj" in n for n in cond_names)
+    assert "null_emb" in cond_names
+    assert any("emb_proj" in n for n in cond_names)
+    assert not any(".conv1." in n or ".conv2." in n for n in cond_names), \
+        "畳み込みが条件経路へ混入している"
+    assert any("out_conv" in n for n in conv_names)
+    assert any("attn" in n for n in conv_names)
+
+    n_cond = sum(p.numel() for p in cond_g["params"])
+    n_conv = sum(p.numel() for p in conv_g["params"])
+    assert n_cond + n_conv == sum(p.numel() for p in model.parameters()) == 1_759_124
+    # §8.1: cond_embeds+cond_proj+null_emb = 4,680、emb_proj×11 = 312,512
+    assert n_cond == 4_680 + 312_512, f"条件経路のパラメータ数が §8.1 と違う: {n_cond}"
+    print(f"  (1) (lr) 条件経路 {n_cond:,} / conv・attn {n_conv:,} "
+          f"（§8.1 の内訳と一致）: OK")
+    print("test_layered_lr: OK")
+
+
+def test_memory_budget() -> None:
+    """(mem) 1パス版のピーク K×D_sub×n を学習前に検査すること（§4.5）。"""
+    ft.check_memory_budget(1, 24, 256)          # 6,144 <= 6,600 ： 通る
+    ft.check_memory_budget(1, 7, 256)           # 1,792         ： 通る
+    for bad in ((1, 28, 256), (4, 7, 256), (1, 7, 1024)):    # 7,168 / 7,168 / 7,168
+        try:
+            ft.check_memory_budget(*bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"予算超過が弾かれていない: {bad}")
+    print("  (1) (mem) D_sub=24 は通り、28 と K=4 と n=1024 は落ちる: OK")
+    print("test_memory_budget: OK")
+
+
 def main() -> None:
     test_checkpoint_roundtrip()
     test_reverse_step_matches_inline()
@@ -638,6 +693,8 @@ def main() -> None:
     test_split_batch_unbiased()
     test_loss_grad_and_diagnostics()
     test_jsd_loss()
+    test_layered_lr()
+    test_memory_budget()
     print("\ntest_stage2: OK")
 
 
