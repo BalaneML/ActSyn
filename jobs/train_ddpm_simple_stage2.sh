@@ -37,7 +37,9 @@
 #   qsub jobs/train_ddpm_simple_stage2.sh
 #
 #   環境変数で上書きできる:
-#     STEPS=300 D_SUB=7 N=256 K=1 EPS=inf LAM=auto LOSS=sq HOLDOUT= RESUME=0
+#     STEPS=300 D_SUB=7 N=256 K=1 CHUNK=0 EPS=inf LAM=auto LOSS=sq HOLDOUT= RESUME=0
+#     CHUNK=0 は予算からの自動決定。B 未満になると2パス勾配蓄積へ切り替わる
+#     （勾配は一括計算と厳密に一致するので、下がっても学習の意味は変わらない）
 #   例: EPS=0.01 qsub -v EPS jobs/train_ddpm_simple_stage2.sh     # 主B（χ²）
 #       RESUME=1 qsub -v RESUME jobs/train_ddpm_simple_stage2.sh  # 途中から再開
 
@@ -48,6 +50,7 @@ STEPS="${STEPS:-300}"
 D_SUB="${D_SUB:-7}"
 N="${N:-256}"
 K="${K:-1}"
+CHUNK="${CHUNK:-0}"
 EPS="${EPS:-inf}"
 LOSS="${LOSS:-sq}"
 LAM="${LAM:-auto}"
@@ -61,7 +64,7 @@ DATA="${REPO}/data/processed/atus2024/atus2024_stula_common12_dataset.csv"
 CKPT_DIR="${REPO}/outputs/checkpoints/stage2"
 LOG="${WORK}/logs/simple_stage2_${PBS_JOBID:-manual}.log"
 
-echo "steps=${STEPS} d_sub=${D_SUB} n=${N} K=${K} eps=${EPS} loss=${LOSS} lam=${LAM}"
+echo "steps=${STEPS} d_sub=${D_SUB} n=${N} K=${K} chunk=${CHUNK} eps=${EPS} loss=${LOSS} lam=${LAM}"
 echo "holdout='${HOLDOUT}' resume=${RESUME}"
 echo "log:  ${LOG}"
 echo "ckpt: ${CKPT_DIR}"
@@ -90,11 +93,24 @@ if [ -z "${VRAM_MIB}" ]; then
 fi
 # 予算 = (VRAM - 固定費 1.7GB) / (4.664 MB per K×sample) × 0.8（断片化の余裕2割）
 BUDGET=$(( (VRAM_MIB - 1700) * 1000 / 4664 * 8 / 10 ))
-LOAD=$(( K * D_SUB * N ))
-echo "VRAM=${VRAM_MIB} MiB  予算 K×D_sub×n <= ${BUDGET}  要求=${LOAD}"
+TOTAL=$(( D_SUB * N ))
+# CHUNK=0（自動）なら Python 側が予算に収まるところまで chunk を下げて2パスへ切り替える。
+# ここではその「下がる先」で判定し、自動でも収まらない場合だけを弾く。
+# CHUNK を明示したときはその値をそのまま判定する。
+if [ "${CHUNK}" -gt 0 ]; then
+    LOAD=$(( K * CHUNK ))
+else
+    LOAD=$(( K * TOTAL ))
+    if [ "${LOAD}" -gt "${BUDGET}" ]; then
+        LOAD=$(( K * (BUDGET / K) ))
+        echo "note: B=${TOTAL} は1パスで収まらないので2パス勾配蓄積へ自動で切り替わる"
+    fi
+fi
+echo "VRAM=${VRAM_MIB} MiB  予算 K×chunk <= ${BUDGET}  要求=${LOAD}  (B=${TOTAL})"
 if [ "${LOAD}" -gt "${BUDGET}" ]; then
-    echo "ERROR: K×D_sub×n = ${K}×${D_SUB}×${N} = ${LOAD} が予算 ${BUDGET} を超えている。" >&2
-    echo "       逃げ道は優先順に (1) D_SUB を下げる (2) 2パス勾配蓄積 (3) 勾配チェックポイント" >&2
+    echo "ERROR: K×chunk = ${LOAD} が予算 ${BUDGET} を超えている（K=${K} CHUNK=${CHUNK}）。" >&2
+    echo "       逃げ道は優先順に (1) CHUNK を下げる／0 にして自動決定させる" >&2
+    echo "                        (2) D_SUB を下げる  (3) 勾配チェックポイント" >&2
     exit 1
 fi
 
@@ -113,14 +129,14 @@ mkdir -p "${CKPT_DIR}"
     echo "commit: $(git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "dirty : $(git status --porcelain 2>/dev/null | wc -l) file(s)"
     echo "stage1: ${STAGE1}"
-    echo "steps=${STEPS} d_sub=${D_SUB} n=${N} K=${K} eps=${EPS} loss=${LOSS} lam=${LAM}"
+    echo "steps=${STEPS} d_sub=${D_SUB} n=${N} K=${K} chunk=${CHUNK} eps=${EPS} loss=${LOSS} lam=${LAM}"
     echo "holdout='${HOLDOUT}' resume=${RESUME} save_every=${SAVE_EVERY}"
-    echo "VRAM=${VRAM_MIB} MiB  budget=${BUDGET}  load=${LOAD}"
+    echo "VRAM=${VRAM_MIB} MiB  budget=${BUDGET}  load=${LOAD}  B=${TOTAL}"
     nvidia-smi
     echo "==="
 } > "${LOG}" 2>&1
 
-ARGS=(--steps "${STEPS}" --d-sub "${D_SUB}" --n "${N}" --K "${K}"
+ARGS=(--steps "${STEPS}" --d-sub "${D_SUB}" --n "${N}" --K "${K}" --chunk "${CHUNK}"
       --eps "${EPS}" --loss "${LOSS}" --lam "${LAM}"
       --save-every "${SAVE_EVERY}" --ckpt-dir "${CKPT_DIR}" --stage1-ckpt "${STAGE1}")
 [ -n "${HOLDOUT}" ] && ARGS+=(--holdout-groups "${HOLDOUT}")

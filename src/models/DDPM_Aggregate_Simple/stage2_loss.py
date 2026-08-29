@@ -178,6 +178,28 @@ def loss_grad(a_A: torch.Tensor, a_B: torch.Tensor, q: torch.Tensor,
     return omega * (a_B - q) / scale, omega * (a_A - q) / scale
 
 
+def per_sample_grad(g_A: torch.Tensor, g_B: torch.Tensor, n: int) -> torch.Tensor:
+    """群平均への勾配 g_A/g_B を個票ごとの上流勾配 (D_sub*n, 12, 96) へ展開する。
+
+    2パス勾配蓄積（Stage2_design.md §2.9, §11.2）で `y_c.backward(gradient=...)` に
+    渡す値そのもの。群 d・半分 h に属する個票 i について
+
+        ∂L/∂y_i = ∂L/∂ā_h[d] · ∂ā_h[d]/∂y_i = g_h[d] / (n/2)
+
+    ★割る数は n ではなく n/2。ā_A は n/2 本の平均なので ∂ā_A/∂y_i = 1/(n/2) である。
+      §2.9 の説明は split-batch を使わない素朴版（g/n）で書いてあるので取り違えないこと。
+    ★並びは group_rates_split と同じ「群優先・群の中は前半がA・後半がB」。
+      ここがずれると別の群の勾配を別の群の個票へ流すことになり、しかも例外は出ない。
+    """
+    if n % 2 != 0:
+        raise ValueError(f"split-batch には n が偶数である必要がある: {n}")
+    d_sub, n_act, n_slot = g_A.shape
+    half = n // 2
+    per = torch.cat([g_A.unsqueeze(1).expand(d_sub, half, n_act, n_slot),
+                     g_B.unsqueeze(1).expand(d_sub, half, n_act, n_slot)], dim=1)
+    return (per / half).reshape(d_sub * n, n_act, n_slot)
+
+
 def g_diagnostics(g: torch.Tensor, q: torch.Tensor, n: int,
                   act_names: list[str] | None = None) -> dict[str, float]:
     """g の統計を dict で返す。生成済みの量だけで計算できるので毎更新で呼べる。

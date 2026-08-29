@@ -1,7 +1,7 @@
 """
 Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
 
-対象は §10.2 の実装 1〜9:
+対象は §10.2 の実装 1〜11:
     1. 定期チェックポイントと再開            stage2_checkpoint.py
     2. 逆過程1ステップの切り出し             model.Diffusion._reverse_step
     3. 打ち切り逆伝播つきサンプラ             model.Diffusion.sample_differentiable
@@ -11,6 +11,7 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     7. 学習ループ                            stage2_finetune.py
     8. teacher_mask と --holdout-groups       stage2_finetune.py
     9. 事後チェックポイント選択                stage2_select.py
+   11. 2パス勾配蓄積（gradient caching）      stage2_finetune.py
 
 検証する内容:
     (ckpt) save_ckpt -> load_ckpt の往復で model/optimizer/step/RNG が戻る。
@@ -32,6 +33,9 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     (mem)  K×D_sub×n の予算超過を学習前に落とす
     (lgo)  teacher_mask が損失群だけを外し、人口層化が大小を混ぜる
     (sel)  事後選択が §9.4 の出所4列を必ず持ち、in-teacher と held-out を分ける
+    (d)    ピークメモリが K に線形かつ n に依存しない
+    (e)    ★2パス蓄積の勾配が一括計算と一致する（近似ではない）
+    (e2)   2パス目に1パス目と同じ zs を渡すと x_0 が一致する
     (d_idx) stage2_targets.d_index が model.d_index と全28組で一致
 
 ★ 出口の零初期化について:
@@ -796,6 +800,199 @@ def test_checkpoint_selection() -> None:
     print("test_checkpoint_selection: OK")
 
 
+# ============================================================
+# 11. 2パス勾配蓄積
+# ============================================================
+def _twopass_fixture(d_sub: int = 3, n: int = 8, K: int = 2):
+    """2パス蓄積の検証に使うモデル・条件・教師をまとめて作る。"""
+    model = _model()
+    diff = sm.Diffusion(device=DEVICE)
+    cond = torch.as_tensor(sm.cond_grid()[:d_sub], device=DEVICE).repeat_interleave(n, dim=0)
+    torch.manual_seed(11)
+    q = torch.rand(d_sub, sm.NUM_ACT, sm.NUM_SLOTS, device=DEVICE)
+    q = q / q.sum(dim=1, keepdim=True)
+    omega = sl.chi2_weights(q, 0.01)
+    return model, diff, cond, q, omega
+
+
+def _grads(model) -> dict:
+    return {k: (v.grad.clone() if v.grad is not None else None)
+            for k, v in model.named_parameters()}
+
+
+def _max_grad_diff(a: dict, b: dict) -> tuple[float, float]:
+    keys = [k for k in a if a[k] is not None and b[k] is not None]
+    assert len(keys) == len([k for k in a if a[k] is not None]), "勾配が付いていないパラメータがある"
+    absd = max(float((a[k] - b[k]).abs().max()) for k in keys)
+    scale = max(float(a[k].abs().max()) for k in keys)
+    return absd, absd / scale
+
+
+def test_naive_accumulation_is_wrong() -> None:
+    """普通の勾配蓄積が使えない理由を、設計書 §2.9 の数値例で固定する。
+
+    損失がバッチ全体の非線形関数なので、部分から全体を復元できない。
+    """
+    # ★float64 で計算する。float32 だと 0.0025 が 0.00250000110 になり、
+    #   ここで見たい「65倍」という桁の話がまるめ誤差の話に見えてしまう
+    y = torch.tensor([1.0, 0.9, 0.1, 0.2], dtype=torch.float64)
+    target = 0.5
+    correct = float((y.mean() - target) ** 2)
+    partial = float(torch.stack([(y[:2].mean() - target) ** 2,
+                                 (y[2:].mean() - target) ** 2]).mean())
+    assert abs(correct - 0.0025) < 1e-12, correct
+    assert abs(partial - 0.1625) < 1e-12, partial
+    assert abs(partial / correct - 65.0) < 1e-9
+    print(f"  (1) 正しい損失 {correct:.4f} に対し部分和は {partial:.4f} で"
+          f"{partial/correct:.0f}倍ずれる: OK")
+    print("test_naive_accumulation_is_wrong: OK")
+
+
+def test_two_pass_matches_full_batch() -> None:
+    """(e)(e2) ★2パス蓄積の勾配が一括計算と一致すること。近似ではない。"""
+    with _short_T():
+        d_sub, n, K = 3, 8, 2
+        total = d_sub * n
+        model, diff, cond, q, omega = _twopass_fixture(d_sub, n, K)
+
+        # --- 参照: 一括 autograd。zs と x_K の引き順を2パス版と揃える ---
+        torch.manual_seed(7)
+        zs = {ti: torch.randn(total, sm.IN_CH, sm.NUM_SLOTS, device=DEVICE)
+              for ti in range(1, K)}
+        x_K = diff._sample_head(model, cond, K)
+        model.zero_grad(set_to_none=True)
+        x0 = diff._sample_tail(model, x_K, K, cond, zs=zs)
+        y = sm.straight_through(x0)
+        a_A, a_B = sl.group_rates_split(y, n)
+        ref_loss = sl.agg_loss_from_rates(a_A, a_B, q, omega)
+        ref_loss.backward()
+        ref = _grads(model)
+        ref_val = float(ref_loss.detach())
+
+        # (e2) 同じ zs をチャンクへ切って渡すと x_0 が再現される
+        with torch.no_grad():
+            parts = [diff._sample_tail(model, x_K[s:s + 6], K, cond[s:s + 6],
+                                       zs={ti: z[s:s + 6] for ti, z in zs.items()})
+                     for s in range(0, total, 6)]
+        cat = torch.cat(parts, dim=0)
+        dmax = float((x0.detach() - cat).abs().max())
+        assert dmax < 1e-5, f"チャンクで x_0 が再現できない: {dmax}"
+        # ★実際に集計へ入るのは argmax 後の one-hot なので、そちらは厳密一致でなければならない
+        assert torch.equal(x0.detach().argmax(dim=1), cat.argmax(dim=1)), \
+            "チャンクで argmax がずれる（one-hot が変わる＝別のサンプルを見ている）"
+        print(f"  (1) (e2) 同じ zs でチャンク再現: max|Δx_0|={dmax:.1e}、argmax は厳密一致: OK")
+
+        # --- (e) 2パス蓄積を chunk を変えて回し、参照と突き合わせる ---
+        for chunk in (total, 12, 6, 1):
+            model.zero_grad(set_to_none=True)
+            torch.manual_seed(7)          # zs と x_T を参照と同じに引き直す
+            loss, got_A, got_B = ft._aggregate_step_two_pass(
+                diff, model, cond, K, n, q, omega, chunk, 1.0)
+            assert abs(loss - ref_val) < 1e-6, f"損失が一致しない (chunk={chunk})"
+            assert torch.equal(got_A, a_A.detach()) and torch.equal(got_B, a_B.detach())
+            absd, rel = _max_grad_diff(_grads(model), ref)
+            # float32 の丸め誤差レベル。設計書 §2.9 の実測は 5.96e-08（絶対）
+            assert rel < 1e-5, f"勾配が一致しない (chunk={chunk}): 相対 {rel:.2e}"
+            print(f"  (2) (e) chunk={chunk:3d}: 勾配 max|Δ|={absd:.2e}（相対 {rel:.1e}）: OK")
+
+        # aggregate_step が chunk>=B で1パス、chunk<B で2パスへ分かれること
+        model.zero_grad(set_to_none=True)
+        torch.manual_seed(7)
+        one, _, _ = ft.aggregate_step(diff, model, cond, K, n, q, omega, total, "sq")
+        one_g = _grads(model)
+        model.zero_grad(set_to_none=True)
+        torch.manual_seed(7)
+        two, _, _ = ft.aggregate_step(diff, model, cond, K, n, q, omega, 6, "sq")
+        assert abs(one - two) < 1e-6, "1パスと2パスで損失が違う"
+        _, rel = _max_grad_diff(_grads(model), one_g)
+        assert rel < 1e-5, f"1パスと2パスで勾配が違う: 相対 {rel:.2e}"
+        print(f"  (3) aggregate_step の1パス／2パスが一致（相対 {rel:.1e}）: OK")
+    print("test_two_pass_matches_full_batch: OK")
+
+
+def _saved_bytes(fn) -> int:
+    """fn の実行中に autograd が保存したテンソルの総バイト数。
+
+    ★重複排除しない（設計書 §4.2 の実測と同じ流儀）。ここで見たいのは
+      K と n に対する増え方の比なので、共有ストレージの二重計上は両辺で相殺される。
+    """
+    total = 0
+
+    def pack(t: torch.Tensor) -> torch.Tensor:
+        nonlocal total
+        total += t.nbytes
+        return t
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        fn()
+    return total
+
+
+def test_two_pass_memory_scaling() -> None:
+    """(d) ★勾配を保持するメモリが K に線形で、n（＝B）に依存しないこと。
+
+    これが2パス蓄積を入れる理由そのもの。1パス版のピークは K×D_sub×n なので n に
+    比例して増えるが、2パスなら K×chunk だけで決まる。
+    """
+    def peak(K: int, d_sub: int, n: int, chunk: int) -> float:
+        model, diff, cond, q, omega = _twopass_fixture(d_sub, n, K)
+        model.zero_grad(set_to_none=True)
+        torch.manual_seed(5)
+        n_chunk = -(-(d_sub * n) // chunk)          # 切り上げ
+        total = _saved_bytes(lambda: ft._aggregate_step_two_pass(
+            diff, model, cond, K, n, q, omega, chunk, 1.0))
+        return total / n_chunk                       # 1チャンクあたり＝ピーク
+
+    with _short_T():
+        # n を倍にしても1チャンクあたりの保持量は変わらない
+        p_n8 = peak(K=1, d_sub=2, n=8, chunk=4)
+        p_n16 = peak(K=1, d_sub=2, n=16, chunk=4)
+        assert abs(p_n16 / p_n8 - 1.0) < 0.02, \
+            f"n に依存している: n=8 で {p_n8:,.0f}B / n=16 で {p_n16:,.0f}B"
+        print(f"  (1) (d) n=8 と n=16 でピークが同じ "
+              f"({p_n8/1e6:.2f}MB vs {p_n16/1e6:.2f}MB): OK")
+
+        # K を倍にすると保持量も倍になる
+        p_k1 = peak(K=1, d_sub=2, n=8, chunk=8)
+        p_k2 = peak(K=2, d_sub=2, n=8, chunk=8)
+        assert 1.9 < p_k2 / p_k1 < 2.1, f"K に線形でない: 比 {p_k2/p_k1:.3f}"
+        print(f"  (2) (d) K=1 -> K=2 でピークが {p_k2/p_k1:.2f} 倍（線形）: OK")
+
+        # chunk を半分にすると保持量も半分に近づく（固定費ぶんだけ完全な半分にはならない）
+        p_c8 = peak(K=1, d_sub=2, n=8, chunk=8)
+        p_c4 = peak(K=1, d_sub=2, n=8, chunk=4)
+        assert p_c4 < p_c8, "chunk を下げてもピークが下がらない"
+        print(f"  (3) chunk 8 -> 4 でピークが {p_c8/1e6:.2f}MB -> {p_c4/1e6:.2f}MB: OK")
+    print("test_two_pass_memory_scaling: OK")
+
+
+def test_resolve_chunk() -> None:
+    """chunk の自動決定と、予算チェックが chunk を見ること。"""
+    # 予算に収まるなら B のまま（＝1パス）
+    assert ft.resolve_chunk(1, 7, 256) == 1792
+    assert ft.resolve_chunk(1, 24, 256) == 6144
+    # 収まらないなら予算いっぱいまで下げる（＝2パス）
+    assert ft.resolve_chunk(1, 28, 256) == ft.MEMORY_BUDGET
+    assert ft.resolve_chunk(4, 7, 256) == ft.MEMORY_BUDGET // 4
+    # 明示指定は B を超えない範囲で尊重する
+    assert ft.resolve_chunk(1, 7, 256, chunk=512) == 512
+    assert ft.resolve_chunk(1, 7, 256, chunk=99999) == 1792
+    print("  (1) chunk の自動決定が予算 K×chunk <= "
+          f"{ft.MEMORY_BUDGET:,} に収まる: OK")
+
+    # ★予算チェックは chunk を見る。2パスなら D_sub=28 も通る
+    ft.check_memory_budget(1, 28, 256, chunk=ft.resolve_chunk(1, 28, 256))
+    ft.check_memory_budget(4, 7, 256, chunk=ft.resolve_chunk(4, 7, 256))
+    try:
+        ft.check_memory_budget(1, 28, 256, chunk=7168)     # 明示指定で超過
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("chunk 明示指定の予算超過が弾かれていない")
+    print("  (2) 2パスなら D_sub=28 も通り、chunk 明示指定の超過は落ちる: OK")
+    print("test_resolve_chunk: OK")
+
+
 def main() -> None:
     test_checkpoint_roundtrip()
     test_reverse_step_matches_inline()
@@ -814,6 +1011,10 @@ def main() -> None:
     test_teacher_mask_and_holdout()
     test_eval_against_subset()
     test_checkpoint_selection()
+    test_naive_accumulation_is_wrong()
+    test_two_pass_matches_full_batch()
+    test_two_pass_memory_scaling()
+    test_resolve_chunk()
     print("\ntest_stage2: OK")
 
 

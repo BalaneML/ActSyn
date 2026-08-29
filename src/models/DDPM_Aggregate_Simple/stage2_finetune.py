@@ -38,6 +38,7 @@ val ε-MSE 早期終了は目的関数が別物なので流用できない。
         --d-sub M        1更新で使う群数。メモリ制約は K×D_sub×n <= 6600（§4.5）
         --n N            群あたり生成本数。n=256 で教師セルの45.6%が識別可能（§4.6）
         --K N            勾配を保持する末尾ステップ数。DRaFT は K=1 でも機能すると報告
+        --chunk N        1度に勾配を保持する個票数。0 で予算から自動。B 未満なら2パス蓄積
         --eps V          損失の重み床。inf=素のMSE（主A）、0.01=χ²（主B）
         --loss {sq,jsd}  jsd はアブレーション1点のみ
         --lam V          リハーサル重み。auto なら初回の L_agg/L_atus 比で決める
@@ -155,22 +156,152 @@ def build_optimizer(model: torch.nn.Module,
                               {"params": conv, "lr": lr_conv}], weight_decay=0.0)
 
 
-def check_memory_budget(K: int, d_sub: int, n: int, budget: int = MEMORY_BUDGET) -> None:
-    """1パス版のピークは K × D_sub × n で決まる（§4.5）。超過なら学習前に落とす。
+def check_memory_budget(K: int, d_sub: int, n: int, chunk: int | None = None,
+                        budget: int = MEMORY_BUDGET) -> None:
+    """勾配を保持するピークは K × chunk で決まる（§4.5）。超過なら学習前に落とす。
 
     ★5時間回した後に OOM で失う事故を防ぐための事前チェック。逃げ道は優先順に
       (1) D_sub を下げる  (2) 2パス勾配蓄積で chunk を下げる  (3) 勾配チェックポイント
+    ★chunk=None は1パス版。そのときピークは K × D_sub × n（＝ chunk が B に等しい）。
     """
-    load = K * d_sub * n
-    if load > budget:
-        raise SystemExit(
-            f"ERROR: K×D_sub×n = {K}×{d_sub}×{n} = {load:,} が予算 {budget:,} を超えている。\n"
-            f"       D_sub <= {budget // (K * n)} に下げるか、K を下げること（§4.5）")
+    load = K * (d_sub * n if chunk is None else chunk)
+    if load <= budget:
+        return
+    what = f"K×D_sub×n = {K}×{d_sub}×{n}" if chunk is None else f"K×chunk = {K}×{chunk}"
+    raise SystemExit(
+        f"ERROR: {what} = {load:,} が予算 {budget:,} を超えている。\n"
+        f"       chunk <= {budget // K} に下げるか、K を下げること（§4.5）")
+
+
+def resolve_chunk(K: int, d_sub: int, n: int, chunk: int | None = None,
+                  budget: int = MEMORY_BUDGET) -> int:
+    """1度に勾配を保持する個票数を決める。返り値が B 以上なら1パス、未満なら2パス。
+
+    ★B（欲しい本数）と chunk（一度に勾配を保持できる本数）は別の量である。
+      B は統計的要請（n は §4.6 の分解能）、chunk はメモリ制約（K×chunk <= 約6,600）で決まる。
+    chunk=None なら予算に収まる最大値を自動で選ぶ。2パス蓄積は勾配が一括計算と厳密に
+    一致する（近似ではない）ので、自動で下げても学習の意味は変わらない。
+    """
+    total = d_sub * n
+    if chunk is not None and chunk > 0:
+        return min(chunk, total)
+    auto = budget // K
+    if auto <= 0:
+        raise SystemExit(f"ERROR: K={K} が大きすぎて chunk を1本も取れない（予算 {budget:,}）")
+    return min(total, auto)
+
+
+def aggregate_step(diffusion: Any, model: torch.nn.Module, cond: torch.Tensor,
+                   K: int, n: int, q: torch.Tensor, omega: torch.Tensor,
+                   chunk: int, loss_kind: str = "sq",
+                   tau: float = 1.0) -> tuple[float, torch.Tensor, torch.Tensor]:
+    """集計側の1更新ぶんの勾配を θ.grad へ蓄積し、(L_agg の値, ā_A, ā_B) を返す。
+
+    ★返り値の損失はスカラー値であって計算グラフを持たない。backward はこの関数の中で
+      済ませてある。呼び出し側は先に optimizer.zero_grad() を済ませておくこと。
+
+    chunk >= B なら1パス（素直に autograd を通す）。chunk < B なら2パス勾配蓄積
+    （gradient caching、§2.9）に切り替える。
+
+    2パスが要る理由は「損失がバッチ全体の関数で分解できないのに、バッチがメモリに
+    入らない」から。普通の勾配蓄積（部分ごとに損失を計算して足す）は使えない。
+    損失が非線形なので部分から全体を復元できず、n=4/chunk=2 の例では正しい損失 0.0025 に
+    対して 0.1625 と65倍ずれる。
+
+    2パスの原理は連鎖律を「定数の部分」と「分解できる部分」に割ること:
+
+        ∂L/∂θ = (∂L/∂Ã) · (∂Ã/∂θ),   ∂Ã/∂θ = (1/n) Σ_i ∂y_i/∂θ
+
+    1パス目で ∂L/∂Ã を数値 g に潰してしまえば、残りは y について線形なので
+    チャンクの和へ分解できる。近似ではなく厳密に一致する。
+
+    ★2パス目は1パス目と同じ乱数でなければ別のサンプルを見ることになる。末尾 K 区間の
+      雑音 zs を1パス目で作って両方に渡す。x_K も1パス目のものを使い回すので、
+      前段（T−K ステップ）は1回しか回らない。2回回るのは末尾 K だけである。
+
+    計算コスト:
+      追加分は「1パス目の末尾 K（no_grad）」＋「(チャンク数−1) 回ぶんの末尾 K と backward」で、
+      前段の T−K ステップには依存しない。K=1・4分割なら数ステップ相当なので、T=1000 の
+      1更新（実測155秒、§4.7）に対しては小さいはずである。
+      ★ただし対象ハードウェア（A100）での実測はまだ無い。手元の MPS・小さい T では
+        計測ノイズが支配的で数値を確定できなかった。学習ログの sec 列で確認すること。
+    """
+    total = cond.size(0)
+    if loss_kind == "jsd" or chunk >= total:
+        return _aggregate_step_one_pass(diffusion, model, cond, K, n, q, omega,
+                                        loss_kind, tau)
+    return _aggregate_step_two_pass(diffusion, model, cond, K, n, q, omega, chunk, tau)
+
+
+def _draw_tail_noise(total: int, K: int, dev: torch.device | str) -> dict[int, torch.Tensor]:
+    """末尾 K 区間で使う雑音 {ti: z}。ti=0 は雑音を使わないのでキーは 1..K-1。
+
+    ★1パス版でもここで引く。chunk はメモリの都合で決まる量であって実験の中身を
+      変えてはいけないので、乱数の引き順を両者で揃える。揃えないと --chunk を変えた
+      だけで同じシードから別の軌跡が出る。K=1 なら空 dict で、乱数を1つも消費しない。
+    """
+    return {ti: torch.randn(total, sm.IN_CH, sm.NUM_SLOTS, device=dev) for ti in range(1, K)}
+
+
+def _aggregate_step_one_pass(diffusion: Any, model: torch.nn.Module, cond: torch.Tensor,
+                             K: int, n: int, q: torch.Tensor, omega: torch.Tensor,
+                             loss_kind: str, tau: float
+                             ) -> tuple[float, torch.Tensor, torch.Tensor]:
+    """素直に autograd を通す版。chunk >= B のとき、および jsd のときに使う。
+
+    ★jsd は二次形式でないので g へ潰せない＝2パス化できない。アブレーション1点用なので
+      1パスで足りる範囲（小さい B）でだけ回す。
+    """
+    zs = _draw_tail_noise(cond.size(0), K, cond.device)
+    x0 = diffusion.sample_differentiable(model, cond, K, zs=zs)
+    y = sm.straight_through(x0, tau)
+    if loss_kind == "jsd":
+        l_agg = sl.jsd_loss(y, q, n)
+        a_A, a_B = sl.group_rates_split(y.detach(), n)
+    else:
+        a_A, a_B = sl.group_rates_split(y, n)
+        l_agg = sl.agg_loss_from_rates(a_A, a_B, q, omega)
+    l_agg.backward()
+    return float(l_agg.detach()), a_A.detach(), a_B.detach()
+
+
+def _aggregate_step_two_pass(diffusion: Any, model: torch.nn.Module, cond: torch.Tensor,
+                             K: int, n: int, q: torch.Tensor, omega: torch.Tensor,
+                             chunk: int, tau: float
+                             ) -> tuple[float, torch.Tensor, torch.Tensor]:
+    """2パス勾配蓄積（§2.9, §11.2 の 12a〜12h）。
+
+    ★乱数の引き順が1パス目と2パス目で同じであることが要点。zs を先に作ってから
+      _sample_head を呼ぶ（この順序はテスト側でも再現する）。
+    """
+    total = cond.size(0)
+    zs = _draw_tail_noise(total, K, cond.device)
+
+    # ---- 1パス目: x_K まで進めて Ã と g を得る。グラフは作らない ----
+    x_K = diffusion._sample_head(model, cond, K)
+    with torch.no_grad():
+        y = sm.straight_through(diffusion._sample_tail(model, x_K, K, cond, zs=zs), tau)
+        a_A, a_B = sl.group_rates_split(y, n)
+        l_agg = float(sl.agg_loss_from_rates(a_A, a_B, q, omega))
+        g_A, g_B = sl.loss_grad(a_A, a_B, q, omega)
+        g_per = sl.per_sample_grad(g_A, g_B, n)          # (B,12,96)
+
+    # ---- 2パス目: チャンクごとに末尾 K だけ再計算し、g を上流勾配として注入 ----
+    for start in range(0, total, chunk):
+        end = min(start + chunk, total)
+        zs_c = {ti: z[start:end] for ti, z in zs.items()}
+        x0_c = diffusion._sample_tail(model, x_K[start:end], K, cond[start:end], zs=zs_c)
+        y_c = sm.straight_through(x0_c, tau)
+        # ★backward(gradient=...) は「この値を上流から来た勾配とみなせ」という指示。
+        #   底にある概念は VJP（ベクトル・ヤコビアン積）で、計算しているのは vᵀJ
+        y_c.backward(gradient=g_per[start:end])
+    return l_agg, a_A, a_B
 
 
 def run(steps: int = DEFAULT_STEPS, d_sub: int = DEFAULT_D_SUB, n: int = DEFAULT_N,
         K: int = DEFAULT_K, eps: float = float("inf"), loss_kind: str = "sq",
-        lam: float | None = None, holdout: list[int] | None = None,
+        lam: float | None = None, chunk: int | None = None,
+        holdout: list[int] | None = None,
         save_every: int = DEFAULT_SAVE_EVERY, ckpt_dir: Path = CKPT_DIR,
         stage1_ckpt: Path = STAGE1_CKPT, resume: bool = False,
         seed: int = 42, use_wandb: bool = True, device: str | None = None) -> torch.nn.Module:
@@ -181,7 +312,8 @@ def run(steps: int = DEFAULT_STEPS, d_sub: int = DEFAULT_D_SUB, n: int = DEFAULT
       判定量と閾値を決める（§8.4）。
     """
     dev = device or sm.DEVICE
-    check_memory_budget(K, d_sub, n)
+    chunk = resolve_chunk(K, d_sub, n, chunk)
+    check_memory_budget(K, d_sub, n, chunk)
     torch.manual_seed(seed)
 
     # ---- 教師 ----
@@ -223,11 +355,13 @@ def run(steps: int = DEFAULT_STEPS, d_sub: int = DEFAULT_D_SUB, n: int = DEFAULT
         wandb_run = wandb.init(project="domain-transfer-ddpm-agg", job_type="stage2",
                                config={"steps": steps, "d_sub": d_sub, "n": n, "K": K,
                                        "eps": eps, "loss": loss_kind, "lam": lam,
+                                       "chunk": chunk,
                                        "holdout": holdout or [], "lr_cond": LR_COND,
                                        "lr_conv": LR_CONV, "seed": seed})
 
+    n_pass = 1 if chunk >= d_sub * n else 2
     print(f"[stage2] steps={steps} d_sub={d_sub} n={n} K={K} eps={eps} loss={loss_kind} "
-          f"teacher_groups={len(teacher_groups)}/28 device={dev}")
+          f"chunk={chunk} ({n_pass}パス) teacher_groups={len(teacher_groups)}/28 device={dev}")
 
     for step in range(start_step + 1, steps + 1):
         t0 = time.time()
@@ -240,43 +374,38 @@ def run(steps: int = DEFAULT_STEPS, d_sub: int = DEFAULT_D_SUB, n: int = DEFAULT
         omega = omega_all[d_pick_t]
 
         # ---- 集計側（eval モードで微分する。§12 未決 G）----
-        x0 = diffusion.sample_differentiable(model, cond, K)
-        y = sm.straight_through(x0)
-        if loss_kind == "jsd":
-            l_agg = sl.jsd_loss(y, q, n)
-            a_A, a_B = sl.group_rates_split(y.detach(), n)
-        else:
-            a_A, a_B = sl.group_rates_split(y, n)
-            l_agg = sl.agg_loss_from_rates(a_A, a_B, q, omega)
+        # ★zero_grad を先に置く。aggregate_step は内部で backward まで済ませるため
+        optimizer.zero_grad(set_to_none=True)
+        l_agg, a_A, a_B = aggregate_step(diffusion, model, cond, K, n, q, omega,
+                                         chunk, loss_kind)
 
         # ---- リハーサル側（train モード。Stage 1 と同じ損失）----
+        # ★集計側の backward が済んでから作る。2つの計算グラフを同時に持たないので
+        #   ピークは max(集計側, リハーサル側) であって和にならない（§4.5）
         model.train()
         b_cond, b_sched = next(atus)
         l_atus = diffusion.loss(model, b_sched.to(dev), b_cond.to(dev))
 
         # ---- λ を初回の実測値で決める（§8.3「勘で決めない」）----
         if lam is None:
-            lam = float(abs(l_agg.detach())) / max(float(l_atus.detach()), 1e-12)
+            lam = abs(l_agg) / max(float(l_atus.detach()), 1e-12)
             print(f"[stage2] lam=auto -> {lam:.4g} "
-                  f"(L_agg={float(l_agg.detach()):.4g} / L_atus={float(l_atus.detach()):.4g})")
+                  f"(L_agg={l_agg:.4g} / L_atus={float(l_atus.detach()):.4g})")
 
-        # ---- 更新。★別々に backward してピークを max(両者) に抑える（§4.5）----
-        optimizer.zero_grad(set_to_none=True)
-        l_agg.backward()
         (lam * l_atus).backward()
         optimizer.step()
 
         # ---- 記録（生成済みの量から追加コストなしに取れるものだけ）----
         with torch.no_grad():
-            a_full = y.detach().view(len(d_pick), n, sm.NUM_ACT, sm.NUM_SLOTS).mean(dim=1)
-            log = {"step": step, "L_agg": float(l_agg.detach()),
+            a_full = 0.5 * (a_A + a_B)          # 全 n 本の群平均（A半分とB半分の平均）
+            log = {"step": step, "L_agg": l_agg,
                    "L_atus": float(l_atus.detach()), "lam": lam, "sec": time.time() - t0,
                    "rate_mae": float((a_full - q).abs().mean()),
                    "other_x_share": float(a_full[:, int(st.Common.OTHER_X)].mean())}
             # ★g の診断は二次形式のときだけ。loss_grad は split-batch の二乗誤差の
             #   勾配なので、jsd で回しているときに混ぜると別の損失の勾配を報告することになる
             if loss_kind != "jsd":
-                g_A, _ = sl.loss_grad(a_A.detach(), a_B.detach(), q, omega)
+                g_A, _ = sl.loss_grad(a_A, a_B, q, omega)
                 log.update(sl.g_diagnostics(g_A, q, n, act_names=sm.ACT_NAMES))
         if wandb_run is not None:
             wandb_run.log(log)
@@ -288,7 +417,8 @@ def run(steps: int = DEFAULT_STEPS, d_sub: int = DEFAULT_D_SUB, n: int = DEFAULT
         if step % save_every == 0 or step == steps:
             ck.save_ckpt(ck.ckpt_path(ckpt_dir, step), model, optimizer, step,
                          {"d_sub": d_sub, "n": n, "K": K, "eps": eps, "loss": loss_kind,
-                          "lam": lam, "holdout": holdout or [], "seed": seed})
+                          "lam": lam, "chunk": chunk, "holdout": holdout or [],
+                          "seed": seed})
             print(f"  [ckpt] {ck.ckpt_path(ckpt_dir, step).name}")
 
     if wandb_run is not None:
@@ -307,6 +437,9 @@ def main() -> None:
                     help="損失の重み床。inf=素のMSE（主A）、0.01=χ²（主B）")
     ap.add_argument("--loss", choices=["sq", "jsd"], default="sq",
                     help="jsd はアブレーション1点のみ（split-batch が使えない）")
+    ap.add_argument("--chunk", type=int, default=0,
+                    help="1度に勾配を保持する個票数。0 で予算から自動決定。"
+                         "B 未満になると2パス勾配蓄積に切り替わる（勾配は一括計算と一致）")
     ap.add_argument("--lam", type=str, default="auto",
                     help="リハーサル重み。auto なら初回の L_agg/L_atus 比で決める")
     ap.add_argument("--holdout-groups", type=str, default="",
@@ -334,7 +467,8 @@ def main() -> None:
         #   モジュール変数を読むので、走り終わるまで差し替えたままにする
         sm.T_STEPS = 20
         run(steps=2, d_sub=2, n=4, K=args.K, eps=float(args.eps), loss_kind=args.loss,
-            lam=None if args.lam == "auto" else float(args.lam), holdout=holdout,
+            lam=None if args.lam == "auto" else float(args.lam),
+            chunk=args.chunk or None, holdout=holdout,
             save_every=1, ckpt_dir=args.ckpt_dir / "smoke",
             stage1_ckpt=args.stage1_ckpt, seed=args.seed, use_wandb=False)
         print("stage2 smoke: OK")
@@ -342,6 +476,7 @@ def main() -> None:
 
     run(steps=args.steps, d_sub=args.d_sub, n=args.n, K=args.K, eps=float(args.eps),
         loss_kind=args.loss, lam=None if args.lam == "auto" else float(args.lam),
+        chunk=args.chunk or None,
         holdout=holdout, save_every=args.save_every, ckpt_dir=args.ckpt_dir,
         stage1_ckpt=args.stage1_ckpt, resume=args.resume, seed=args.seed,
         use_wandb=not args.no_wandb)
