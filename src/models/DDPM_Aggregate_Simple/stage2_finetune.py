@@ -41,6 +41,7 @@ val ε-MSE 早期終了は目的関数が別物なので流用できない。
         --eps V          損失の重み床。inf=素のMSE（主A）、0.01=χ²（主B）
         --loss {sq,jsd}  jsd はアブレーション1点のみ
         --lam V          リハーサル重み。auto なら初回の L_agg/L_atus 比で決める
+        --holdout-groups d1,d2,...  LGO。損失から外す群（生成と評価は常に全28群）
         --resume         ckpt-dir の最新チェックポイントから再開
 """
 import argparse
@@ -96,6 +97,38 @@ COND_PATH_KEYS = ("cond_embeds", "cond_proj", "null_emb", "emb_proj")
 
 
 # ============================================================
+# 群のマスクと抽出（§8.4）
+# ============================================================
+def build_teacher_mask(holdout: list[int]) -> np.ndarray:
+    """損失に使う群の bool マスク (28,)。既定（空）なら28群すべてが教師。
+
+    ★損失は teacher_mask の群だけ、生成と評価は常に全28群。LGO を有効にしても
+      「モデルが何を作るか」は変えず、「何を教師にするか」だけを変える。
+    """
+    mask = np.ones(st.D_GROUPS, dtype=bool)
+    for d in holdout:
+        if not 0 <= d < st.D_GROUPS:
+            raise ValueError(f"群インデックスが範囲外: {d}")
+        mask[d] = False
+    if not mask.any():
+        raise ValueError("教師群が空になっている")
+    return mask
+
+
+def stratified_holdout(pop: np.ndarray, k: int, seed: int = 0) -> list[int]:
+    """人口シェアで層化して k 群を選ぶ（§8.4）。
+
+    ★群人口シェアは18.7倍の開きがあるので、無作為に選ぶと大きい群ばかり、あるいは
+      小さい群ばかりになりうる。シェア順に k 個の帯へ分け、各帯から1つずつ引いて
+      大小を混ぜる。
+    """
+    order = np.argsort(pop.reshape(st.D_GROUPS))
+    rng = np.random.default_rng(seed)
+    picked = [int(rng.choice(band)) for band in np.array_split(order, k)]
+    return sorted(picked)
+
+
+# ============================================================
 # 学習
 # ============================================================
 def build_optimizer(model: torch.nn.Module,
@@ -132,7 +165,7 @@ def check_memory_budget(K: int, d_sub: int, n: int, budget: int = MEMORY_BUDGET)
 
 def run(steps: int = DEFAULT_STEPS, d_sub: int = DEFAULT_D_SUB, n: int = DEFAULT_N,
         K: int = DEFAULT_K, eps: float = float("inf"), loss_kind: str = "sq",
-        lam: float | None = None,
+        lam: float | None = None, holdout: list[int] | None = None,
         save_every: int = DEFAULT_SAVE_EVERY, ckpt_dir: Path = CKPT_DIR,
         stage1_ckpt: Path = STAGE1_CKPT, resume: bool = False,
         seed: int = 42, use_wandb: bool = True, device: str | None = None) -> torch.nn.Module:
@@ -141,8 +174,6 @@ def run(steps: int = DEFAULT_STEPS, d_sub: int = DEFAULT_D_SUB, n: int = DEFAULT
     ★早期終了は入れない。何が起きているか分からないまま止まるのを避けるため、
       まず固定ステップで1本回し、L_agg と ATUS val ε-MSE の推移を見てから
       判定量と閾値を決める（§8.4）。
-    ★まず28群すべてを教師にする。LGO（leave-groups-out）は teacher_mask として
-      後から足せる形にしてある（§8.4、§10.2-8）。
     """
     dev = device or sm.DEVICE
     check_memory_budget(K, d_sub, n)
@@ -152,7 +183,8 @@ def run(steps: int = DEFAULT_STEPS, d_sub: int = DEFAULT_D_SUB, n: int = DEFAULT
     tgt = st.load_stula_targets()
     q_all = sl.teacher_tensor(tgt, dev)                       # (28,12,96)
     omega_all = sl.chi2_weights(q_all, eps)
-    teacher_groups = np.arange(st.D_GROUPS)
+    teacher_mask = build_teacher_mask(holdout or [])
+    teacher_groups = np.flatnonzero(teacher_mask)
 
     # ---- モデル ----
     model = sm.load_pretrained(stage1_ckpt).to(dev)
@@ -186,8 +218,8 @@ def run(steps: int = DEFAULT_STEPS, d_sub: int = DEFAULT_D_SUB, n: int = DEFAULT
         wandb_run = wandb.init(project="domain-transfer-ddpm-agg", job_type="stage2",
                                config={"steps": steps, "d_sub": d_sub, "n": n, "K": K,
                                        "eps": eps, "loss": loss_kind, "lam": lam,
-                                       "lr_cond": LR_COND, "lr_conv": LR_CONV,
-                                       "seed": seed})
+                                       "holdout": holdout or [], "lr_cond": LR_COND,
+                                       "lr_conv": LR_CONV, "seed": seed})
 
     print(f"[stage2] steps={steps} d_sub={d_sub} n={n} K={K} eps={eps} loss={loss_kind} "
           f"teacher_groups={len(teacher_groups)}/28 device={dev}")
@@ -251,7 +283,7 @@ def run(steps: int = DEFAULT_STEPS, d_sub: int = DEFAULT_D_SUB, n: int = DEFAULT
         if step % save_every == 0 or step == steps:
             ck.save_ckpt(ck.ckpt_path(ckpt_dir, step), model, optimizer, step,
                          {"d_sub": d_sub, "n": n, "K": K, "eps": eps, "loss": loss_kind,
-                          "lam": lam, "seed": seed})
+                          "lam": lam, "holdout": holdout or [], "seed": seed})
             print(f"  [ckpt] {ck.ckpt_path(ckpt_dir, step).name}")
 
     if wandb_run is not None:
@@ -272,6 +304,8 @@ def main() -> None:
                     help="jsd はアブレーション1点のみ（split-batch が使えない）")
     ap.add_argument("--lam", type=str, default="auto",
                     help="リハーサル重み。auto なら初回の L_agg/L_atus 比で決める")
+    ap.add_argument("--holdout-groups", type=str, default="",
+                    help="LGO。損失から外す群をカンマ区切りで。'auto:4' で人口層化して4群選ぶ")
     ap.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY)
     ap.add_argument("--ckpt-dir", type=Path, default=CKPT_DIR)
     ap.add_argument("--stage1-ckpt", type=Path, default=STAGE1_CKPT)
@@ -282,12 +316,20 @@ def main() -> None:
                     help="生成を短くして数更新だけ回す動作確認")
     args = ap.parse_args()
 
+    holdout: list[int] = []
+    if args.holdout_groups.startswith("auto:"):
+        holdout = stratified_holdout(st.load_stula_targets()["pop"],
+                                     int(args.holdout_groups.split(":")[1]), args.seed)
+        print(f"[stage2] 人口層化で外す群: {holdout}")
+    elif args.holdout_groups:
+        holdout = [int(x) for x in args.holdout_groups.split(",")]
+
     if args.smoke:
         # ★T_STEPS を短くしてから Diffusion を作る。sample_differentiable のループ範囲も
         #   モジュール変数を読むので、走り終わるまで差し替えたままにする
         sm.T_STEPS = 20
         run(steps=2, d_sub=2, n=4, K=args.K, eps=float(args.eps), loss_kind=args.loss,
-            lam=None if args.lam == "auto" else float(args.lam),
+            lam=None if args.lam == "auto" else float(args.lam), holdout=holdout,
             save_every=1, ckpt_dir=args.ckpt_dir / "smoke",
             stage1_ckpt=args.stage1_ckpt, seed=args.seed, use_wandb=False)
         print("stage2 smoke: OK")
@@ -295,7 +337,7 @@ def main() -> None:
 
     run(steps=args.steps, d_sub=args.d_sub, n=args.n, K=args.K, eps=float(args.eps),
         loss_kind=args.loss, lam=None if args.lam == "auto" else float(args.lam),
-        save_every=args.save_every, ckpt_dir=args.ckpt_dir,
+        holdout=holdout, save_every=args.save_every, ckpt_dir=args.ckpt_dir,
         stage1_ckpt=args.stage1_ckpt, resume=args.resume, seed=args.seed,
         use_wandb=not args.no_wandb)
 

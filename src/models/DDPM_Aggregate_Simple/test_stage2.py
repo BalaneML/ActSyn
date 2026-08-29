@@ -1,7 +1,7 @@
 """
 Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
 
-対象は §10.2 の実装 1〜7:
+対象は §10.2 の実装 1〜8:
     1. 定期チェックポイントと再開            stage2_checkpoint.py
     2. 逆過程1ステップの切り出し             model.Diffusion._reverse_step
     3. 打ち切り逆伝播つきサンプラ             model.Diffusion.sample_differentiable
@@ -9,6 +9,7 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     5. 教師 A* と28群表への採点              stage2_targets.py
     6. 集計損失（split-batch 不偏推定）        stage2_loss.py
     7. 学習ループ                            stage2_finetune.py
+    8. teacher_mask と --holdout-groups       stage2_finetune.py
 
 検証する内容:
     (ckpt) save_ckpt -> load_ckpt の往復で model/optimizer/step/RNG が戻る。
@@ -28,6 +29,7 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     (j)    ★ω の平均が 1。正規化を忘れると実効学習率が24倍ずれる
     (lr)   層別 LR の分割が条件経路と conv/attention を取り違えていない
     (mem)  K×D_sub×n の予算超過を学習前に落とす
+    (lgo)  teacher_mask が損失群だけを外し、人口層化が大小を混ぜる
     (d_idx) stage2_targets.d_index が model.d_index と全28組で一致
 
 ★ 出口の零初期化について:
@@ -630,7 +632,7 @@ def test_jsd_loss() -> None:
 
 
 # ============================================================
-# 7. 学習ループ
+# 7-8. 学習ループと LGO
 # ============================================================
 def test_layered_lr() -> None:
     """(lr) 層別 LR の分割（§8.3）。条件経路と conv/attention を取り違えていないこと。"""
@@ -680,6 +682,36 @@ def test_memory_budget() -> None:
     print("test_memory_budget: OK")
 
 
+def test_teacher_mask_and_holdout() -> None:
+    """(lgo) teacher_mask と人口層化ホールドアウト（§8.4）。"""
+    m = ft.build_teacher_mask([])
+    assert m.shape == (28,) and m.all(), "既定は28群すべてが教師"
+    m = ft.build_teacher_mask([0, 5, 27])
+    assert int(m.sum()) == 25 and not m[0] and not m[5] and not m[27]
+    print("  (1) (lgo) 既定は全28群、指定した群だけが外れる: OK")
+
+    for bad in ([28], [-1], list(range(28))):
+        try:
+            ft.build_teacher_mask(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"不正な指定が弾かれていない: {bad}")
+    print("  (2) 範囲外と全群除外を弾く: OK")
+
+    # ★人口シェアで層化する。群人口シェアは18.7倍の開きがあるので、
+    #   大小を混ぜないと「小さい群ばかり外す」ことになりうる
+    pop = st.load_stula_targets()["pop"]
+    picked = ft.stratified_holdout(pop, 4, seed=0)
+    assert len(picked) == 4 and len(set(picked)) == 4
+    share = (pop.reshape(28) / pop.sum())[picked]
+    assert share.max() / share.min() > 3.0, \
+        f"層化しても大小が混ざっていない: {share.min():.4f}..{share.max():.4f}"
+    print(f"  (3) 人口層化の4群 {picked} のシェア "
+          f"{share.min():.4f}..{share.max():.4f}（{share.max()/share.min():.1f}倍）: OK")
+    print("test_teacher_mask_and_holdout: OK")
+
+
 def main() -> None:
     test_checkpoint_roundtrip()
     test_reverse_step_matches_inline()
@@ -695,6 +727,7 @@ def main() -> None:
     test_jsd_loss()
     test_layered_lr()
     test_memory_budget()
+    test_teacher_mask_and_holdout()
     print("\ntest_stage2: OK")
 
 
