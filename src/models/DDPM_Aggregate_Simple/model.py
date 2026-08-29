@@ -54,10 +54,12 @@ out_conv のゼロ初期化は残してある（DDPM_Aggregate と同じ）。
     outputs/generated/ddpm_simple_pretrain_samples.csv             サニティ用の生成個票
 """
 import argparse
+import contextlib
 import copy
 import importlib.util
 import math
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Literal, overload
 
@@ -472,6 +474,24 @@ class UNet1D(nn.Module):
 # ============================================================
 # 5. Diffusion（forward過程・損失・サンプリング）
 # ============================================================
+@contextlib.contextmanager
+def eval_mode(model: nn.Module) -> Iterator[nn.Module]:
+    """model を eval に切り替え、抜けるときに元のモードへ戻す。
+
+    Stage 2 は1回のパラメータ更新の中で2つのモードを行き来する:
+        集計側   (sample_differentiable) : eval。評価時と同じ生成器を微分する
+        リハーサル側 (Diffusion.loss)      : train。Dropout を効かせた Stage 1 と同じ損失
+    切り替え忘れは例外を出さずに静かに数値を変える（zero-shot 基準線は eval で
+    測ってある）ので、元へ戻す責任を呼び出し側に持たせない。
+    """
+    was_training = model.training
+    model.eval()
+    try:
+        yield model
+    finally:
+        model.train(was_training)
+
+
 class Diffusion:
     """
     β schedule と派生バッファを事前計算し、q_sample / loss / sample を提供する
@@ -608,6 +628,65 @@ class Diffusion:
             if verbose and ti % 200 == 0:
                 print(f"  sampling t={ti}")
         return x.argmax(dim=1)
+
+    # --------------------------------------------------------
+    # Stage 2: 末尾 K ステップだけ勾配を保持する逆過程（Stage2_design.md §4.3）
+    #
+    # 全 1000 ステップの計算グラフは B=28 でも 130.6 GB になり保持できない。
+    # 一方 ∂x_0/∂x_{t-1} は (t-1) 段ぶんの積なので、古いステップからの勾配は
+    # 数値的に潰れて寄与しない。よって末尾 K ステップで打ち切る。
+    # メモリのための妥協であると同時に、勾配の質から見ても正解である。
+    #
+    # head / tail に分けてあるのは2パス勾配蓄積のため。1パス目で x_K を保存すれば
+    # 前段（999ステップ）は1回で済み、2パス目は tail だけを回せばよい。
+    # --------------------------------------------------------
+    def _sample_head(self, model: UNet1D, cond_idx, K: int,
+                     guidance_scale=GUIDANCE_SCALE) -> torch.Tensor:
+        """x_T ~ N(0,I) から t = 999 → K まで進めて x_K を返す。グラフを作らない。
+
+        通常のサンプリングと計算内容は完全に同じで、中間活性を保存しないだけ。
+        返り値は detach 済みで、ここでグラフが切れる。
+        """
+        with eval_mode(model), torch.no_grad():
+            x = torch.randn(cond_idx.size(0), IN_CH, NUM_SLOTS, device=cond_idx.device)
+            for ti in reversed(range(K, T_STEPS)):
+                x = self._reverse_step(model, x, ti, cond_idx, guidance_scale)
+        return x.detach()
+
+    def _sample_tail(self, model: UNet1D, x_K: torch.Tensor, K: int, cond_idx,
+                     guidance_scale=GUIDANCE_SCALE,
+                     zs: dict[int, torch.Tensor] | None = None) -> torch.Tensor:
+        """x_K から t = K-1 → 0 まで進めて x_0 を返す。★ここだけ計算グラフが作られる。
+
+        args:
+            zs: 末尾 K 区間で使う雑音 {ti: z}。None なら新しく引く。
+                2パス目では1パス目と同じものを渡す（別のサンプルを見ないため）。
+                ti=0 は雑音を使わないので、キー 0 は無くてよい
+        """
+        x = x_K
+        with eval_mode(model):
+            for ti in reversed(range(K)):
+                x = self._reverse_step(model, x, ti, cond_idx, guidance_scale,
+                                       None if zs is None else zs.get(ti))
+        return x
+
+    def sample_differentiable(self, model: UNet1D, cond_idx, K: int,
+                              guidance_scale=GUIDANCE_SCALE,
+                              zs: dict[int, torch.Tensor] | None = None) -> torch.Tensor:
+        """打ち切り逆伝播つきサンプリング。(B,12,96) の連続値を返す。
+
+        ★@torch.no_grad() を付けないこと。付けると勾配が流れないまま例外も出ない。
+        ★返り値は sample と違って argmax していない。t=0 の逆過程出力そのもの。
+          離散化は straight_through が行う
+        ★ti=0 の返り値は x0_hat と厳密には一致しない。post_coef_xt[0] と post_var[0] は
+          厳密に 0 だが、post_coef_x0[0] は実数では 1 でも float32 では 0.99983406 になる
+          （1-acp[0] を引き算で作るときの桁落ち。相対 1.7e-4）。つまり返るのは
+          x0_hat の 0.99983 倍である。softmax も argmax も正のスケールに対して
+          ほぼ不変なので下流への影響は無いが、「厳密に一致する」と書かないこと
+        ★K=0 なら全ステップが no_grad になり、返り値は勾配を持たない
+        """
+        x_K = self._sample_head(model, cond_idx, K, guidance_scale)
+        return self._sample_tail(model, x_K, K, cond_idx, guidance_scale, zs)
 
 
 # ============================================================

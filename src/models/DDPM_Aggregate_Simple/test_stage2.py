@@ -1,14 +1,20 @@
 """
 Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
 
-対象は §10.2 の実装 1〜2:
+対象は §10.2 の実装 1〜3:
     1. 定期チェックポイントと再開            stage2_checkpoint.py
     2. 逆過程1ステップの切り出し             model.Diffusion._reverse_step
+    3. 打ち切り逆伝播つきサンプラ             model.Diffusion.sample_differentiable
 
 検証する内容:
     (ckpt) save_ckpt -> load_ckpt の往復で model/optimizer/step/RNG が戻る。
            一時ファイルが残らない。latest_ckpt が step を数値順で選ぶ
     (f2)   _reverse_step が旧インライン式と厳密一致し、smoke_test が通る
+    (f)    同一シードで sample_differentiable(K=0) が sample と一致
+           ＝ 切り出しリファクタで生成の数値が1ビットも変わっていない
+    (c)    K=0 では勾配が流れない
+    (c2)   ★K>=1 では勾配が流れる。@torch.no_grad() の付け間違いは (c) だけでは
+           検出できない（勾配が一切流れなくなっても (c) は通ってしまう）
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは勾配の大きさが測れない。
@@ -16,6 +22,7 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
 
     .venv/bin/python3 src/models/DDPM_Aggregate_Simple/test_stage2.py
 """
+import contextlib
 import importlib.util
 import sys
 import tempfile
@@ -41,6 +48,7 @@ def _load(name: str, path: Path):
 sm: Any = _load("simple_model", HERE / "model.py")
 ck: Any = _load("simple_stage2_checkpoint", HERE / "stage2_checkpoint.py")
 DEVICE = "cpu"          # テストは決定性重視で CPU 固定
+T_SHORT = 12            # 全1000ステップは重いので、逆過程の往復は短い T で見る
 
 
 def _wake_up(model: Any, seed: int = 0) -> Any:
@@ -59,6 +67,23 @@ def _model(seed: int = 0) -> Any:
 
 def _cond(n_groups: int = 3) -> torch.Tensor:
     return torch.as_tensor(sm.cond_grid()[:n_groups], device=DEVICE)
+
+
+@contextlib.contextmanager
+def _short_T():
+    """T_STEPS を短くした Diffusion を貸し出す（本番の T=1000 は重いので）。
+
+    ★sm.T_STEPS はバッファの構築だけでなく sample / _sample_head のループ範囲にも
+      使われる。構築後に戻すと「バッファは12段なのにループは1000段」になって
+      IndexError で落ちるので、使い終わるまで差し替えたままにする。
+      test_backbone.test_reverse_process と同じ流儀。
+    """
+    original = sm.T_STEPS
+    sm.T_STEPS = T_SHORT
+    try:
+        yield sm.Diffusion(device=DEVICE)
+    finally:
+        sm.T_STEPS = original
 
 
 # ============================================================
@@ -172,9 +197,67 @@ def test_reverse_step_matches_inline() -> None:
     print("test_reverse_step_matches_inline: OK")
 
 
+# ============================================================
+# 3. 打ち切り逆伝播つきサンプラ
+# ============================================================
+def test_sample_differentiable() -> None:
+    with _short_T() as diff:
+        model = _model()
+        cond = _cond()
+
+        # (f) 同一シードで sample と一致する ＝ 切り出しで数値が変わっていない
+        torch.manual_seed(7)
+        ref = diff.sample(model, cond)
+        torch.manual_seed(7)
+        out0 = diff.sample_differentiable(model, cond, K=0)
+        assert out0.shape == (cond.size(0), sm.IN_CH, sm.NUM_SLOTS)
+        assert torch.equal(out0.argmax(dim=1), ref), "K=0 の生成が sample と一致しない"
+        print("  (1) (f) K=0 の出力が sample と厳密一致: OK")
+
+        # (c) K=0 では勾配が流れない
+        assert not out0.requires_grad, "K=0 なのに勾配が流れている"
+        print("  (2) (c) K=0 で requires_grad=False: OK")
+
+        # (c2) K>=1 では勾配が流れる。★これが @torch.no_grad() の付け間違いを検出する
+        for K in (1, 2):
+            model.zero_grad(set_to_none=True)
+            torch.manual_seed(7)
+            out = diff.sample_differentiable(model, cond, K=K)
+            assert out.requires_grad, f"K={K} なのに勾配が流れていない"
+            out.sum().backward()
+            n_nonzero = sum(1 for p in model.parameters()
+                            if p.grad is not None and float(p.grad.abs().max()) > 0)
+            n_total = sum(1 for _ in model.parameters())
+            assert n_nonzero > 0, f"K={K} で非ゼロ勾配のパラメータが1つも無い"
+            print(f"  (3) (c2) K={K}: 非ゼロ勾配 {n_nonzero}/{n_total} パラメータ: OK")
+
+        # モードの復元（リハーサル項が train を要求するため）
+        model.train()
+        diff.sample_differentiable(model, cond, K=1)
+        assert model.training, "sample_differentiable の後に train モードへ戻っていない"
+        model.eval()
+        diff.sample_differentiable(model, cond, K=1)
+        assert not model.training, "sample_differentiable の後に eval モードへ戻っていない"
+        print("  (4) 呼び出し前のモードへ復元される: OK")
+
+        # zs を渡すと決定的（2パス蓄積の前提。K=1 では ti=0 が雑音を使わないので K=3 で見る）
+        K = 3
+        zs = {ti: torch.randn(cond.size(0), sm.IN_CH, sm.NUM_SLOTS, device=DEVICE)
+              for ti in range(1, K)}
+        x_K = diff._sample_head(model, cond, K)
+        a = diff._sample_tail(model, x_K, K, cond, zs=zs)
+        b = diff._sample_tail(model, x_K, K, cond, zs=zs)
+        assert torch.equal(a, b), "同じ x_K と zs で結果が変わる"
+        assert not diff._sample_tail(model, x_K, K, cond).equal(a), \
+            "zs を渡さなくても同じ結果になる（雑音が効いていない）"
+        print("  (5) head/tail 分割: 同じ x_K と zs なら決定的: OK")
+    print("test_sample_differentiable: OK")
+
+
 def main() -> None:
     test_checkpoint_roundtrip()
     test_reverse_step_matches_inline()
+    test_sample_differentiable()
     print("\ntest_stage2: OK")
 
 
