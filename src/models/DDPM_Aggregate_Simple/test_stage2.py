@@ -1,12 +1,13 @@
 """
 Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
 
-対象は §10.2 の実装 1〜5:
+対象は §10.2 の実装 1〜6:
     1. 定期チェックポイントと再開            stage2_checkpoint.py
     2. 逆過程1ステップの切り出し             model.Diffusion._reverse_step
     3. 打ち切り逆伝播つきサンプラ             model.Diffusion.sample_differentiable
     4. straight-through デコーダ             model.straight_through
     5. 教師 A* と28群表への採点              stage2_targets.py
+    6. 集計損失（split-batch 不偏推定）        stage2_loss.py
 
 検証する内容:
     (ckpt) save_ckpt -> load_ckpt の往復で model/optimizer/step/RNG が戻る。
@@ -20,7 +21,10 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     (a)    straight-through の前向きが厳密に one-hot で、群平均が pool_to_rates と一致
     (h)    stage2_targets.load_stula_targets が移植元 (CVAE_Aggregate) と厳密一致
     (k)    教師 A* の実測性質が設計書 §3.6 から動いていない
-    (g)    A* が各 (群,時刻) で12チャネルの和 1
+    (g)    A* と Ã が各 (群,時刻) で12チャネルの和 1
+    (b)    split-batch 推定が合成データで不偏（多様性への罰が消えている）
+    (i)    ε=inf で ω が全要素1、χ² の損失値が素の MSE と一致
+    (j)    ★ω の平均が 1。正規化を忘れると実効学習率が24倍ずれる
     (d_idx) stage2_targets.d_index が model.d_index と全28組で一致
 
 ★ 出口の零初期化について:
@@ -35,6 +39,7 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
 """
 import contextlib
 import importlib.util
+import math
 import sys
 import tempfile
 from pathlib import Path
@@ -60,6 +65,7 @@ def _load(name: str, path: Path):
 sm: Any = _load("simple_model", HERE / "model.py")
 ck: Any = _load("simple_stage2_checkpoint", HERE / "stage2_checkpoint.py")
 st: Any = _load("simple_stage2_targets", HERE / "stage2_targets.py")
+sl: Any = _load("simple_stage2_loss", HERE / "stage2_loss.py")
 DEVICE = "cpu"          # テストは決定性重視で CPU 固定
 T_SHORT = 12            # 全1000ステップは重いので、逆過程の往復は短い T で見る
 
@@ -419,6 +425,206 @@ def test_eval_against() -> None:
     print("test_eval_against: OK")
 
 
+# ============================================================
+# 6. 集計損失
+# ============================================================
+def _fake_onehot(probs: torch.Tensor, n: int, gen: torch.Generator) -> torch.Tensor:
+    """各スロットで probs (D,12,96) に従う one-hot を群あたり n 本引く。
+
+    生成器の代わりに使う合成データ。真の平均が probs だと分かっているので、
+    推定量の期待値を解析値と突き合わせられる。
+    """
+    d, n_act, n_slot = probs.shape
+    flat = probs.permute(0, 2, 1).reshape(-1, n_act)                  # (D*96, 12)
+    idx = torch.multinomial(flat, n, replacement=True, generator=gen)  # (D*96, n)
+    oh = torch.nn.functional.one_hot(idx, n_act).float()               # (D*96, n, 12)
+    return oh.view(d, n_slot, n, n_act).permute(0, 2, 3, 1).reshape(d * n, n_act, n_slot)
+
+
+def test_chi2_weights() -> None:
+    """(i)(j) 重み ω の性質。"""
+    torch.manual_seed(0)
+    q = torch.rand(4, sm.NUM_ACT, sm.NUM_SLOTS)
+    q = q / q.sum(dim=1, keepdim=True)          # 各スロットで和1（教師と同じ性質）
+
+    # (i) ε=inf は素の MSE。ω が厳密に全要素1
+    w_inf = sl.chi2_weights(q, float("inf"))
+    assert torch.equal(w_inf, torch.ones_like(q)), "ε=inf で ω が全要素1になっていない"
+    print("  (1) (i) ε=inf で ω が厳密に全要素1: OK")
+
+    # (j) ★平均1への正規化。忘れると実効学習率が24倍ずれる
+    for eps in (0.01, 0.05, 1.0 / 256):
+        w = sl.chi2_weights(q, eps)
+        assert abs(float(w.mean()) - 1.0) < 1e-5, f"ω の平均が1でない (eps={eps}): {w.mean()}"
+        # 率の低いセルほど重い（逆分散重みの向き）
+        assert float(w[q < 0.01].mean()) > float(w[q > 0.2].mean())
+    print("  (2) (j) ω の平均が 1、かつ低率セルほど重い: OK")
+
+    # 十分大きい ε は素の MSE に収束する（ε=inf 分岐と連続であること）
+    w_big = sl.chi2_weights(q, 1e6)
+    assert float((w_big - 1.0).abs().max()) < 1e-3
+    print("  (3) 大きい ε は ω=1 に収束（inf 分岐と連続）: OK")
+
+    for bad in (0.0, -1.0):
+        try:
+            sl.chi2_weights(q, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"eps={bad} が弾かれていない")
+    print("  (4) eps<=0 を弾く: OK")
+    print("test_chi2_weights: OK")
+
+
+def test_agg_loss() -> None:
+    """(i)(g) 損失値そのものの性質。"""
+    torch.manual_seed(0)
+    d_sub, n = 4, 8
+    q = torch.rand(d_sub, sm.NUM_ACT, sm.NUM_SLOTS)
+    q = q / q.sum(dim=1, keepdim=True)
+    gen = torch.Generator().manual_seed(1)
+    y = _fake_onehot(q, n, gen)
+
+    # (g) Ã 側も各 (群,時刻) で12チャネルの和が1（one-hot の平均なので厳密）
+    a_A, a_B = sl.group_rates_split(y, n)
+    for a in (a_A, a_B):
+        assert a.shape == (d_sub, sm.NUM_ACT, sm.NUM_SLOTS)
+        assert float((a.sum(dim=1) - 1.0).abs().max()) == 0.0
+    print("  (1) (g) Ã の12チャネル和が厳密に 1: OK")
+
+    # A と B は重ならない（同じ本が両方の半分に入らない）
+    grouped = y.view(d_sub, n, sm.NUM_ACT, sm.NUM_SLOTS)
+    assert torch.equal(a_A, grouped[:, :n // 2].mean(dim=1))
+    assert torch.equal(a_B, grouped[:, n // 2:].mean(dim=1))
+    print("  (2) A/B が群ごとに前半・後半へ重なりなく分かれる: OK")
+
+    # (i) ε=inf の χ² が素の MSE と一致する ＝ 1本のコードで両方走る
+    w_inf = sl.chi2_weights(q, float("inf"))
+    plain = ((a_A - q) * (a_B - q)).sum(dim=1).mean()
+    assert torch.allclose(sl.agg_loss(y, q, w_inf, n), plain, atol=0, rtol=0)
+    print("  (3) (i) ε=inf の損失値が素の MSE と厳密一致: OK")
+
+    # 教師そのものを生成したことにすれば損失は 0
+    perfect = q.unsqueeze(1).expand(d_sub, n, sm.NUM_ACT, sm.NUM_SLOTS).reshape(
+        d_sub * n, sm.NUM_ACT, sm.NUM_SLOTS)
+    assert abs(float(sl.agg_loss(perfect, q, w_inf, n))) < 1e-12
+    print("  (4) 教師と同じ率を生成すると損失 0: OK")
+
+    # 奇数の n は split-batch にできない
+    try:
+        sl.group_rates_split(y, 7)
+    except ValueError:
+        print("  (5) 奇数の n を弾く: OK")
+    else:
+        raise AssertionError("奇数の n が弾かれていない")
+    print("test_agg_loss: OK")
+
+
+def test_split_batch_unbiased() -> None:
+    """(b) ★split-batch 推定が不偏で、素朴な二乗和は多様性への罰を持つこと。
+
+    合成データの真の平均 p と教師 q を別に置くと、解析値が分かる:
+        E[split-batch] = Σ_c ω (p−q)²                        （bias のみ）
+        E[素朴]        = Σ_c ω (p−q)² + (1/n) Σ_c ω Var(y_c)  （罰つき）
+    Var(y_c) = p_c(1−p_c)（one-hot なのでベルヌーイ）。
+    """
+    torch.manual_seed(0)
+    d_sub, n, reps = 3, 16, 400
+    p = torch.rand(d_sub, sm.NUM_ACT, sm.NUM_SLOTS)
+    p = p / p.sum(dim=1, keepdim=True)
+    q = torch.rand(d_sub, sm.NUM_ACT, sm.NUM_SLOTS)
+    q = q / q.sum(dim=1, keepdim=True)
+    omega = sl.chi2_weights(q, 0.05)
+
+    bias = ((p - q) ** 2 * omega).sum(dim=1).mean()
+    penalty = (omega * p * (1.0 - p)).sum(dim=1).mean() / n
+
+    gen = torch.Generator().manual_seed(2)
+    split_vals, naive_vals = [], []
+    for _ in range(reps):
+        y = _fake_onehot(p, n, gen)
+        a_A, a_B = sl.group_rates_split(y, n)
+        split_vals.append(float(sl.agg_loss_from_rates(a_A, a_B, q, omega)))
+        a_full = y.view(d_sub, n, sm.NUM_ACT, sm.NUM_SLOTS).mean(dim=1)
+        naive_vals.append(float(((a_full - q) ** 2 * omega).sum(dim=1).mean()))
+
+    split_mean = float(np.mean(split_vals))
+    naive_mean = float(np.mean(naive_vals))
+    se = float(np.std(split_vals) / np.sqrt(reps))
+
+    assert abs(split_mean - float(bias)) < 4 * se, \
+        f"split-batch が不偏でない: {split_mean:.6f} vs 解析値 {float(bias):.6f} (se={se:.6f})"
+    print(f"  (1) (b) split-batch の平均 {split_mean:.5f} ≒ bias² {float(bias):.5f} "
+          f"(±4se={4*se:.5f}): OK")
+
+    expected_naive = float(bias) + float(penalty)
+    assert abs(naive_mean - expected_naive) < 4 * se, \
+        f"素朴推定が解析値と合わない: {naive_mean:.6f} vs {expected_naive:.6f}"
+    assert naive_mean > split_mean, "素朴推定が split-batch を上回っていない"
+    print(f"  (2) 素朴推定の平均 {naive_mean:.5f} ≒ bias²+罰 {expected_naive:.5f} "
+          f"（罰 {float(penalty):.5f} が実在する）: OK")
+    print("test_split_batch_unbiased: OK")
+
+
+def test_loss_grad_and_diagnostics() -> None:
+    """loss_grad の解析形が autograd と一致し、g_diagnostics が値を返すこと。"""
+    torch.manual_seed(0)
+    d_sub, n = 4, 8
+    q = torch.rand(d_sub, sm.NUM_ACT, sm.NUM_SLOTS)
+    q = q / q.sum(dim=1, keepdim=True)
+    omega = sl.chi2_weights(q, 0.01)
+    gen = torch.Generator().manual_seed(3)
+    y = _fake_onehot(q, n, gen)
+    a_A, a_B = sl.group_rates_split(y, n)
+
+    lhs_A = a_A.clone().requires_grad_(True)
+    lhs_B = a_B.clone().requires_grad_(True)
+    sl.agg_loss_from_rates(lhs_A, lhs_B, q, omega).backward()
+    g_A, g_B = sl.loss_grad(a_A, a_B, q, omega)
+    assert lhs_A.grad is not None and lhs_B.grad is not None
+    assert float((g_A - lhs_A.grad).abs().max()) < 1e-9, "g_A が autograd と一致しない"
+    assert float((g_B - lhs_B.grad).abs().max()) < 1e-9, "g_B が autograd と一致しない"
+    print("  (1) loss_grad の解析形が autograd と一致: OK")
+
+    # ★A半分に流す勾配は B半分の誤差で決まる（split-batch の帰結）
+    scale = d_sub * sm.NUM_SLOTS
+    assert torch.allclose(g_A, omega * (a_B - q) / scale)
+    print("  (2) g_A が B半分の誤差で決まる: OK")
+
+    diag = sl.g_diagnostics(g_A, q, n, act_names=sm.ACT_NAMES)
+    for key in ("g_abs_mean", "g_abs_max", "g_frac_negligible",
+                "g_share_unidentifiable", "g_sign_pos_frac"):
+        assert key in diag and math.isfinite(diag[key]), key
+    shares = [diag[f"g_share_{a}"] for a in sm.ACT_NAMES]
+    assert abs(sum(shares) - 1.0) < 1e-5, "活動別シェアの和が1でない"
+    print(f"  (3) g_diagnostics: 活動シェアの和 {sum(shares):.6f}、"
+          f"識別不能セルへのシェア {diag['g_share_unidentifiable']:.3f}: OK")
+    print("test_loss_grad_and_diagnostics: OK")
+
+
+def test_jsd_loss() -> None:
+    """アブレーション用 JSD が定義どおりで、床の値に依存すること。"""
+    torch.manual_seed(0)
+    d_sub, n = 3, 8
+    q = torch.rand(d_sub, sm.NUM_ACT, sm.NUM_SLOTS)
+    q = q / q.sum(dim=1, keepdim=True)
+    perfect = q.unsqueeze(1).expand(d_sub, n, sm.NUM_ACT, sm.NUM_SLOTS).reshape(
+        d_sub * n, sm.NUM_ACT, sm.NUM_SLOTS)
+    assert abs(float(sl.jsd_loss(perfect, q, n))) < 1e-6, "同一分布で JSD が 0 でない"
+
+    gen = torch.Generator().manual_seed(4)
+    y = _fake_onehot(q, n, gen)
+    v = float(sl.jsd_loss(y, q, n))
+    assert 0.0 < v <= math.log(2.0) + 1e-6, f"JSD が [0, ln2] に入っていない: {v}"
+    print(f"  (1) 同一分布で 0、一般には (0, ln2] に入る (実測 {v:.4f}): OK")
+
+    # ★床の値で数値が動く。報告時に床を明記する必要があることの担保
+    v_low, v_high = float(sl.jsd_loss(y, q, n, 1e-12)), float(sl.jsd_loss(y, q, n, 1.0 / 256))
+    assert v_low != v_high, "床を変えても値が動かない（床が効いていない）"
+    print(f"  (2) 床 1e-12 で {v_low:.4f} / 床 1/256 で {v_high:.4f} と動く: OK")
+    print("test_jsd_loss: OK")
+
+
 def main() -> None:
     test_checkpoint_roundtrip()
     test_reverse_step_matches_inline()
@@ -427,6 +633,11 @@ def main() -> None:
     test_targets_match_reference()
     test_target_properties()
     test_eval_against()
+    test_chi2_weights()
+    test_agg_loss()
+    test_split_batch_unbiased()
+    test_loss_grad_and_diagnostics()
+    test_jsd_loss()
     print("\ntest_stage2: OK")
 
 
