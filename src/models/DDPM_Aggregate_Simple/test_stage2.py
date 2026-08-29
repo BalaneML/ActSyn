@@ -1,11 +1,12 @@
 """
 Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
 
-対象は §10.2 の実装 1〜4:
+対象は §10.2 の実装 1〜5:
     1. 定期チェックポイントと再開            stage2_checkpoint.py
     2. 逆過程1ステップの切り出し             model.Diffusion._reverse_step
     3. 打ち切り逆伝播つきサンプラ             model.Diffusion.sample_differentiable
     4. straight-through デコーダ             model.straight_through
+    5. 教師 A* と28群表への採点              stage2_targets.py
 
 検証する内容:
     (ckpt) save_ckpt -> load_ckpt の往復で model/optimizer/step/RNG が戻る。
@@ -17,10 +18,18 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     (c2)   ★K>=1 では勾配が流れる。@torch.no_grad() の付け間違いは (c) だけでは
            検出できない（勾配が一切流れなくなっても (c) は通ってしまう）
     (a)    straight-through の前向きが厳密に one-hot で、群平均が pool_to_rates と一致
+    (h)    stage2_targets.load_stula_targets が移植元 (CVAE_Aggregate) と厳密一致
+    (k)    教師 A* の実測性質が設計書 §3.6 から動いていない
+    (g)    A* が各 (群,時刻) で12チャネルの和 1
+    (d_idx) stage2_targets.d_index が model.d_index と全28組で一致
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは勾配の大きさが測れない。
     test_backbone.py と同じ _wake_up() で out_conv だけを小さな乱数で埋めてから測る。
+
+★ (k) の期待値が食い違ったときは、テスト側を黙って合わせないこと。
+    前処理か教師データが設計書の執筆時から動いた証拠であり、設計書に載っている
+    実測値（勾配配分・必要な n・zero-shot 基準線）が全部無効になる。
 
     .venv/bin/python3 src/models/DDPM_Aggregate_Simple/test_stage2.py
 """
@@ -50,6 +59,7 @@ def _load(name: str, path: Path):
 # 動的ロードしたモジュールは型チェッカから中身が見えないので Any で受ける
 sm: Any = _load("simple_model", HERE / "model.py")
 ck: Any = _load("simple_stage2_checkpoint", HERE / "stage2_checkpoint.py")
+st: Any = _load("simple_stage2_targets", HERE / "stage2_targets.py")
 DEVICE = "cpu"          # テストは決定性重視で CPU 固定
 T_SHORT = 12            # 全1000ステップは重いので、逆過程の往復は短い T で見る
 
@@ -299,11 +309,124 @@ def test_straight_through() -> None:
     print("test_straight_through: OK")
 
 
+# ============================================================
+# 5. 教師 A* と採点
+# ============================================================
+def test_targets_match_reference() -> None:
+    """(h) 移植した load_stula_targets が移植元 (CVAE_Aggregate) と厳密一致すること。
+
+    ★移植元は `from model import AggCVAE` という素の import を持つ。テストから素直に
+      読むと sys.path[0] がこのファイルのディレクトリなので DDPM_Aggregate_Simple/model.py
+      を掴んで ImportError になる。CVAE のディレクトリを先頭に差し込んでから読み、
+      終わったら戻す。設計書 §10.1 が Stage 2 で断とうとしている経路そのものなので、
+      本番コードではなくテストの中だけでこの細工をする。
+    """
+    mine = st.load_stula_targets()
+    cvae_dir = REPO_ROOT / "src" / "models" / "CVAE_Aggregate"
+    sys.path.insert(0, str(cvae_dir))
+    try:
+        ref = _load("cvae_japan_match_experiment", cvae_dir / "japan_match_experiment.py")
+    finally:
+        sys.path.remove(str(cvae_dir))
+    reference = ref.load_stula_targets("timeband_weekday")
+
+    for key in ("group_rates_tbl", "pop"):
+        a, b = mine[key], reference[key]
+        assert a.shape == b.shape, f"{key} の形が違う: {a.shape} vs {b.shape}"
+        assert np.array_equal(np.isnan(a), np.isnan(b)), f"{key} の NaN 位置が違う"
+        d = float(np.nanmax(np.abs(a - b))) if a.size else 0.0
+        assert d == 0.0, f"{key} が移植元と一致しない: max|d|={d}"
+    print("  (1) (h) group_rates_tbl と pop が移植元と厳密一致: OK")
+
+    # d_index は model.py と同じ規則でなければならない（群の並びがずれると全部が壊れる）
+    for g in range(st.N_G):
+        for a in range(st.N_A):
+            for e in range(st.N_E):
+                assert st.d_index(g, a, e) == sm.d_index(g, a, e)
+    assert (st.D_GROUPS, st.NUM_SLOTS) == (sm.D_GROUPS, sm.NUM_SLOTS)
+    assert st.NUM_COMMON == sm.NUM_ACT
+    print("  (2) (d_idx) d_index と定数が model.py と全28組で一致: OK")
+    print("test_targets_match_reference: OK")
+
+
+def test_target_properties() -> None:
+    """(k)(g) 教師 A* の実測性質が設計書 §3.6 から動いていないこと。
+
+    ★食い違ったらテスト側を合わせない。設計書の実測値（勾配配分・必要な n・
+      zero-shot 基準線）が全部無効になったという報告すべき事実である。
+    """
+    tgt = st.load_stula_targets()
+    A, pop = tgt["group_rates_tbl"], tgt["pop"]
+
+    assert A.shape == (28, 12, 96)
+    n_nan = int(np.isnan(A).sum())
+    assert n_nan == 0, f"全国・平日は全セル公表のはずだが NaN が {n_nan} セルある"
+    assert int((~np.isnan(A)).sum()) == 32256
+    print("  (1) NaN 0 セル / 有効教師セル 32,256: OK")
+
+    # (g) 各 (群,時刻) で12活動の和が 1（公表値の丸めぶんだけ振れる）
+    ch = A.sum(axis=1)
+    assert 0.9995 <= ch.min() and ch.max() <= 1.0005, f"チャネル和 {ch.min()}..{ch.max()}"
+    assert abs(float(ch.mean()) - 1.0) < 1e-4
+    print(f"  (2) (g) 12チャネル和 min {ch.min():.4f} / max {ch.max():.4f}: OK")
+
+    # exact 0 が 10.7%（原表の '-' = 行動者ゼロ が 99.3%、単位未満の 0 が 0.7%）
+    n_zero = int((A == 0).sum())
+    assert n_zero == 3458, f"exact 0 のセル数が 3458 から変わっている: {n_zero}"
+    frac_le = float((A <= 0.01).mean())
+    assert abs(frac_le - 0.481) < 2e-3, f"<=0.01 の割合が 48.1% から変わっている: {frac_le}"
+    assert abs(float(np.median(A)) - 0.0112) < 2e-4
+    print(f"  (3) exact 0 が {100*n_zero/A.size:.1f}% / <=0.01 が {100*frac_le:.1f}%: OK")
+
+    # 群人口シェアの開きが 18.7 倍（§7.2 で群を等重みにした根拠）
+    share = pop.reshape(28) / pop.sum()
+    ratio = float(share.max() / share.min())
+    assert abs(float(share.min()) - 0.0045) < 5e-4
+    assert abs(float(share.max()) - 0.0839) < 5e-4
+    assert abs(ratio - 18.7) < 0.5, f"群人口シェアの比が 18.7 倍から変わっている: {ratio}"
+    # 15歳以上人口の 99.6% を覆う（就業状態が不詳の 411千人は公表表に区分が無く対象外）
+    assert abs(float(pop.sum()) - 106709.0) < 1.0
+    print(f"  (4) 群人口シェア {share.min():.4f}..{share.max():.4f} = {ratio:.1f} 倍: OK")
+    print("test_target_properties: OK")
+
+
+def test_eval_against() -> None:
+    tgt = st.load_stula_targets()
+    A = tgt["group_rates_tbl"]
+
+    # 教師そのものを渡せば誤差は厳密に 0
+    perfect = A.reshape(st.D_GROUPS, st.NUM_COMMON * st.NUM_SLOTS)
+    r12 = st.eval_against(perfect, tgt, st.mask_12act())
+    assert r12["rate_mae"] == 0.0 and r12["dev_mae"] == 0.0 and r12["max_abs_err"] == 0.0
+    assert r12["mask"] == "12act" and r12["n_cells"] == 32256
+    print("  (1) 教師そのものを渡すと誤差 0: OK")
+
+    rows = st.eval_both(perfect, tgt)
+    assert [r["mask"] for r in rows] == ["12act", "11act"]
+    assert rows[1]["n_cells"] == 28 * 11 * 96, "11act のセル数が合わない"
+    assert "mae_OTHER_X" in rows[0] and "mae_OTHER_X" not in rows[1]
+    print("  (2) eval_both が 12act / 11act の2行を mask 列付きで返す: OK")
+
+    # 相対誤差 = mae / 教師平均率。定数ずらしで手計算と突き合わせる
+    shifted = (A + 0.01).reshape(st.D_GROUPS, st.NUM_COMMON * st.NUM_SLOTS)
+    r = st.eval_against(shifted, tgt, st.mask_12act())
+    assert abs(r["rate_mae"] - 0.01) < 1e-12
+    assert abs(r["dev_mae"]) < 1e-12, "一様なずらしは群偏差を動かさないはず"
+    for c in st.Common:
+        q_bar = float(A[:, int(c), :].mean())
+        assert abs(r[f"rel_{c.name}"] - 0.01 / q_bar) < 1e-9, f"rel_{c.name} の定義がずれている"
+    print(f"  (3) rel_* = mae / 教師平均率 (例 rel_TRAVEL={r['rel_TRAVEL']:.3f}): OK")
+    print("test_eval_against: OK")
+
+
 def main() -> None:
     test_checkpoint_roundtrip()
     test_reverse_step_matches_inline()
     test_sample_differentiable()
     test_straight_through()
+    test_targets_match_reference()
+    test_target_properties()
+    test_eval_against()
     print("\ntest_stage2: OK")
 
 
