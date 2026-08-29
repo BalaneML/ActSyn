@@ -1,10 +1,11 @@
 """
 Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
 
-対象は §10.2 の実装 1〜3:
+対象は §10.2 の実装 1〜4:
     1. 定期チェックポイントと再開            stage2_checkpoint.py
     2. 逆過程1ステップの切り出し             model.Diffusion._reverse_step
     3. 打ち切り逆伝播つきサンプラ             model.Diffusion.sample_differentiable
+    4. straight-through デコーダ             model.straight_through
 
 検証する内容:
     (ckpt) save_ckpt -> load_ckpt の往復で model/optimizer/step/RNG が戻る。
@@ -15,6 +16,7 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     (c)    K=0 では勾配が流れない
     (c2)   ★K>=1 では勾配が流れる。@torch.no_grad() の付け間違いは (c) だけでは
            検出できない（勾配が一切流れなくなっても (c) は通ってしまう）
+    (a)    straight-through の前向きが厳密に one-hot で、群平均が pool_to_rates と一致
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは勾配の大きさが測れない。
@@ -29,6 +31,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -254,10 +257,53 @@ def test_sample_differentiable() -> None:
     print("test_sample_differentiable: OK")
 
 
+# ============================================================
+# 4. straight-through デコーダ
+# ============================================================
+def test_straight_through() -> None:
+    torch.manual_seed(0)
+    x0 = torch.randn(8, sm.IN_CH, sm.NUM_SLOTS, requires_grad=True)
+    y = sm.straight_through(x0)
+    assert y.shape == x0.shape
+
+    # 前向きは厳密に one-hot。★括弧を落とすと 6.0e-08 ずれてここが落ちる
+    oh = torch.nn.functional.one_hot(
+        torch.softmax(x0.detach(), dim=1).argmax(dim=1), sm.NUM_ACT).permute(0, 2, 1).float()
+    assert torch.equal(y.detach(), oh), "前向きが厳密な one-hot になっていない"
+    assert float((y.detach().sum(dim=1) - 1.0).abs().max()) == 0.0
+    print("  (1) 前向きが厳密に one-hot、活動チャネル方向の和が厳密に 1: OK")
+
+    # 後ろ向きは softmax の微分（argmax なら勾配は恒等的に 0 になるはず）
+    y.sum().backward()
+    assert x0.grad is not None and float(x0.grad.abs().max()) > 0, \
+        "勾配が流れていない（straight-through になっていない）"
+    print("  (2) 後ろ向きに勾配が流れる: OK")
+
+    # 群平均が pool_to_rates と一致する ＝ 学習で下げる量と評価で測る量が同じ
+    pool = x0.detach().argmax(dim=1).numpy()[None, :, :]           # (1, M, 96)
+    rates = sm.pool_to_rates(pool).reshape(1, sm.NUM_ACT, sm.NUM_SLOTS)
+    # ★pool_to_rates は float64 で平均を取るので、比較も float64 で行う。
+    #   float32 のまま平均すると 1/M の丸めで 2.4e-08 ずれる（straight_through の
+    #   欠陥ではなく、平均の精度の違い）
+    diff64 = float(np.abs(y.detach().double().mean(0).numpy() - rates[0]).max())
+    diff32 = float(np.abs(y.detach().mean(0).numpy() - rates[0]).max())
+    assert diff64 == 0.0, f"float64 平均が pool_to_rates と一致しない: {diff64}"
+    assert diff32 < 1e-6, f"float32 平均のずれが丸め誤差を超えている: {diff32}"
+    print(f"  (3) (a) 群平均が pool_to_rates と一致 (float64 差 {diff64}, "
+          f"float32 差 {diff32:.1e}): OK")
+
+    # tau は softmax を鋭くするだけで、前向きの one-hot は変わらない
+    y_tau = sm.straight_through(x0.detach(), tau=0.5)
+    assert torch.equal(y_tau, oh), "tau を変えると前向きの one-hot が変わる"
+    print("  (4) tau を変えても前向きは同じ one-hot: OK")
+    print("test_straight_through: OK")
+
+
 def main() -> None:
     test_checkpoint_roundtrip()
     test_reverse_step_matches_inline()
     test_sample_differentiable()
+    test_straight_through()
     print("\ntest_stage2: OK")
 
 

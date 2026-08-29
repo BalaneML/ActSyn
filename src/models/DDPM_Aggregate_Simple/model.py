@@ -689,6 +689,36 @@ class Diffusion:
         return self._sample_tail(model, x_K, K, cond_idx, guidance_scale, zs)
 
 
+def straight_through(x0: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
+    """連続値 (B,12,96) を微分可能に one-hot 化する（Stage2_design.md §2.8）。
+
+    なぜ必要か:
+        評価の pool_to_rates は argmax → one-hot → 平均で率を作る。一方 sample_differentiable
+        が返す x0 は各要素が [0,1] にクリップされただけで、活動チャネル方向の和は1にならない
+        （ある時刻で和が 2.0 になる値が普通に出る）。生の x0 の平均を教師に合わせると
+        評価とは別の量を最適化することになる。
+        argmax は階段関数で微分がほぼ至るところ 0 なので、前向きは argmax のまま使い、
+        後ろ向きだけ softmax の微分で置き換える。
+
+    args:
+        tau: softmax の温度。既定 1 で運用し掃引しない。勾配の大きさは tau について
+             単調でなく tau≈0.3 で最大になるが、tau を下げると p が1チャネルに集中して
+             代理が argmax に近づく（置き換えた意味が薄れる）。勾配が効かないときの
+             予備のつまみとして下げる場合も 0.15 を下回らせない
+
+    ★dim=1 は12活動の軸であって時刻軸ではない。テンソルは (B, IN_CH, NUM_SLOTS) = (B,12,96)
+      なので、この softmax は各時刻スロットで12活動に対して正規化する。dim=2 にかけると
+      「各活動が1日のどこか1スロットで起きる」という別物の制約になる
+    """
+    p = F.softmax(x0, dim=1) if tau == 1.0 else F.softmax(x0 / tau, dim=1)
+    # ★F.one_hot は新しい軸を末尾に足す。p.argmax(dim=1) が (B,96) なので
+    #   F.one_hot は (B,96,12) を返す。permute で (B,12,96) に戻さないと形が合わない
+    oh = F.one_hot(p.argmax(dim=1), NUM_ACT).permute(0, 2, 1).float()
+    # ★括弧が必須。oh + p - p.detach() は左から評価されて (oh + p) - p.detach() になり、
+    #   float32 の丸めで前向きの値が one-hot から 6.0e-08 ずれる。括弧を付ければ厳密に一致する
+    return oh + (p - p.detach())
+
+
 # ============================================================
 # 6. 学習
 # ============================================================
