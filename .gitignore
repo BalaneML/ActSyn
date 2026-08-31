@@ -25,6 +25,7 @@ model_configs/*
 NOTE.md
 docs/*
 Stage2_design.md
+Stage2_implementation.md
 
 # wandb
 wandb/
