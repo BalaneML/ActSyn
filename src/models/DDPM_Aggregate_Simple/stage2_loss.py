@@ -24,7 +24,13 @@ Stage 2 の集計損失（Stage2_design.md §6, §7）
 
 損失の形（§7.4 の決定）:
 
-    dist(p,q) = Σ_c ω_c (p_c − q_c)²,   ω_c = (1/(q_c+ε)) / mean(1/(q+ε))
+    dist(p,q) = (1/12) Σ_c ω_c (p_c − q_c)²,   ω_c = (1/(q_c+ε)) / mean(1/(q+ε))
+
+    ★活動数 12 で割る。こうすると ε=inf で損失が「セル単位の平均二乗誤差」そのものになり、
+      報告指標（rate_mae / rate_rmse はいずれも (d,c,s) 全セルの平均）と同じ尺度になる
+      （√L_agg ≈ rate_rmse）。割らないと MSE の 12 倍の量を MSE と呼ぶことになる。
+      学習への影響はない：--lam auto は λ = |L_agg| / L_atus と置くので定数 1/12 が
+      そのまま λ に吸収され、損失全体が一様に 1/12 倍されるだけで AdamW は不変。
 
     ε=inf   主A  素の MSE。勾配配分が実誤差分布と一致し、報告指標 rate_mae と整合
     ε=0.01  主B  χ²。逆分散重みに近い側で、稀活動と相対誤差を取りに行く
@@ -113,16 +119,17 @@ def agg_loss_from_rates(a_A: torch.Tensor, a_B: torch.Tensor,
                         q: torch.Tensor, omega: torch.Tensor) -> torch.Tensor:
     """split-batch 不偏推定の集計損失。すべて (D_sub,12,96) で群は揃えて渡す。
 
-        L = mean_{d,s} Σ_c ω[d,c,s] · (ā_A − q)[d,c,s] · (ā_B − q)[d,c,s]
+        L = mean_{d,c,s} ω[d,c,s] · (ā_A − q)[d,c,s] · (ā_B − q)[d,c,s]
 
-    ★活動 c は和、群 d と時刻 s は平均。§7.1(5) の定義そのもの。
+    ★群 d・活動 c・時刻 s の 3 軸とも平均（§7.1(5) の定義）。ω は全セル平均 1 なので
+      ε=inf ではこれがそのままセル単位の MSE になり、rate_rmse と同じ尺度で読める。
     ★ā_A ⊥ ā_B なので E[L] = Σ ω (E[ā]−q)² となり、多様性への罰 (1/n)tr Var が
       厳密に消える。素朴な二乗和はこの項を含むので、集計を合わせるほど群内の
       個票が互いに似ていく圧力がかかる。
     ★値が負になりうる。ā_A と ā_B の誤差の符号が逆なら内積が負になる。損失として
       不自然に見えるが、期待値が bias² で下限0なのは変わらない（推定量の分散の話）。
     """
-    return ((a_A - q) * (a_B - q) * omega).sum(dim=1).mean()
+    return ((a_A - q) * (a_B - q) * omega).mean()
 
 
 def agg_loss(y: torch.Tensor, q: torch.Tensor, omega: torch.Tensor,
@@ -166,7 +173,7 @@ def loss_grad(a_A: torch.Tensor, a_B: torch.Tensor, q: torch.Tensor,
     """g_A = ∂L/∂ā_A と g_B = ∂L/∂ā_B を解析的に返す。autograd を使わない。
 
     ★split-batch なので、A半分に流す勾配は B半分の誤差で決まる（その逆も同じ）:
-        g_A = ω·(ā_B − q) / (|D_sub|·96),   g_B = ω·(ā_A − q) / (|D_sub|·96)
+        g_A = ω·(ā_B − q) / (|D_sub|·12·96),   g_B = ω·(ā_A − q) / (|D_sub|·12·96)
       素朴版の g = 2(Ã − A*) とは形が違う。2パス蓄積で g を注入するときに
       取り違えないこと。
 
@@ -174,7 +181,7 @@ def loss_grad(a_A: torch.Tensor, a_B: torch.Tensor, q: torch.Tensor,
       - 学習過程の診断（§11.3）。追加コストなしに「教師のどの部分が効いているか」が測れる
       - 2パス勾配蓄積（§10.2-11）で上流勾配として注入する値そのもの
     """
-    scale = a_A.size(0) * a_A.size(2)          # |D_sub| × 96
+    scale = a_A.size(0) * a_A.size(1) * a_A.size(2)    # |D_sub| × 12 × 96（3軸とも平均）
     return omega * (a_B - q) / scale, omega * (a_A - q) / scale
 
 
