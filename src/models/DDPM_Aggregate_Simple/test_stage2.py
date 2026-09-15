@@ -529,7 +529,7 @@ def test_agg_loss() -> None:
 
     # (i) ε=inf の χ² が素の MSE と一致する ＝ 1本のコードで両方走る
     w_inf = sl.chi2_weights(q, float("inf"))
-    plain = ((a_A - q) * (a_B - q)).sum(dim=1).mean()
+    plain = ((a_A - q) * (a_B - q)).mean()
     assert torch.allclose(sl.agg_loss(y, q, w_inf, n), plain, atol=0, rtol=0)
     print("  (3) (i) ε=inf の損失値が素の MSE と厳密一致: OK")
 
@@ -553,8 +553,8 @@ def test_split_batch_unbiased() -> None:
     """(b) ★split-batch 推定が不偏で、素朴な二乗和は多様性への罰を持つこと。
 
     合成データの真の平均 p と教師 q を別に置くと、解析値が分かる:
-        E[split-batch] = Σ_c ω (p−q)²                        （bias のみ）
-        E[素朴]        = Σ_c ω (p−q)² + (1/n) Σ_c ω Var(y_c)  （罰つき）
+        E[split-batch] = mean_c ω (p−q)²                        （bias のみ）
+        E[素朴]        = mean_c ω (p−q)² + (1/n) mean_c ω Var(y_c)  （罰つき）
     Var(y_c) = p_c(1−p_c)（one-hot なのでベルヌーイ）。
     """
     torch.manual_seed(0)
@@ -565,8 +565,8 @@ def test_split_batch_unbiased() -> None:
     q = q / q.sum(dim=1, keepdim=True)
     omega = sl.chi2_weights(q, 0.05)
 
-    bias = ((p - q) ** 2 * omega).sum(dim=1).mean()
-    penalty = (omega * p * (1.0 - p)).sum(dim=1).mean() / n
+    bias = ((p - q) ** 2 * omega).mean()
+    penalty = (omega * p * (1.0 - p)).mean() / n
 
     gen = torch.Generator().manual_seed(2)
     split_vals, naive_vals = [], []
@@ -575,7 +575,7 @@ def test_split_batch_unbiased() -> None:
         a_A, a_B = sl.group_rates_split(y, n)
         split_vals.append(float(sl.agg_loss_from_rates(a_A, a_B, q, omega)))
         a_full = y.view(d_sub, n, sm.NUM_ACT, sm.NUM_SLOTS).mean(dim=1)
-        naive_vals.append(float(((a_full - q) ** 2 * omega).sum(dim=1).mean()))
+        naive_vals.append(float(((a_full - q) ** 2 * omega).mean()))
 
     split_mean = float(np.mean(split_vals))
     naive_mean = float(np.mean(naive_vals))
@@ -616,7 +616,7 @@ def test_loss_grad_and_diagnostics() -> None:
     print("  (1) loss_grad の解析形が autograd と一致: OK")
 
     # ★A半分に流す勾配は B半分の誤差で決まる（split-batch の帰結）
-    scale = d_sub * sm.NUM_SLOTS
+    scale = d_sub * sm.NUM_ACT * sm.NUM_SLOTS      # 群・活動・時刻の3軸とも平均
     assert torch.allclose(g_A, omega * (a_B - q) / scale)
     print("  (2) g_A が B半分の誤差で決まる: OK")
 
