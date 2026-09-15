@@ -1,41 +1,8 @@
 """
 model.py
 ================
-集計マッチ転移のための条件付きDDPM（AggDDPM）— 簡素化版
+集計マッチ転移のための条件付きDDPM（AggDDPM）
 
-DDPM_Aggregate/model.py から意図的に4点を削った独立実装である。
-このファイルは DDPM_Aggregate を import しない（完全に自己完結）。共通部分を写している
-ぶん、DDPM_Aggregate 側を直してもここには伝播しない。両方を直す必要がある。
-
-DDPM_Aggregate/model.py との差分（★が本モデルの変更点）:
-    1. データ表現 : ★one-hot を {-1,+1} でなく {0,1} のまま拡散空間に載せる
-                    sched_to_x0 と sample の clamp 範囲が対応して変わる
-    2. サンプリング: ★DDIM を持たない。ancestral のみ
-                    SAMPLER / DDIM_STEPS / DDIM_ETA と、それに付随する引数を削除
-    3. 時刻埋め込み: ★sinusoidal を MLP で持ち上げず、256次元を直接足す
-                    time_mlp (98,816 params) を削除
-    4. 学習       : ★EMA を持たない。学習後の重みをそのまま生成に使う
-
-変更1の測定済みの代償（採用前に確認した数値。設計判断の記録として残す）:
-    正解チャネルと不正解チャネルの差（分離幅）は {-1,+1} で 2、{0,1} で 1 になる。
-    分離/ノイズ比 = gap·√(ᾱ_t/(1-ᾱ_t)) が 1 を下回る境界は
-        {-1,+1}: t = 395（全1000ステップの39.5%で1スロット単独判別が可能）
-        {0,1}  : t = 258（同 25.8%）
-    判別可能な区間が 4 割から 2.6 割に減るので、断片化（本研究の主指標）が
-    悪化しうる。一方 12分類 one-hot の要素平均は {-1,+1} で -0.833、{0,1} で +0.083 で、
-    事前分布 N(0,I) との平均のずれは {0,1} の方が小さい。両者は一長一短であり、
-    どちらが良いかは実測で決める。比較相手は DDPM_Aggregate（同一の学習ループ）。
-
-変更4について:
-    EMA は拡散モデルで広く使われる。削除の影響は未測定である。
-    なお DDPM_Aggregate では val 損失を raw 重みで測って early stopping し、
-    生成には EMA 重みを使うという不整合があった。本実装では生成に使う重みが
-    そのまま val で選ばれるので、選択指標と生成重みは一致する。
-
-out_conv のゼロ初期化は残してある（DDPM_Aggregate と同じ）。
-100エポック×2シードの A/B で、既定初期化より val ε-MSE が良かったため:
-    epoch   5: ゼロ初期化 0.643 / 既定 0.335   ← 立ち上がりは不利
-    epoch 100: ゼロ初期化 0.043 / 既定 0.046   ← 収束側で逆転（差 +0.0031 ± 0.0008）
 
 使い方:
     # Stage1: ATUS 平日・共通12分類・28群で条件付き pretrain
@@ -173,7 +140,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_availabl
 # ============================================================
 def d_index(g: int, a: int, e: int) -> int:
     """
-    (性, 年齢7区分, 就業) -> 群インデックス d
+    (性2, 年齢7区分, 就業2) -> 群28インデックス d
     """
     return g * (N_A * N_E) + a * N_E + e
 
@@ -274,9 +241,8 @@ def sched_to_x0(sched: torch.Tensor) -> torch.Tensor:
     活動スケジュール (index表現) を onehot~{0,1} に変換
     スケジュール (B,96) int -> 拡散空間 (B,12,96) ∈ {0,1}
 
-    ★DDPM_Aggregate は 2*onehot-1 で {-1,+1} に写す。本実装は写さない。
-      値域が変わるので、逆過程の clamp も [0,1] に揃える（Diffusion.sample 参照）。
-      デコードは argmax なので、この変更でも復元規則は変わらない。
+    値域が変わるので、逆過程の clamp も [0,1] に揃える（Diffusion.sample 参照）。
+    デコードは argmax なので、この変更でも復元規則は変わらない。
     """
     return F.one_hot(sched, NUM_ACT).float().permute(0, 2, 1)
 
@@ -285,14 +251,19 @@ def sched_to_x0(sched: torch.Tensor) -> torch.Tensor:
 # 4. Denoiser（1D-UNet）
 # ============================================================
 def timestep_embedding(t: torch.Tensor, dim: int = TIME_EMB_DIM) -> torch.Tensor:
-    """
-    sinusoidal timestep embedding (B,) -> (B, dim)
+    """拡散ステップtをsinusoidal埋め込みベクトルへ符号化する, (B,) -> (B, dim)
 
-    ★DDPM_Aggregate は 128次元で作ってから MLP (Linear-SiLU-Linear) で 256次元へ
-      持ち上げるが、本実装は最初から 256次元で作って直接足す。
-      各 ResBlock1D の emb_proj が線形写像なので、時刻条件は
-      「256次元フーリエ基底の線形読み出し」として残る。失うのは全ブロックで
-      共有される非線形処理の分だけ。削減は 98,816 params。
+    Note:
+        1. 近いステップは近いベクトル
+        2. 異なるステップは異なるベクトル
+        3. スカラーtからdim次元ベクトルへ広げる
+
+    Args:
+        t: 拡散ステップ数, dtype=int64, 値域[0, T_STEPS], (B,)
+        dim: 出力次元数, default=TIME_EMB_DIM=256
+
+    Returns:
+        sinusoidal埋め込み, dtype=float32, (B, dim)
     """
     half = dim // 2  # sin, cosのために, dimを2分割
     freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / half)
@@ -301,13 +272,21 @@ def timestep_embedding(t: torch.Tensor, dim: int = TIME_EMB_DIM) -> torch.Tensor
 
 
 class ResBlock1D(nn.Module):
-    """
-    GroupNorm→SiLU→Conv1d ×2 + timestep/条件埋め込みの加算注入 + skip
+    """条件埋め込みを注入する1D残差ブロック (pre-activation ResNet)
 
-    Norm→Act→Conv の順序（pre-activation）は Ho et al. 2020 の resnet_block と同じ。
-    残差経路が純粋な恒等写像になり、出口のゼロ初期化が成立する前提でもある。
+    Note:
+        1. GroupNorm -> SiLU -> Conv1d の pre-activation 構成を2段重ね, 入力を残差加算する
+        2. emb を emb_proj で c_out 次元へ落とし、チャネル毎バイアスとして時間軸一様に加算する
+        3. 時間長Lは変えない (padding = KERNEL_SIZE // 2)
     """
     def __init__(self, c_in: int, c_out: int, emb_dim: int = TIME_EMB_DIM):
+        """残差ブロックの層を構築する。
+
+        Args:
+            c_in: 入力チャネル数, GroupNorm(8, c_in) のため8の倍数
+            c_out: 出力チャネル数, 8の倍数, c_in と異なるとき skip は 1x1 conv になる
+            emb_dim: 条件埋め込みの次元, default=TIME_EMB_DIM=256
+        """
         super().__init__()
         k, pad = KERNEL_SIZE, KERNEL_SIZE // 2
         self.norm1 = nn.GroupNorm(8, c_in)
@@ -318,9 +297,20 @@ class ResBlock1D(nn.Module):
         self.dropout = nn.Dropout(DROPOUT)
         self.conv2 = nn.Conv1d(c_out, c_out, k, padding=pad)
 
-        self.skip = nn.Conv1d(c_in, c_out, 1) if c_in != c_out else nn.Identity()
+        self.skip = nn.Identity() if c_in == c_out else nn.Conv1d(c_in, c_out, 1)
 
-    def forward(self, x, emb):
+    def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        """残差ブロック, (B, c_in, L) -> (B, c_out, L)
+
+        Args:
+            x: 入力特徴, dtype=float32, (B, c_in, L)
+                Lは呼び出し位置で NUM_SLOTS = 96 / 48 / 24 のいずれか
+            emb: 拡散ステップ埋め込みと条件埋め込みの和,
+                dtype=float32, (B, emb_dim) = (B, 256)
+
+        Returns:
+            出力特徴, dtype=float32, (B, c_out, L)。Lは入力と同じ
+        """
         h = self.conv1(F.silu(self.norm1(x)))
         h = h + self.emb_proj(emb)[:, :, None]
         h = self.conv2(self.dropout(F.silu(self.norm2(h))))
@@ -328,34 +318,38 @@ class ResBlock1D(nn.Module):
 
 
 class AttnBlock1D(nn.Module):
-    """
-    時間軸(スロット間)の self-attention + residual
+    """時間軸(スロット間)の self-attention + residual
+    畳み込みが届かない遠いスロット同士を直接結ぶ
     """
     def __init__(self, ch: int):
+        """attention層を構築する。
+
+        Args:
+            ch: 入出力チャネル数, GroupNorm(8, ch) のため8の倍数
+        """
         super().__init__()
         self.norm = nn.GroupNorm(8, ch)
         self.attn = nn.MultiheadAttention(ch, ATTN_HEADS, batch_first=True)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """self-attentionを1回かける, (B, C, L) -> (B, C, L)
+
+        Args:
+            x: 入力特徴, dtype=float32, (B, C, L)
+
+        Returns:
+            出力特徴, dtype=float32, (B, C, L)
+        """
         h = self.norm(x).permute(0, 2, 1)
         h, _ = self.attn(h, h, h, need_weights=False)
-        return x + h.permute(0, 2, 1)
+        return h.permute(0, 2, 1) + x
 
 
 class UNet1D(nn.Module):
-    """
-    ε予測ネットワーク: (B,12,96) + 拡散ステップt + 条件cond -> (B,12,96)
-    ノイズεの shape は予測するデータ (活動系列) の shape と同じ
-
-    ★DDPM_Aggregate との差は time_mlp を持たないことだけ。
-      それ以外の層構成・チャネル数・attention の位置は同一に保つ
-      （比較したときの差が「時刻埋め込みの処理」だけに帰着するようにするため）。
-    """
+    """ε予測ネットワーク: (B,12,96) + 拡散ステップt + 条件cond -> (B,12,96)"""
     def __init__(self):
         super().__init__()
         c1, c2 = BASE_CH, BASE_CH * 2
-
-        # ★time_mlp は持たない。timestep_embedding(t) を直接 emb に足す
 
         # Condition Embedding
         self.cond_embeds = nn.ModuleList([
@@ -395,8 +389,7 @@ class UNet1D(nn.Module):
         self.us1 = nn.Conv1d(c2, c1, k, padding=pad)
         self.u1 = ResBlock1D(c1 + c1, c1)
 
-        # 最終出力層。ゼロ初期化により学習開始時の ε̂ が恒等的に 0 になる。
-        # ε̂=0 は E[ε]=0 より「最適な定数予測器」であり、A/B で収束後の val が良かった
+        # 最終出力層
         self.out_norm = nn.GroupNorm(8, c1)
         self.out_conv = nn.Conv1d(c1, IN_CH, k, padding=pad)
         nn.init.zeros_(self.out_conv.weight)
@@ -406,18 +399,37 @@ class UNet1D(nn.Module):
 
     @property
     def in_channels(self) -> int:
-        """
-        拡散空間のチャネル数
-        バックボーン実装に依らない共通の入口
+        """拡散空間のチャネル数。バックボーン実装に依らない共通の入口。
 
         clock_diagnostics が純ノイズ x_T を作るのに使う。実装内部の層名
         (in_conv 等) に触らせないための薄い契約。
         """
         return IN_CH
 
-    def embed_cond(self, cond_idx, batch: int, drop_mask=None):
-        """
-        条件 (性・年齢・就業) を256次元のベクトルにまとめる
+    def embed_cond(self, cond_idx: torch.Tensor | None, batch: int,
+                    drop_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """条件 (性・年齢・就業) を256次元の条件埋め込みへ, (B,3) -> (B,256)
+
+        Note:
+            1. 属性ごとに別の Embedding 表を引き、連結して cond_proj で混ぜる
+                (埋め込み段階では属性は独立、Linear で初めて属性間の相互作用が入る)
+            2. 条件なしは学習可能な null_emb 1本で表す
+                (cond_idx=None はバッチ全体、drop_mask は行単位)
+            3. timestep_embedding(t) と同じ TIME_EMB_DIM 次元で出し、加算できる形にする
+
+        Args:
+            cond_idx: 社会属性の条件インデックス, dtype=int64, (B, 3)
+                列は COND_SPEC の順で [gender, age, telfs]
+                gender: {0=男, 1=女}, age: {0,..,6} (15歳起点10歳階級7区分),
+                telfs : {0=無業, 1=有業}
+                None のときバッチ全体を無条件 (null_emb) にする
+            batch: バッチサイズ B。cond_idx=None では形状を取れないため明示的に受け取る
+            drop_mask: CFGの条件dropoutマスク, dtype=bool, (B,)
+                True の行だけ条件埋め込みを null_emb に差し替える
+                学習時は P_UNCOND=0.1 で立てる (GaussianDiffusion.loss)
+
+        Returns:
+            条件埋め込み c, dtype=float32, (B, TIME_EMB_DIM) = (B, 256)
         """
         if cond_idx is None:
             return self.null_emb.expand(batch, -1)
@@ -429,32 +441,69 @@ class UNet1D(nn.Module):
             c = torch.where(drop_mask[:, None], self.null_emb.expand_as(c), c)
         return c  # (B, 256)
 
-    def _encode(self, x_t, emb):
-        """
-        下り経路の中間特徴
-        forward と features の共通部分（分岐させない）
+    def _encode(self,x_t: torch.Tensor,
+                emb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """UNet1Dの下り経路を1回通し, 3つの解像度の中間特徴 (hidden) を返す, (B, 12, 96) -> 96/48/24
+
+        Note:
+            1. CNN1Dで時間軸を96 -> 48 -> 24と半減させる, チャネルは12 -> 64 (h1) -> 128 (h2, h3)
+            2. 各ResBlock1Dへembを渡し, 拡散ステップと条件を全段に入力
+            3. forward と features の共通部分（分岐させない）
+
+        Args:
+            x_t: ノイズ付き活動スケジュール, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)
+            emb: 拡散ステップ埋め込み + 条件埋め込み (和), dtype=float32, (B, TIME_EMB_DIM) = (B, 256)
+
+        Returns:
+            中間特徴のタプル (h1, h2, h3), dtype=float32
+                h1: (B, BASE_CH,   NUM_SLOTS)    = (B,  64, 96)  ds1 の手前
+                h2: (B, BASE_CH*2, NUM_SLOTS//2) = (B, 128, 48)  ds2 の手前
+                h3: (B, BASE_CH*2, NUM_SLOTS//4) = (B, 128, 24)  Bottleneck への入力
         """
         h1 = self.d1b(self.d1a(self.in_conv(x_t), emb), emb)
         h2 = self.attn2(self.d2b(self.d2a(self.ds1(h1), emb), emb))
         h3 = self.attn3(self.d3b(self.d3a(self.ds2(h2), emb), emb))
         return h1, h2, h3
 
-    def features(self, x_t, t, cond_idx=None) -> dict[str, torch.Tensor]:
-        """
-        中間特徴 {h1:(B,64,96), h2:(B,128,48), h3:(B,128,24)}
+    def features(self, x_t: torch.Tensor, t: torch.Tensor,
+                cond_idx: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+        """下り経路の中間特徴を名前付きで返す（診断用）。
+
+        eval/clock_diagnostics.py の B4 診断が、実装内部の層名に触らずに
+        中間特徴を読むための入口。
+
+        Args:
+            x_t: ノイズ付き活動スケジュール, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)
+            t: 拡散ステップ数, dtype=int64, (B,)
+            cond_idx: 社会属性の条件インデックス, dtype=int64, (B, 3)
+                None のときバッチ全体を無条件にする
+
+        Returns:
+            中間特徴 {h1: (B,64,96), h2: (B,128,48), h3: (B,128,24)}, dtype=float32
         """
         emb = timestep_embedding(t) + self.embed_cond(cond_idx, x_t.size(0))
         h1, h2, h3 = self._encode(x_t, emb)
         return {"h1": h1, "h2": h2, "h3": h3}
 
-    def forward(self, x_t, t, cond_idx=None, drop_mask=None):
-        """
-        UNetのforward
-        ε_θ(x_t, t, c) -> ノイズを予測する
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor,
+                cond_idx: torch.Tensor | None=None,
+                drop_mask: torch.Tensor | None=None) -> torch.Tensor:
+        """ノイズを予測する ε_θ(x_t, t, c), (B, 12, 96) -> (B, 12, 96)
+
+        Args:
+            x_t: ノイズ付き活動スケジュール, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)
+            t: 拡散ステップ数, dtype=int64, 値域[0, T_STEPS], (B,)
+            cond_idx: 社会属性 (gender, age, telfs) の条件インデックス, dtype=int64, (B, 3)
+                None のときバッチ全体を無条件にする
+            drop_mask: CFGの条件dropoutマスク, dtype=bool, (B,)
+                Trueの行だけ条件埋め込みをnull_embに差し替える
+
+        Returns:
+            予測ノイズ ε_θ, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)
         """
         # Embedding (拡散ステップt + 社会属性条件cond)
-        # ★sinusoidal をそのまま足す（MLP を通さない）
-        emb = timestep_embedding(t) + self.embed_cond(cond_idx, x_t.size(0), drop_mask)  # (B, 256)
+        num_batch = x_t.size(0)
+        emb = timestep_embedding(t) + self.embed_cond(cond_idx, num_batch, drop_mask)  # emb(B, 256) = time_emb + cond_emb
 
         # Down
         h1, h2, h3 = self._encode(x_t, emb)
@@ -633,9 +682,13 @@ class Diffusion:
     # Stage 2: 末尾 K ステップだけ勾配を保持する逆過程（Stage2_design.md §4.3）
     #
     # 全 1000 ステップの計算グラフは B=28 でも 130.6 GB になり保持できない。
-    # 一方 ∂x_0/∂x_{t-1} は (t-1) 段ぶんの積なので、古いステップからの勾配は
-    # 数値的に潰れて寄与しない。よって末尾 K ステップで打ち切る。
-    # メモリのための妥協であると同時に、勾配の質から見ても正解である。
+    # よって末尾 K ステップで打ち切る。
+    #
+    # ★捨てた項はゼロではない。「古いステップの勾配は指数的に消えるから捨ててよい」
+    #   という説明は誤りで、逆過程1段の倍率はむしろ 1/√α_t > 1 である。
+    #   捨ててよい根拠は「消えるから」ではなく「残した項と向きがほぼ同じだから」で、
+    #   K=1 の勾配は K=32 の勾配と cos ≈ 0.96 で一致する。
+    #   実測は src/eval/diagnostics/stage2_gradient_probe.py、議論は docs/Stage2_design.md §4.2 ②。
     #
     # head / tail に分けてあるのは2パス勾配蓄積のため。1パス目で x_K を保存すれば
     # 前段（999ステップ）は1回で済み、2パス目は tail だけを回せばよい。
