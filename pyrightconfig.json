@@ -4,7 +4,10 @@
     "venv": ".venv",
     "extraPaths": [
         "src/common/aggregates",
+        "src/common/astar",
         "src/common/preprocess/stula",
-        "src/models/CVAE_Aggregate"
+        "src/eval",
+        "src/models/CVAE_Aggregate",
+        "src/models/DDPM_Aggregate_Simple"
     ]
 }
