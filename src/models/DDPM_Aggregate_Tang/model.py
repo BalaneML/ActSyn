@@ -98,6 +98,19 @@ NUM_ACT   = agg.NUM_ACT            # 共通12分類
 IN_CH     = agg.IN_CH              # 拡散空間のチャネル数 = NUM_ACT
 DEVICE    = agg.DEVICE
 
+# ★診断スクリプトが「モデルフォルダ」に期待する表面を agg から素通しする。
+#   src/eval/clock_diagnostics.py --model-dir でこのフォルダを渡せるようにするため
+#   （バックボーン以外は DDPM_Aggregate と同一なので再実装しない）。
+ACT_NAMES = agg.ACT_NAMES
+D_GROUPS  = agg.D_GROUPS
+VAL_RATIO = agg.VAL_RATIO
+SEED      = agg.SEED
+load_data = agg.load_data
+cond_to_d = agg.cond_to_d
+cond_grid = agg.cond_grid
+sched_to_x0 = agg.sched_to_x0
+Diffusion = agg.Diffusion
+
 # Tang: fully connected (K, 512)。512 を 256 に落としても総 params は
 # 12.66M → 12.09M でほぼ動かない（bottleneck と attention が支配的）ので Tang 値のまま
 EMB_DIM   = 512
