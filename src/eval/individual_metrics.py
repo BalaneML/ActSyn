@@ -55,6 +55,7 @@ import numpy.typing as npt
 import pandas as pd
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch
+from scipy.special import kolmogorov
 from scipy.stats import ks_2samp, wasserstein_distance
 
 # ============================================================
@@ -217,18 +218,61 @@ def switch_stats(sched: IntArr, w: FloatArr | None = None) -> dict:
     }
 
 
+def _weighted_ecdf(x: FloatArr, w: FloatArr, grid: FloatArr) -> FloatArr:
+    """重み付き経験CDF を grid 上で評価する。w は和1に正規化済みであること。"""
+    order = np.argsort(x)
+    cum = np.cumsum(w[order])
+    idx = np.searchsorted(x[order], grid, side="right")
+    return np.where(idx > 0, cum[np.maximum(idx - 1, 0)], 0.0)
+
+
+def _kish_n_eff(w: FloatArr) -> float:
+    """Kish の有効標本サイズ (Σw)^2 / Σw^2。一様重みなら len(w) に一致する。"""
+    return float(w.sum() ** 2 / np.square(w).sum())
+
+
+def weighted_ks_2samp(x1: FloatArr, x2: FloatArr, w1: FloatArr | None = None,
+                      w2: FloatArr | None = None) -> dict:
+    """重み付き2標本 KS。統計量 sup|F1-F2| は重み付き経験CDF から厳密に出す。
+
+    ★ p 値は近似である。標本サイズを Kish の有効標本サイズに置き換えて
+      Kolmogorov 分布の漸近式（Numerical Recipes の連続性補正つき）に入れる。
+      重み付き KS の厳密な帰無分布は重みの並びに依存し閉形式を持たないため。
+      重みが一様なら n_eff = n となり scipy の ks_2samp と一致する（検定の
+      漸近近似ぶんの差は残る）。p 値を主張の根拠にするなら注意すること。
+    """
+    x1, x2 = np.asarray(x1, dtype=np.float64), np.asarray(x2, dtype=np.float64)
+    wn1, wn2 = _norm_w(len(x1), w1), _norm_w(len(x2), w2)
+    grid = np.union1d(x1, x2)
+    stat = float(np.max(np.abs(_weighted_ecdf(x1, wn1, grid) - _weighted_ecdf(x2, wn2, grid))))
+
+    n1, n2 = _kish_n_eff(wn1), _kish_n_eff(wn2)
+    en = np.sqrt(n1 * n2 / (n1 + n2))
+    pvalue = float(kolmogorov((en + 0.12 + 0.11 / en) * stat))
+    return {"ks": stat, "ks_pvalue": pvalue, "n_eff_1": n1, "n_eff_2": n2}
+
+
 def switch_dist_compare(real: IntArr, gen: IntArr,
                         w_real: FloatArr | None = None,
                         w_gen: FloatArr | None = None) -> dict:
-    """切替回数（1次元量）の分布距離。emd は重み付き、ks は非重み付き。"""
+    """切替回数（1次元量）の分布距離。
+
+    emd / ks は重みを反映する。ks_unw / ks_unw_pvalue は scipy の ks_2samp
+    （重みを取れない）で、重みを外したときの参照値として残してある。
+    両者が食い違うときは、その差がまるごと重みの効果。
+    """
     sr = n_switches(real).astype(np.float64)
     sg = n_switches(gen).astype(np.float64)
     emd = float(wasserstein_distance(sr, sg,
                                      u_weights=None if w_real is None else np.asarray(w_real),
                                      v_weights=None if w_gen is None else np.asarray(w_gen)))
+    wks = weighted_ks_2samp(sr, sg, w_real, w_gen)
     # scipy の検定結果クラスは実行時に組み立てられるので静的には属性が見えない
     ks: Any = ks_2samp(sr, sg)
-    return {"emd": emd, "ks": float(ks.statistic), "ks_pvalue": float(ks.pvalue)}
+    return {"emd": emd,
+            "ks": wks["ks"], "ks_pvalue": wks["ks_pvalue"],
+            "n_eff_real": wks["n_eff_1"], "n_eff_gen": wks["n_eff_2"],
+            "ks_unw": float(ks.statistic), "ks_unw_pvalue": float(ks.pvalue)}
 
 
 def bootstrap_ci(x: FloatArr, w: FloatArr | None = None, n_boot: int = 2000,
@@ -553,7 +597,11 @@ def group_reweight(group_d: IntArr, w_ref: FloatArr, d_ref: IntArr,
 
     生成プールの群構成を実データの群構成へ合わせるだけで、群内の重みの
     ばらつきは再現しない（生成側に個人重みが無いため）。
-    model.py:654-655 の sanity_check の w_gen と同じ作り方。
+
+    ★ 生成側に重みを与える処理はここが唯一の出所。DDPM_Aggregate/model.py の
+      sanity_check と clock_diagnostics.run はどちらもこの関数を呼ぶ。
+      群シェアを非加重の人数比で作ると ATUS 平日で総変動距離 0.139 ずれ、
+      同じモデルの数値が経路によって食い違う。
     """
     wr = np.asarray(w_ref, dtype=np.float64)
     wr = wr / wr.sum()
@@ -908,31 +956,104 @@ def plot_real_vs_gen(real_seqs, gen_seqs, n_act: int, act_names: list[str],
     plt.show()
 
 
-def plot_switch_hist(real: IntArr, gen: IntArr, w_real: FloatArr | None = None,
-                     w_gen: FloatArr | None = None, path: str | Path | None = None,
-                     title: str = "切替回数の分布") -> None:
-    """切替回数のヒストグラム（共通bin）と ECDF の2パネル。平均に縦線を引く。"""
-    sr = n_switches(real).astype(np.float64)
-    sg = n_switches(gen).astype(np.float64)
-    wr, wg = _norm_w(len(sr), w_real), _norm_w(len(sg), w_gen)
-    hi = int(max(sr.max(), sg.max()))
-    bins = np.arange(-0.5, hi + 1.5, 1.0)
+def _stats_box(ax, keys: list[str], real: dict, gen: dict,
+               loc: tuple[float, float], va: str, ha: str) -> None:
+    """統計量を等幅の小表として図中に置く。keys は switch_stats のキー。
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    ax = axes[0]
+    比の列まで入れると図が読めなくなるので real / gen の2列に留める。
+    ラベルは ASCII にする（日本語フォントに等幅が無く、桁が揃わないため）。
+    """
+    lines = [f"{'':<6}{'real':>8}{'gen':>8}"]
+    lines += [f"{k:<6}{real[k]:>8.3f}{gen[k]:>8.3f}" for k in keys]
+    ax.text(loc[0], loc[1], "\n".join(lines), transform=ax.transAxes,
+            va=va, ha=ha, family="monospace", fontsize=8.5,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, edgecolor="0.7"))
+
+
+HIST_STAT_KEYS = ["mean", "var", "std", "cv"]
+ECDF_STAT_KEYS = ["q25", "median", "q75", "p90", "p95"]
+
+
+def _panel_switch_hist(ax, sr: FloatArr, sg: FloatArr, wr: FloatArr, wg: FloatArr,
+                       bins: FloatArr, st_r: dict, st_g: dict,
+                       stat_keys: list[str] | None, y_max: float | None) -> None:
+    """切替回数のヒストグラム（共通bin、破線 = 重み付き平均）を1軸に描く。"""
     ax.hist(sr, bins=bins, weights=wr, alpha=0.55, label="real", color="tab:blue")
     ax.hist(sg, bins=bins, weights=wg, alpha=0.55, label="gen", color="tab:orange")
     ax.axvline(float((wr * sr).sum()), color="tab:blue", ls="--", lw=1.5)
     ax.axvline(float((wg * sg).sum()), color="tab:orange", ls="--", lw=1.5)
     ax.set_xlabel("1日の切替回数"); ax.set_ylabel("割合")
-    ax.set_title("ヒストグラム (破線 = 平均)"); ax.legend()
+    ax.set_title("ヒストグラム (破線 = 平均)"); ax.legend(loc="upper right")
+    if y_max is not None:
+        # 図を並べて比べるときに軸が動くと目盛りの読み替えが要るので、明示指定を優先する
+        ax.set_ylim(0.0, y_max)
+    elif stat_keys:
+        # 分布の山は中央にあるので左上が空く。凡例は右上へ固定して衝突を避ける。
+        # 山が左に寄った分布だと既定の ylim では棒に重なるので、上に余白を足す
+        ax.set_ylim(top=ax.get_ylim()[1] * (1.12 + 0.075 * len(stat_keys)))
+    if stat_keys:
+        _stats_box(ax, stat_keys, st_r, st_g, loc=(0.02, 0.98), va="top", ha="left")
 
-    ax = axes[1]
+
+def _panel_switch_ecdf(ax, sr: FloatArr, sg: FloatArr, wr: FloatArr, wg: FloatArr,
+                       st_r: dict, st_g: dict, stat_keys: list[str] | None) -> None:
+    """切替回数の ECDF を1軸に描く。"""
     for s, w, lab, c in ((sr, wr, "real", "tab:blue"), (sg, wg, "gen", "tab:orange")):
         o = np.argsort(s)
         ax.step(s[o], np.cumsum(w[o]), where="post", label=lab, color=c)
     ax.set_xlabel("1日の切替回数"); ax.set_ylabel("累積割合")
-    ax.set_title("ECDF"); ax.legend(); ax.grid(alpha=0.3)
+    ax.set_title("ECDF"); ax.legend(loc="upper left"); ax.grid(alpha=0.3)
+    if stat_keys:
+        # ECDF は左下から右上へ上がるので右下が空く
+        _stats_box(ax, stat_keys, st_r, st_g, loc=(0.98, 0.02), va="bottom", ha="right")
+
+
+def plot_switch_hist(real: IntArr, gen: IntArr, w_real: FloatArr | None = None,
+                     w_gen: FloatArr | None = None, path: str | Path | None = None,
+                     title: str = "切替回数の分布", show_stats: bool = True,
+                     panels: str = "both", stat_keys: list[str] | None = None,
+                     hist_y_max: float | None = None) -> None:
+    """切替回数のヒストグラムと ECDF。平均に縦線を引く。
+
+    panels: "both" (既定) / "hist" (ヒストグラム単体) / "ecdf" (ECDF単体)。
+
+    show_stats=True のとき、図中に switch_stats の値を置く。2パネルでは
+    ヒストグラム側に 平均・分散・標準偏差・変動係数、ECDF 側に分位点を分けるが、
+    単体表示では分ける相手が居ないので両方をその軸に載せる。
+    図と数表を別々に見比べる必要をなくすためで、値の出所は switch_stats と同一。
+    stat_keys で switch_stats のキーを明示すれば、この既定を上書きできる。
+
+    hist_y_max: ヒストグラムの割合軸の上限。指定すると統計量ぶんの自動余白は
+    付けない（軸を固定したいのに勝手に伸びる方が困るため）。
+    """
+    if panels not in ("both", "hist", "ecdf"):
+        raise ValueError(f"panels は both / hist / ecdf のいずれか: {panels!r}")
+
+    sr = n_switches(real).astype(np.float64)
+    sg = n_switches(gen).astype(np.float64)
+    wr, wg = _norm_w(len(sr), w_real), _norm_w(len(sg), w_gen)
+    hi = int(max(sr.max(), sg.max()))
+    bins = np.arange(-0.5, hi + 1.5, 1.0)
+    st_r, st_g = switch_stats(real, w_real), switch_stats(gen, w_gen)
+
+    if stat_keys is not None:
+        unknown = set(stat_keys) - set(st_r)
+        if unknown:
+            raise ValueError(f"switch_stats に無いキー: {sorted(unknown)}")
+
+    both = panels == "both"
+    hist_keys = stat_keys or (HIST_STAT_KEYS if both else HIST_STAT_KEYS + ECDF_STAT_KEYS)
+    ecdf_keys = stat_keys or (ECDF_STAT_KEYS if both else HIST_STAT_KEYS + ECDF_STAT_KEYS)
+
+    fig, axes = plt.subplots(1, 2 if both else 1,
+                             figsize=(12, 4) if both else (7, 4.5), squeeze=False)
+    row = axes[0]
+    if panels in ("both", "hist"):
+        _panel_switch_hist(row[0], sr, sg, wr, wg, bins, st_r, st_g,
+                           hist_keys if show_stats else None, hist_y_max)
+    if panels in ("both", "ecdf"):
+        _panel_switch_ecdf(row[1 if both else 0], sr, sg, wr, wg, st_r, st_g,
+                           ecdf_keys if show_stats else None)
 
     fig.suptitle(title)
     fig.tight_layout()

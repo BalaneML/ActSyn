@@ -89,6 +89,32 @@ def test_travel_pairing():
     print("  (2) travel_pairing: OK  (往復2本/片道1本/移動なし を数え分け)")
 
 
+def test_travel_am_pm():
+    """(2b) ★午前/午後の境界（slot 32 = 12:00）と P(午後|午前) の定義。"""
+    def with_travel(*slots):
+        row = np.zeros(96, dtype=np.int64)
+        for s in slots:
+            row[s] = 7
+        return row
+
+    # 往復 / 午前だけ（帰らない）/ 午後だけ / 移動なし
+    sched = np.stack([with_travel(10, 60), with_travel(10), with_travel(60),
+                      np.zeros(96, dtype=np.int64)])
+    r = fe.travel_am_pm(sched)
+    assert abs(r["am_travel_rate"] - 0.5) < 1e-12, r
+    assert abs(r["pm_travel_rate"] - 0.5) < 1e-12, r
+    assert abs(r["return_rate P(pm|am)"] - 0.5) < 1e-12, "午前2人中1人が帰っている"
+    assert abs(r["am_only_rate"] - 0.25) < 1e-12, r
+
+    # 境界: slot 31 = 11:45 は午前、slot 32 = 12:00 は午後
+    b = fe.travel_am_pm(np.stack([with_travel(31), with_travel(32)]))
+    assert b["am_travel_rate"] == 0.5 and b["pm_travel_rate"] == 0.5, b
+
+    # 午前に誰も動かなければ P(午後|午前) は定義できない
+    assert np.isnan(fe.travel_am_pm(with_travel(60)[None, :])["return_rate P(pm|am)"])
+    print("  (2b) travel_am_pm: OK  (境界 slot32=12:00, P(午後|午前) の定義)")
+
+
 def test_night_intrusion():
     """(3) ★深夜帯 (slot 80..95) だけを見ていること。"""
     # 深夜に睡眠を1スロットだけ MEALS で割る
@@ -157,6 +183,7 @@ def main():
     print("feasibility のテスト")
     test_episode_count()
     test_travel_pairing()
+    test_travel_am_pm()
     test_night_intrusion()
     test_summary()
 

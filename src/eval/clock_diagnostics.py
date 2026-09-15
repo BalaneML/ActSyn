@@ -165,12 +165,43 @@ def first_onset(sched: IntArr, act: int) -> IntArr:
     return np.argmax(sched[has] == act, axis=1).astype(np.int64)
 
 
+def first_onset_with_weights(sched: IntArr, act: int, w: FloatArr | None = None
+                             ) -> tuple[IntArr, FloatArr | None]:
+    """first_onset に、行動者だけを残した重みを添えて返す (onsets, weights)。
+
+    w=None なら weights も None。重み付き比較（群構成を揃えた比較）で、
+    「その活動をした人」の部分集合に対応する重みを取り出すために要る。
+    """
+    sched = np.asarray(sched)
+    has = (sched == act).any(axis=1)
+    onsets = np.argmax(sched[has] == act, axis=1).astype(np.int64)
+    return onsets, None if w is None else np.asarray(w, dtype=np.float64)[has]
+
+
+def _weighted_std(x: IntArr, w: FloatArr | None) -> float:
+    """重み付き標準偏差（母標準偏差, ddof=0）。w=None なら np.std と一致する。"""
+    xf = np.asarray(x, dtype=np.float64)
+    if w is None:
+        return float(xf.std())
+    mean = float(np.average(xf, weights=w))
+    return float(np.sqrt(np.average((xf - mean) ** 2, weights=w)))
+
+
 def onset_comparison(real: IntArr, gen: IntArr, n_act: int, act_names: list[str],
                      acts: list[str] | None = None,
+                     w_real: FloatArr | None = None, w_gen: FloatArr | None = None,
                      n_boot: int = 60, seed: int = 0) -> pd.DataFrame:
     """★B2: 初回開始時刻の分布距離 (EMD) と標準偏差の比、ノイズ床つき。
 
     std_ratio > 1 は生成側の開始時刻が過分散 = 個人ごとに時刻がぶれている。
+
+    w_real / w_gen を渡すと重み付き経験分布で EMD・中央値・標準偏差を測る。
+    群構成を揃えた比較（実データ側は survey weight、生成側は群構成の再重み付け）
+    をするときは必ず渡す。渡さないと両側とも素の標本になり、群構成が違う
+    プール同士を比べることになる。
+    ★ 床は null_band_2sample の契約どおり「w を再抽出確率として使い、抽出後は
+      一様重みで評価」する。観測値（重み付き）とは推定量が違うが、どちらも
+      同じ母集団量の一致推定量なので突き合わせて読める。
     """
     targets = acts if acts is not None else act_names
     rows = []
@@ -178,18 +209,24 @@ def onset_comparison(real: IntArr, gen: IntArr, n_act: int, act_names: list[str]
         if name not in act_names:
             continue
         a = act_names.index(name)
-        orr, og = first_onset(real, a), first_onset(gen, a)
+        orr, w_orr = first_onset_with_weights(real, a, w_real)
+        og, w_og = first_onset_with_weights(gen, a, w_gen)
         if len(orr) < 30 or len(og) < 30:
             continue                      # 標本が薄すぎる活動は EMD が読めない
-        emd = float(wasserstein_distance(orr.astype(float), og.astype(float)))
+        emd = float(wasserstein_distance(orr.astype(float), og.astype(float),
+                                         w_orr, w_og))
         _, _, emd_hi = im.null_band_2sample(
-            real, _onset_emd_of(a), n_gen=len(gen), n_boot=n_boot, seed=seed)
+            real, _onset_emd_of(a), n_gen=len(gen), n_boot=n_boot, seed=seed, w=w_real)
+        std_real = _weighted_std(orr, w_orr)
+        std_gen = _weighted_std(og, w_og)
         rows.append({
             "activity": name, "n_real": len(orr), "n_gen": len(og),
-            "onset_median_real": float(np.median(orr)),
-            "onset_median_gen": float(np.median(og)),
-            "onset_std_real": float(orr.std()), "onset_std_gen": float(og.std()),
-            "onset_std_ratio": float(og.std() / orr.std()) if orr.std() > 0 else np.nan,
+            "onset_median_real": float(im.weighted_quantile(orr.astype(np.float64),
+                                                            0.5, w_orr)),
+            "onset_median_gen": float(im.weighted_quantile(og.astype(np.float64),
+                                                           0.5, w_og)),
+            "onset_std_real": std_real, "onset_std_gen": std_gen,
+            "onset_std_ratio": float(std_gen / std_real) if std_real > 0 else np.nan,
             "onset_emd": emd, "onset_emd_floor_hi": emd_hi,
             "verdict": "床の内" if emd <= emd_hi else "★床の外",
         })
@@ -226,6 +263,48 @@ def wrap_comparison(real: IntArr, gen: IntArr,
             "wrap_ratio": float(g / r) if r > 0 else np.nan,
             "ci_lo": lo, "ci_hi": hi,
             "verdict": "床の内" if lo <= g <= hi else "★床の外"}
+
+
+# ============================================================
+# B1 の可視化
+# ============================================================
+def plot_curves(real: IntArr, gen: IntArr, n_act: int, act_names: list[str],
+                acts: list[str] | None = None,
+                w_real: FloatArr | None = None, w_gen: FloatArr | None = None,
+                path: Any = None, title: str = "") -> None:
+    """時刻別行動者率カーブを実 vs 生成で重ねる（00:00 開始表示）。
+
+    B1 の peak_ratio が何を測っているかを目で確認するための図。
+    ピークが低く裾が持ち上がっていれば「時計が無い」ことの視覚的な証拠になる。
+    """
+    import matplotlib.pyplot as plt
+
+    targets = [a for a in (acts if acts is not None else act_names) if a in act_names]
+    cr = im.participation_by_slot(real, n_act, w_real)
+    cg = im.participation_by_slot(gen, n_act, w_gen)
+    roll = im.roll_slots()
+
+    n_col = 2
+    n_row = int(np.ceil(len(targets) / n_col))
+    fig, axes = plt.subplots(n_row, n_col, figsize=(11, 2.6 * n_row), squeeze=False)
+    for ax, name in zip(axes.ravel(), targets):
+        a = act_names.index(name)
+        x = np.arange(NUM_SLOTS)
+        ax.plot(x, np.roll(cr[:, a], roll), label="real train", lw=1.6)
+        ax.plot(x, np.roll(cg[:, a], roll), label="gen", lw=1.6, ls="--")
+        ax.set_title(f"{name}  (peak比 {cg[:, a].max() / cr[:, a].max():.3f})", fontsize=10)
+        ax.set_xticks(np.arange(0, NUM_SLOTS + 1, 16))
+        ax.set_xticklabels([f"{h:02d}" for h in range(0, 25, 4)])
+        ax.set_xlim(0, NUM_SLOTS - 1)
+        ax.set_ylabel("行動者率")
+        ax.grid(alpha=0.25)
+    for ax in axes.ravel()[len(targets):]:
+        ax.axis("off")
+    axes.ravel()[0].legend(fontsize=8)
+    fig.suptitle(title or "時刻別行動者率カーブ (real train vs gen)")
+    fig.tight_layout()
+    im._save(fig, path)
+    plt.show()
 
 
 # ============================================================
@@ -399,7 +478,8 @@ def run(n_probe: int = 512, n_shift: int = 256, seed: int = 0,
         print(b1.to_string(index=False))
 
     print("\n=== B2. 初回開始時刻の分布（個人レベルの時刻のぶれ）===")
-    b2 = onset_comparison(sched_real, gen, n_act, act_names, seed=seed)
+    b2 = onset_comparison(sched_real, gen, n_act, act_names,
+                          w_real=w_real, w_gen=w_gen, seed=seed)
     with pd.option_context("display.width", 200, "display.float_format", "{:.3f}".format):
         print(b2.to_string(index=False))
 

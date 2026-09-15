@@ -119,6 +119,31 @@ def travel_pairing_summary(sched: IntArr, w: FloatArr | None = None,
     }
 
 
+def travel_am_pm(sched: IntArr, w: FloatArr | None = None,
+                 travel_act: int = TRAVEL, split_slot: int = 32) -> dict:
+    """午前に出かけた人が午後以降に帰るかを時刻軸で測る。
+
+    travel_pairing_summary は本数だけを見るので「いつ出て、いつ帰るか」が落ちる。
+    往復は「午前に移動あり → 午後以降にも移動あり」として時刻軸に写せる。
+    P(午後|午前) が実データより低ければ「出かけたまま帰ってこない」個票が
+    時刻の並びとして実在することの直接の証拠になる。
+
+    split_slot: 午前/午後の境界スロット。既定 32 は 04:00 開始で 12:00。
+        午前 = slot 0..31 (04:00-12:00)、午後以降 = slot 32..95 (12:00-04:00)。
+    """
+    s = np.asarray(sched)
+    wn = _norm_w(len(s), w)
+    am = (s[:, :split_slot] == travel_act).any(axis=1)
+    pm = (s[:, split_slot:] == travel_act).any(axis=1)
+    p_am = float(wn[am].sum())
+    return {
+        "am_travel_rate": p_am,
+        "pm_travel_rate": float(wn[pm].sum()),
+        "return_rate P(pm|am)": float(wn[am & pm].sum() / p_am) if p_am > 0 else np.nan,
+        "am_only_rate": float(wn[am & ~pm].sum()),    # ★出かけたまま帰ってこない
+    }
+
+
 # ============================================================
 # 2. 睡眠への割り込み ★
 # ============================================================

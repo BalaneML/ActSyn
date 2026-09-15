@@ -309,6 +309,39 @@ def test_dist_compare_and_bootstrap():
     print(f"  (11) 分布距離と bootstrap: OK  (同一入力 emd={d['emd']:.2e}, CI=[{lo:.2f},{hi:.2f}])")
 
 
+def test_weighted_ks():
+    """(11b) 重み付き KS。一様重みで scipy の ks_2samp と統計量が一致すること。
+
+    ここがずれると「real 側は全経路で重み付き」という前提が KS だけ破れる。
+    """
+    from scipy.stats import ks_2samp
+
+    rng = np.random.default_rng(11)
+    for n1, n2 in [(300, 700), (50, 50), (1000, 120)]:
+        x1 = rng.integers(0, 30, n1).astype(np.float64)
+        x2 = rng.integers(0, 30, n2).astype(np.float64)
+        got = im.weighted_ks_2samp(x1, x2)
+        assert abs(got["ks"] - ks_2samp(x1, x2).statistic) < 1e-12, (n1, n2, got)
+        # 一様重みなら Kish の有効標本サイズは素の n に戻る
+        assert abs(got["n_eff_1"] - n1) < 1e-9 and abs(got["n_eff_2"] - n2) < 1e-9, got
+
+    # 重みが統計量に効くこと（同一標本でも重みが違えば距離は 0 でない）
+    x = rng.integers(0, 30, 500).astype(np.float64)
+    w = np.where(x > 15, 10.0, 1.0)
+    assert im.weighted_ks_2samp(x, x, w, w)["ks"] == 0.0
+    assert im.weighted_ks_2samp(x, x, w, None)["ks"] > 0.3
+
+    # switch_dist_compare は重み付き ks と非重み ks_unw を両方返す
+    sched = rng.integers(0, 12, size=(200, 96)).astype(np.int64)
+    other = np.repeat(rng.integers(0, 12, size=(200, 6)), 16, axis=1).astype(np.int64)
+    d = im.switch_dist_compare(sched, other)
+    assert abs(d["ks"] - d["ks_unw"]) < 1e-12, "重み None なら両者は一致する"
+    dw = im.switch_dist_compare(sched, other, rng.random(200) + 0.1, None)
+    assert dw["ks_unw"] == d["ks_unw"], "ks_unw は重みに依存しない"
+    print(f"  (11b) 重み付き KS: OK  (一様重みで scipy と一致, "
+          f"重み違いの同一標本 ks={im.weighted_ks_2samp(x, x, w, None)['ks']:.4f})")
+
+
 def test_compare_tables(sched):
     """compare_frag / compare_activity が形を保つこと（描画は notebook 側で確認）。"""
     a, b = sched[:200], sched[200:400]
@@ -536,6 +569,7 @@ def main():
     test_duration_identities()
     test_weighted_quantile()
     test_dist_compare_and_bootstrap()
+    test_weighted_ks()
     test_compare_tables(sched)
     test_null_band(sched)
     test_dispersion(sched)
