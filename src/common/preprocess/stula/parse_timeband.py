@@ -68,10 +68,10 @@ KEY_RENAME = {
 
 
 def parse_table(path: Path) -> pd.DataFrame:
-    wb = load_workbook(path, read_only=True)
-    ws = wb[wb.sheetnames[0]]
-    rows = ws.iter_rows(values_only=True)
-    grid_head = [next(rows) for _ in range(DATA_START_ROW - 1)]
+    wb = load_workbook(path, read_only=True)  # Excelファイルを読み込む
+    ws = wb[wb.sheetnames[0]]  # Excelファイルの1番左のシートを取得
+    rows = ws.iter_rows(values_only=True)  # 各行ごとに処理するイテレータを作成
+    grid_head = [next(rows) for _ in range(DATA_START_ROW - 1)]  # リスト内に1行目からデータ開始直前までの行データ（ヘッダー等）が格納される
 
     # キー列: 行9で非空のセル / 時刻列: 行7で "NN_H:MM - H:MM" 形式のセル
     key_cols = {c: str(v).strip() for c, v in enumerate(grid_head[HEADER_KEYS_ROW - 1])
