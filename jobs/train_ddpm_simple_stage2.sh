@@ -10,7 +10,7 @@
 #PBS -M yokoyama.jun@ist.osaka-u.ac.jp
 #
 # AggDDPM-Simple Stage 2: 公表集計表だけを教師にした微調整
-# 設計: src/models/DDPM_Aggregate_Simple/Stage2_design.md
+# 設計: src/models/DDPM_Aggregate_Simple/docs/Stage2_design.md
 #
 # 何をするジョブか:
 #   Stage 1（ATUS 個票で事前学習した重み）を出発点に、社会生活基本調査の公表集計表
