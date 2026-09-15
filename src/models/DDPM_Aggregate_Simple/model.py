@@ -3,7 +3,6 @@ model.py
 ================
 集計マッチ転移のための条件付きDDPM（AggDDPM）
 
-
 使い方:
     # Stage1: ATUS 平日・共通12分類・28群で条件付き pretrain
     uv run python src/models/DDPM_Aggregate_Simple/model.py
@@ -530,8 +529,6 @@ def eval_mode(model: nn.Module) -> Iterator[nn.Module]:
     Stage 2 は1回のパラメータ更新の中で2つのモードを行き来する:
         集計側   (sample_differentiable) : eval。評価時と同じ生成器を微分する
         リハーサル側 (Diffusion.loss)      : train。Dropout を効かせた Stage 1 と同じ損失
-    切り替え忘れは例外を出さずに静かに数値を変える（zero-shot 基準線は eval で
-    測ってある）ので、元へ戻す責任を呼び出し側に持たせない。
     """
     was_training = model.training
     model.eval()
@@ -542,54 +539,71 @@ def eval_mode(model: nn.Module) -> Iterator[nn.Module]:
 
 
 class Diffusion:
-    """
-    β schedule と派生バッファを事前計算し、q_sample / loss / sample を提供する
-
-    ★DDPM_Aggregate との差は2点:
-        - sample の clamp が [0,1]（データ表現が {0,1} なので）
-        - ddim_sample を持たない
-    """
+    """Stage1とStage2を実装"""
     def __init__(self, device=DEVICE):
-        """
-        (1000,)ベクトル
-        args:
-            betas: 拡散ステップtにおいてのノイズの強さ
-            alphas: 1-betas
-            acp: alphaの累積積
-            acp_prev: acpの1つずらした
-            sqrt_acp: √{\\bar(α)}
-            sqrt_1m_acp: √{1-\\bar(α)}
-            post_var: 1ステップ前のvar
-            post_coef_x0 / post_coef_xt: 後方平均の係数
+        """β schedule と, そこから導かれるバッファを事前計算する
+
+        Note:
+            以下は全て (T_STEPS,) = (1000,) の1次元テンソル, dtype=float32
+            拡散ステップ t でインデックスして使う
+
+            1. betas: ノイズの強さ β_t, BETA_START=0.0001 から BETA_END=0.02 への線形スケジュール
+            2. alphas: α_t = 1 - β_t
+            3. acp: ᾱ_t = Π α_s (alphas の累積積), acp[0]=0.99990, acp[999]=4.04e-5
+            4. sqrt_acp: √ᾱ_t, q_sample の x0 側の係数
+            5. sqrt_1m_acp: √(1-ᾱ_t), q_sample の eps 側の係数
+            6. post_var: 事後分散 σ²_t = β_t(1-ᾱ_{t-1})/(1-ᾱ_t)
+            7. post_coef_x0: 事後平均の x0_hat 側の係数 β_t·√ᾱ_{t-1}/(1-ᾱ_t)
+            8. post_coef_xt: 事後平均の x_t 側の係数 (1-ᾱ_{t-1})·√α_t/(1-ᾱ_t)
+
+            6〜8 は事後分布 q(x_{t-1}|x_t, x0) の閉形式で, _reverse_step だけが使う
+
+        Args:
+            device: バッファを置くデバイス, default=DEVICE
         """
         betas = torch.linspace(BETA_START, BETA_END, T_STEPS, device=device)
         alphas = 1.0 - betas
-        acp = torch.cumprod(alphas, dim=0)  # 累積積
+        acp = torch.cumprod(alphas, dim=0)
         acp_prev = torch.cat([torch.ones(1, device=device), acp[:-1]])
         self.device = device
         self.betas = betas
         self.alphas = alphas
-        self.acp = acp  # \bar(α)
-        self.sqrt_acp = acp.sqrt()  # √{\bar(α)}
-        self.sqrt_1m_acp = (1.0 - acp).sqrt()  # √{1-\bar(α)}
+        self.acp = acp
+        self.sqrt_acp = acp.sqrt()
+        self.sqrt_1m_acp = (1.0 - acp).sqrt()
         self.post_var = betas * (1.0 - acp_prev) / (1.0 - acp)
         self.post_coef_x0 = betas * acp_prev.sqrt() / (1.0 - acp)
         self.post_coef_xt = (1.0 - acp_prev) * alphas.sqrt() / (1.0 - acp)
 
-    def q_sample(self, x0, t, eps):
-        """
-        x0 から任意のtステップ先の x_t を求める
-        x_t = √ᾱ_t·x0 + √(1-ᾱ_t)·ε
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
+        """x0 から任意のtステップ先の x_t を求める (前向き拡散過程)
+
+        Note:
+            x_t = √ᾱ_t·x0 + √(1-ᾱ_t)·ε
+
+        Args:
+            x0: 拡散対象の活動スケジュール, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96), 値域{0,1}
+            t: 拡散ステップ数, dtype=int64, 値域[0, T_STEPS-1], (B,)
+            eps: 乗せるノイズ, dtype=float32, (B, 12, 96), ~N(0, I), MSE教師
+
+        Returns:
+            ノイズ付きスケジュール x_t, dtype=float32, (B, 12, 96)
         """
         return (self.sqrt_acp[t][:, None, None] * x0
                 + self.sqrt_1m_acp[t][:, None, None] * eps)
 
-    def loss(self, model, sched, cond_idx):
-        """
-        標準 ε 予測 MSE + CFG 条件dropout
+    def loss(self, model: UNet1D, sched: torch.Tensor, cond_idx: torch.Tensor) -> torch.Tensor:
+        """Stage1学習の目的関数, 標準的な ε予測MSEに CFGを組み込んだもの
 
-        ★データ表現が {0,1} に変わっても ε ~ N(0,I) は変わらないので、
-          損失の形も out_conv のゼロ初期化の意味も変わらない
+        Note:
+
+        Args:
+            model: UNet1D
+            sched: 活動スケジュール (インデックス表現), dtype=int64, (B, 96)
+            cond_idx: 条件インデックス, dtype=int64, (B, 3)
+
+        Returns:
+            バッチ損失, dtype=float32, (スカラ)
         """
         x0 = sched_to_x0(sched)  # (B,96)->(B,12,96)∈{0,1}
         t = torch.randint(0, T_STEPS, (x0.size(0),), device=x0.device)  # t~U{0,T-1}
@@ -601,9 +615,22 @@ class Diffusion:
         eps_hat = model(x_t, t, cond_idx, drop_mask)
         return F.mse_loss(eps_hat, eps)  # ノイズ間のMSE
 
-    def _eps(self, model: UNet1D, x, t_scalar, cond_idx, guidance_scale):
-        """
-        CFG 込みの ε 予測。t_scalar は int
+    def _eps(self, model: UNet1D, x: torch.Tensor,
+            t_scalar: int, cond_idx: torch.Tensor | None, guidance_scale: float) -> torch.Tensor:
+        """Classifier-Free Guidance (CFG) を適用した ε予測
+
+        Note:
+            1. tからt-1のノイズ予測のみを行う
+
+        Args:
+            model: UNet1D
+            x: ノイズ付き活動スケジュール, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)
+            t_scalar: 拡散ステップ数, 値域[0, T_STEPS-1]
+            cond_idx: 条件インデックス, dtype=int64, (B, 3)
+            guidance_scale: CFGの強さ
+
+        Returns:
+            CFG適用後の予測ノイズ, dtype=float32, (B, 12, 96)
         """
         t = torch.full((x.size(0),), t_scalar, device=x.device, dtype=torch.long)
         eps_c = model(x, t, cond_idx)
@@ -614,38 +641,35 @@ class Diffusion:
 
     # 逆過程1ステップの式は、以前は sample の中と smoke_test の中に二重に書かれていた。
     # Stage 2（Stage2_design.md §4.3）が微分可能な逆過程を要求するので、3箇所目を
-    # 作らずに済むよう1つの関数へ括り出してある。呼び出し元は sample /
-    # _sample_head / _sample_tail / smoke_test の4つ。
+    # 作らずに済むよう1つの関数へ括り出してある。
+    # 呼び出し元は sample / _sample_head / _sample_tail / smoke_test の4つ。
     @overload
     def _reverse_step(self, model: UNet1D, x: torch.Tensor, ti: int, cond_idx,
-                      guidance_scale: float, z: torch.Tensor | None = ...,
-                      return_aux: Literal[False] = ...) -> torch.Tensor: ...
+                        guidance_scale: float, z: torch.Tensor | None = ...,
+                        return_aux: Literal[False] = ...) -> torch.Tensor: ...
 
     @overload
     def _reverse_step(self, model: UNet1D, x: torch.Tensor, ti: int, cond_idx,
-                      guidance_scale: float, z: torch.Tensor | None,
-                      return_aux: Literal[True]) -> tuple[torch.Tensor, torch.Tensor,
-                                                          torch.Tensor, torch.Tensor]: ...
+                        guidance_scale: float, z: torch.Tensor | None,
+                        return_aux: Literal[True]) -> tuple[torch.Tensor, torch.Tensor,
+                                                            torch.Tensor, torch.Tensor]: ...
 
     def _reverse_step(self, model: UNet1D, x: torch.Tensor, ti: int, cond_idx,
-                      guidance_scale: float, z: torch.Tensor | None = None,
-                      return_aux: bool = False):
-        """
-        ancestral DDPM + CFG の逆過程を1ステップ進める。x_t -> x_{t-1}
+                        guidance_scale: float, z: torch.Tensor | None = None,
+                        return_aux: bool = False):
+        """逆過程を1ステップ進める, x_t -> x_{t-1}
 
-        args:
-            z         : そのステップで加える雑音 (B,12,96)。None なら新しく引く。
-                        ★2パス勾配蓄積は1パス目と同じ z を再注入する必要があるので
-                          引数で受け取れる形にしてある。randn_like 固定にすると2パス化できない
-            return_aux: True なら (x_next, eps_hat, x0_hat, mean) を返す。
-                        smoke_test の assert が中間量を見ているため
+        Args:
+            model: UNet1D, denoiser
+            x: 現在の状態x_t, dtype=float32, (B, 12, 96)
+            ti: 拡散ステップ, 値域[0, T_STEPS-1], スカラー
+            guidance_scale: CFGの強さ, スカラー
+            z: そのステップで加える雑音, デフォルトでtorch.randn_likeで引く, dtype=float32, (B, 12, 96)
+            return_aux: Trueなら中間量を返す, bool, smoke_testのため
 
-        ★clamp は [0,1]。データ表現 {0,1} に合わせてある
-          （DDPM_Aggregate は表現が {-1,+1} なので [-1,1]）
-        ★in-place の clamp_ ではなく clamp を使う。勾配を流す区間で in-place 演算を
-          挟むと autograd がエラーを出す（sample 側の数値は変わらない）
-        ★ti == 0 では post_var[0] = 0 なので z を引かない。乱数の消費順が
-          切り出し前と同じになり、同一シードで sample の出力が1ビットも変わらない
+        Returns:
+            return_aux=False: 1ステップ進めた x_{t-1}, dtype=float32, (B, 12, 96)
+            return_aux=True: (x_next, eps_hat, x0_hat, mean)の4タプル, それぞれdtype=float32, (B, 12, 96)
         """
         eps_hat = self._eps(model, x, ti, cond_idx, guidance_scale)
         x0_hat = (x - self.sqrt_1m_acp[ti] * eps_hat) / self.sqrt_acp[ti]
@@ -660,126 +684,143 @@ class Diffusion:
         return (x_next, eps_hat, x0_hat, mean) if return_aux else x_next
 
     @torch.no_grad()
-    def sample(self, model: UNet1D, cond_idx, guidance_scale=GUIDANCE_SCALE, verbose=False):
-        """
-        ancestral DDPM + CFG
-        cond_idx (M,K) -> スケジュール (M,96) int
+    def sample(self, model: UNet1D, cond_idx: torch.Tensor,
+                guidance_scale: float=GUIDANCE_SCALE, verbose: bool=False) -> torch.Tensor:
+        """M本の条件に基づいた活動スケジュールをサンプリングする
+        
+        Args:
+            model: UNet1D, εを予測する, denoiser
+            cond_idx: 条件インデックス, dtype=int64, (M, 3), Mは生成本数
+            guidance_scale: CFGの強さ s, default=GUIDANCE_SCALE=1.25
+            verbose: Trueなら 200ステップごとに進捗を表示する
 
-        ★@torch.no_grad() はこのメソッドに付けたまま残すこと。_reverse_step 側へ移すと
-          sample_differentiable から呼んでも勾配が一切流れなくなり、しかも例外を出さない
+        Returns:
+            活動スケジュール (インデックス表現), dtype=int64, (M, NUM_SLOTS) = (M, 96)
+            値域[0, NUM_ACT-1]
         """
         model.eval()
-        m = cond_idx.size(0)
+        m = cond_idx.size(0)  # 生成本数
 
         x = torch.randn(m, IN_CH, NUM_SLOTS, device=cond_idx.device)  # x_T~N(0,I)
-        for ti in reversed(range(T_STEPS)):
+        for ti in reversed(range(T_STEPS)): # T_STEPS-1..0
             x = self._reverse_step(model, x, ti, cond_idx, guidance_scale)
             if verbose and ti % 200 == 0:
                 print(f"  sampling t={ti}")
-        return x.argmax(dim=1)
+        return x.argmax(dim=1)  # 微分不可 -> argmaxのため
 
     # --------------------------------------------------------
-    # Stage 2: 末尾 K ステップだけ勾配を保持する逆過程（Stage2_design.md §4.3）
+    # Stage 2: 末尾 K ステップだけ勾配を保持する逆過程
     #
     # 全 1000 ステップの計算グラフは B=28 でも 130.6 GB になり保持できない。
-    # よって末尾 K ステップで打ち切る。
+    # よって末尾 K ステップで打ち切る
     #
-    # ★捨てた項はゼロではない。「古いステップの勾配は指数的に消えるから捨ててよい」
-    #   という説明は誤りで、逆過程1段の倍率はむしろ 1/√α_t > 1 である。
-    #   捨ててよい根拠は「消えるから」ではなく「残した項と向きがほぼ同じだから」で、
-    #   K=1 の勾配は K=32 の勾配と cos ≈ 0.96 で一致する。
-    #   実測は src/eval/diagnostics/stage2_gradient_probe.py、議論は docs/Stage2_design.md §4.2 ②。
-    #
-    # head / tail に分けてあるのは2パス勾配蓄積のため。1パス目で x_K を保存すれば
-    # 前段（999ステップ）は1回で済み、2パス目は tail だけを回せばよい。
+    # head / tail に分けてあるのは2パス勾配蓄積
     # --------------------------------------------------------
-    def _sample_head(self, model: UNet1D, cond_idx, K: int,
-                     guidance_scale=GUIDANCE_SCALE) -> torch.Tensor:
-        """x_T ~ N(0,I) から t = 999 → K まで進めて x_K を返す。グラフを作らない。
 
-        通常のサンプリングと計算内容は完全に同じで、中間活性を保存しないだけ。
-        返り値は detach 済みで、ここでグラフが切れる。
+    def _sample_head(self, model: UNet1D, cond_idx: torch.Tensor,
+                    K: int, guidance_scale: float=GUIDANCE_SCALE) -> torch.Tensor:
+        """x_T ~ N(0,I) から t = 999 → K まで進めて x_K を返す, 計算グラフを作らない
+
+        Args:
+            model: UNet1D, ε予測する, denoiser
+            cond_idx: 条件インデックス, dtype=int64, (M, 3), Mは生成本数
+            K: 勾配を保持する末尾ステップ数
+            guidance_scale: CFGの強さ, default=GUIDANCE_SCALE=1.25
+
+        Returns:
+            残り Kステップ地点での状態 x_K, dtype=float32, (M, IN_CH, NUM_SLOTS) = (M, 12, 96)
         """
         with eval_mode(model), torch.no_grad():
-            x = torch.randn(cond_idx.size(0), IN_CH, NUM_SLOTS, device=cond_idx.device)
-            for ti in reversed(range(K, T_STEPS)):
-                x = self._reverse_step(model, x, ti, cond_idx, guidance_scale)
-        return x.detach()
+            x = torch.randn(cond_idx.size(0), IN_CH, NUM_SLOTS, device=cond_idx.device)  # x_T, (M, 12, 96)
+            for ti in reversed(range(K, T_STEPS)):  # ti = T_STEPS-1...K
+                x = self._reverse_step(model, x, ti, cond_idx, guidance_scale)  # x_t -> x_{t-1}
+        return x.detach()  # 計算グラフを切る
 
-    def _sample_tail(self, model: UNet1D, x_K: torch.Tensor, K: int, cond_idx,
-                     guidance_scale=GUIDANCE_SCALE,
-                     zs: dict[int, torch.Tensor] | None = None) -> torch.Tensor:
-        """x_K から t = K-1 → 0 まで進めて x_0 を返す。★ここだけ計算グラフが作られる。
+    def _sample_tail(self, model: UNet1D, x_K: torch.Tensor, K: int, 
+                    cond_idx: torch.Tensor, guidance_scale: float=GUIDANCE_SCALE,
+                    zs: dict[int, torch.Tensor] | None = None) -> torch.Tensor:
+        """x_K から t = K-1 → 0 まで進めて x_0 を返す, ここだけ計算グラフが作られる
 
-        args:
-            zs: 末尾 K 区間で使う雑音 {ti: z}。None なら新しく引く。
-                2パス目では1パス目と同じものを渡す（別のサンプルを見ないため）。
+        Args:
+            model: UNet1D, εを予測する denoiser
+            x_K: 残りKステップ地点の状態, dtype=float32, (M, IN_CH, NUM_SLOTS) = (M, 12, 96)
+            K: 勾配を保持する末尾ステップ数, ti = K-1 .. 0
+            cond_idx: 条件インデックス, dtype=int64, (M, 3)
+            guidance_scale: CFGの強さs, default=GUIDANCE_SCALE=1.25
+            zs: 末尾 K 区間で使う雑音 {ti: z}
+                2パス目では1パス目と同じものを渡す（別のサンプルを見ないため）
                 ti=0 は雑音を使わないので、キー 0 は無くてよい
+
+        Returns:
+            逆過程 t=0 の出力 x_0, dtype=float32, (M, IN_CH, NUM_SLOTS) = (M, 12, 96)
+            argmaxしていない連続値, 関数外で離散化する
         """
         x = x_K
         with eval_mode(model):
             for ti in reversed(range(K)):
                 x = self._reverse_step(model, x, ti, cond_idx, guidance_scale,
-                                       None if zs is None else zs.get(ti))
+                                        None if zs is None else zs.get(ti))
         return x
 
-    def sample_differentiable(self, model: UNet1D, cond_idx, K: int,
-                              guidance_scale=GUIDANCE_SCALE,
-                              zs: dict[int, torch.Tensor] | None = None) -> torch.Tensor:
-        """打ち切り逆伝播つきサンプリング。(B,12,96) の連続値を返す。
+    def sample_differentiable(self, model: UNet1D, cond_idx: torch.Tensor,
+                                K: int, guidance_scale: float=GUIDANCE_SCALE,
+                                zs: dict[int, torch.Tensor] | None = None) -> torch.Tensor:
+        """Kステップ打ち切り逆伝播つきサンプリング, (B,12,96) の連続値を返す
 
-        ★@torch.no_grad() を付けないこと。付けると勾配が流れないまま例外も出ない。
-        ★返り値は sample と違って argmax していない。t=0 の逆過程出力そのもの。
-          離散化は straight_through が行う
-        ★ti=0 の返り値は x0_hat と厳密には一致しない。post_coef_xt[0] と post_var[0] は
-          厳密に 0 だが、post_coef_x0[0] は実数では 1 でも float32 では 0.99983406 になる
-          （1-acp[0] を引き算で作るときの桁落ち。相対 1.7e-4）。つまり返るのは
-          x0_hat の 0.99983 倍である。softmax も argmax も正のスケールに対して
-          ほぼ不変なので下流への影響は無いが、「厳密に一致する」と書かないこと
-        ★K=0 なら全ステップが no_grad になり、返り値は勾配を持たない
+        Args:
+            model: εを予測, denoiser
+            cond_idx: 条件インデックス, dtype=int64, (B, 3)
+            K: 勾配を保持する末尾ステップ
+            guidance_scale: CFGの強さs, default=GUIDANCE_SCALE=1.25
+            zs: 末尾K区間で使う雑音 {ti: z}
+
+        Returns:
+            逆過程 t=0 の出力 x_0, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)
+            argmaxしない, 離散化は関数外で行う
         """
         x_K = self._sample_head(model, cond_idx, K, guidance_scale)
         return self._sample_tail(model, x_K, K, cond_idx, guidance_scale, zs)
 
 
-def straight_through(x0: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
-    """連続値 (B,12,96) を微分可能に one-hot 化する（Stage2_design.md §2.8）。
+def straight_through(x0: torch.Tensor, tau: float=1.0) -> torch.Tensor:
+    """連続値 (B,12,96) を微分可能に one-hot 化
 
-    なぜ必要か:
-        評価の pool_to_rates は argmax → one-hot → 平均で率を作る。一方 sample_differentiable
-        が返す x0 は各要素が [0,1] にクリップされただけで、活動チャネル方向の和は1にならない
-        （ある時刻で和が 2.0 になる値が普通に出る）。生の x0 の平均を教師に合わせると
-        評価とは別の量を最適化することになる。
-        argmax は階段関数で微分がほぼ至るところ 0 なので、前向きは argmax のまま使い、
-        後ろ向きだけ softmax の微分で置き換える。
-
-    args:
+    Args:
+        x0: 離散化前の活動スケジュール, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)
         tau: softmax の温度。既定 1 で運用し掃引しない。勾配の大きさは tau について
-             単調でなく tau≈0.3 で最大になるが、tau を下げると p が1チャネルに集中して
-             代理が argmax に近づく（置き換えた意味が薄れる）。勾配が効かないときの
-             予備のつまみとして下げる場合も 0.15 を下回らせない
+            単調でなく tau≈0.3 で最大になるが、tau を下げると p が1チャネルに集中して
+            代理が argmax に近づく（置き換えた意味が薄れる）。勾配が効かないときの
+            予備のつまみとして下げる場合も 0.15 を下回らせない
 
-    ★dim=1 は12活動の軸であって時刻軸ではない。テンソルは (B, IN_CH, NUM_SLOTS) = (B,12,96)
-      なので、この softmax は各時刻スロットで12活動に対して正規化する。dim=2 にかけると
-      「各活動が1日のどこか1スロットで起きる」という別物の制約になる
+    Returns:
+        微分可能な one-hot, dtype=float32, (B, 12, 96)
+        前向きは厳密なone-hot, 後ろ向きはsoftmax(x0/tau) の微分が流れる
     """
-    p = F.softmax(x0, dim=1) if tau == 1.0 else F.softmax(x0 / tau, dim=1)
-    # ★F.one_hot は新しい軸を末尾に足す。p.argmax(dim=1) が (B,96) なので
-    #   F.one_hot は (B,96,12) を返す。permute で (B,12,96) に戻さないと形が合わない
+    p = F.softmax(x0 / tau, dim=1)
     oh = F.one_hot(p.argmax(dim=1), NUM_ACT).permute(0, 2, 1).float()
-    # ★括弧が必須。oh + p - p.detach() は左から評価されて (oh + p) - p.detach() になり、
-    #   float32 の丸めで前向きの値が one-hot から 6.0e-08 ずれる。括弧を付ければ厳密に一致する
     return oh + (p - p.detach())
 
 
 # ============================================================
 # 6. 学習
 # ============================================================
-def run_epoch(model, diffusion: Diffusion, loader, optimizer=None):
-    """
-    1エポック分の学習または評価を実行し、平均 ε-MSE を返す。
+def run_epoch(model: UNet1D, diffusion: Diffusion,loader: DataLoader,
+            optimizer: torch.optim.Optimizer | None=None) -> float:
+    """1エポック分の学習または評価を実行し, サンプル加重平均の ε-MSE を返す
 
-    ★EMA を持たないので ema 引数は無い
+    optimizerを渡せば学習, 渡さなければ評価として動く
+
+    Args:
+        model: ノイズ予測器ε_θ
+        diffusion: βスケジュールを持つDiffusion
+        loader:
+            (cond_idx, sched)をyieldするDataLoader
+            cond_idx: 条件インデックス, dtype=int64, (B, 3)
+            sched: 活動スケジュール (インデックス表現), dtype=int64, (B, 96)
+        optimizer: 学習時の最適化器, Noneなら評価モード, default=None
+
+    Returns:
+        エポック平均の ε-MSE, float
     """
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
@@ -802,12 +843,18 @@ def run_epoch(model, diffusion: Diffusion, loader, optimizer=None):
 
 def train(epochs: int = EPOCHS,
             use_wandb: bool = True,
-            save_path: Path | None = MODEL_SAVE_PATH):
-    """
-    save_path=None なら保存しない（--smoke が本番チェックポイントを潰さないため）
+            save_path: Path | None = MODEL_SAVE_PATH) -> UNet1D:
+    """Stage1の学習を実行, val 損失が最良だった重みのモデルを返す
 
-    ★EMA が無いので、val 損失で選ばれた重みがそのまま生成に使われる。
-      DDPM_Aggregate にあった「val は raw・生成は EMA」という不整合は無い
+    ATUS実個票を教師に, 条件付きノイズ予測器 ε_θ(x_t, t, c)を学習
+
+    Args:
+        epochs: 学習エポック数の上限, default=EPOCHS=1000
+        use_wandb: wandbへハイパラと学習曲線を記録するか, default=True
+        save_path: チェックポイントの保存先, Noneなら保存しない
+
+    Returns:
+        best_stateを復元済みのUNet1D, 必ずしも最終エポックのおもみではない
     """
     run = None
     if use_wandb:
@@ -899,20 +946,41 @@ def load_pretrained(path: Path = MODEL_SAVE_PATH) -> nn.Module:
 
 
 # ============================================================
-# 7. 群レベル生成（Stage2 の提案分布 / 評価用）
+# 7. 群レベル生成（評価・チェックポイント選択用）
 # ============================================================
 @torch.no_grad()
 def group_pool(model, n_per_group: int, guidance_scale: float = GUIDANCE_SCALE,
                 verbose: bool = True) -> npt.NDArray[np.int64]:
-    """群別サンプルプール (D, M, 96)。行 d は cond_grid()[d] の条件で生成。
+    """群別サンプルプール (D, M, 96) を生成する。行 d は cond_grid()[d] の条件。
 
-    Stage2 の指数傾けはこのプールを提案分布 p_d として重み付けするので、
-    M が小さいと傾け後の有効サンプル数 (ESS) が枯れる。M は数千を想定。
+    Stage 1 の sanity_check と、Stage 2 のチェックポイント事後選択
+    (stage2_select.evaluate_ckpt) の両方が、ここで作ったプールを
+    pool_to_rates に通して群別行動者率を測る。
 
-    ★sampler / ddim_steps / eta 引数は持たない（ancestral のみ）
-    ★デバイスはモジュール定数 DEVICE ではなく model の実デバイスから取る。
-      Stage 2 の事後選択はチェックポイントを任意のデバイスへ載せて評価するので、
-      両者が食い違うと "Placeholder storage has not been allocated" で落ちる。
+    Args:
+        model: 学習済み UNet1D。Stage 1 でも Stage 2 のチェックポイントでもよい
+        n_per_group: 群あたりの生成本数 M。群別行動者率の推定分散が
+            チェックポイント間の差より小さくなる必要があるので、
+            選択用途では数千を想定 (stage2_select.DEFAULT_N = 2000)
+        guidance_scale: CFG のスケール, default=GUIDANCE_SCALE=1.25
+        verbose: 生成の進捗を print するか, default=True
+
+    Returns:
+        群別サンプルプール, dtype=int64, (D_GROUPS, n_per_group, NUM_SLOTS)
+        = (28, M, 96)。値域 [0, NUM_ACT)
+
+    Note:
+        Stage 2 の学習ループはこの関数を使わない (@torch.no_grad() なので勾配が
+        通らない)。学習側は Diffusion.sample_differentiable を使う。
+        本関数は評価と選択の専用である。
+
+        (群, サンプル) を平坦化してからチャンクする。群ごとに切ると端数バッチが
+        増えて、逆過程 (1000ステップ) の呼び出し効率が落ちるため。
+
+        ★sampler / ddim_steps / eta 引数は持たない（ancestral のみ）
+        ★デバイスはモジュール定数 DEVICE ではなく model の実デバイスから取る。
+          Stage 2 の事後選択はチェックポイントを任意のデバイスへ載せて評価するので、
+          両者が食い違うと "Placeholder storage has not been allocated" で落ちる。
     """
     dev = next(model.parameters()).device
     diffusion = Diffusion(device=dev)
@@ -932,12 +1000,26 @@ def group_pool(model, n_per_group: int, guidance_scale: float = GUIDANCE_SCALE,
 
 def pool_to_rates(pool: npt.NDArray[np.int64],
                     weights: npt.NDArray[np.float64] | None = None) -> npt.NDArray[np.float64]:
-    """サンプルプール -> 群別期待行動者率 (D, n_act*96) act-major。
+    """サンプルプールを群別期待行動者率へ集計する, (D, M, 96) -> (D, n_act*96)
 
-    CVAE_Aggregate.model.group_rates と同一形式（インデックス a*96+t）で返すので、
-    japan_match_experiment.eval_against にそのまま渡せる。
+    Args:
+        pool: 群別サンプルプール, dtype=int64, (D_GROUPS, M, NUM_SLOTS)
+        weights: (D, M) の非負重み。None なら一様平均。
+            無印 DDPM_Aggregate の指数傾けと API を揃えるために残してある。
+            Simple 版の本番経路 (stage2_select / stage2_targets / sanity_check)
+            は全て None で呼ぶ, default=None
 
-    weights: (D, M) の非負重み（指数傾けの結果）。None なら一様（= zero-shot）。
+    Returns:
+        群別期待行動者率, dtype=float64, (D_GROUPS, NUM_ACT * NUM_SLOTS)
+        act-major（インデックス a*96+t）。各スロットで活動方向の和が 1
+
+    Note:
+        CVAE_Aggregate.model.group_rates と同一形式で返すので、
+        japan_match_experiment.eval_against にそのまま渡せる。
+
+        Stage 2 の損失が straight-through の前向きを群平均した量と、この関数の
+        出力が float64 で厳密一致することを test_stage2 が検査している
+        （学習で下げる量と評価で測る量を同じにするため）。
     """
     D, M, T = pool.shape
     onehot = np.eye(NUM_ACT, dtype=np.float64)[pool]        # (D,M,96,n_act)
