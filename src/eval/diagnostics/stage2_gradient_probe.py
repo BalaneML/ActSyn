@@ -185,8 +185,8 @@ def depth_check(ckpt: Path, d_sub: int = 2, n: int = 8, seed: int = 0,
     cond = grid[d_pick].repeat_interleave(n, dim=0)        # (d_sub*n, 3) 群優先
     batch = cond.size(0)
 
-    q = sl.teacher_tensor(st.load_stula_targets(), sm.DEVICE)[d_pick]
-    omega = sl.chi2_weights(q, float("inf"))
+    a_star = sl.teacher_tensor(st.load_stula_targets(), sm.DEVICE)[d_pick]
+    omega = sl.chi2_weights(a_star, float("inf"))
 
     def one_rep(rep_seed: int) -> dict[int, torch.Tensor]:
         """1本の逆過程に対し、K ごとの ∂L/∂θ を返す。"""
@@ -209,7 +209,7 @@ def depth_check(ckpt: Path, d_sub: int = 2, n: int = 8, seed: int = 0,
             x0 = diff._sample_tail(model, state[k], k, cond, sm.GUIDANCE_SCALE, zs_tail)
             y = sm.straight_through(x0)
             a_A, a_B = sl.group_rates_split(y, n)
-            sl.agg_loss_from_rates(a_A, a_B, q, omega).backward()
+            sl.agg_loss_from_rates(a_A, a_B, a_star, omega).backward()
             out[k] = torch.cat([p.grad.flatten() for p in model.parameters()
                                 if p.grad is not None])
         return out

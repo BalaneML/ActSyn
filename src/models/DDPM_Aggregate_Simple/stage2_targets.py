@@ -57,22 +57,17 @@ AGE15_TO_7 = {i: min((i - 1) // 2, 6) for i in range(1, 16)}
 
 
 def d_index(g: int, a: int, e: int) -> int:
-    """(性, 年齢7区分, 就業) -> 群インデックス 0..27。model.py:171 と同じ規則。"""
+    """(性2, 年齢7区分, 就業2) -> 群インデックス 0..27"""
     return g * (N_A * N_E) + a * N_E + e
 
 
 def mask_12act() -> npt.NDArray[np.bool_]:
-    """損失と評価の12活動マスク（OTHER_X を含む）。実際に最適化する対象そのもの。"""
+    """12活動マスク"""
     return np.ones(NUM_COMMON, dtype=bool)
 
 
 def mask_11act() -> npt.NDArray[np.bool_]:
-    """既存の報告値と比較するための11活動マスク（OTHER_X を除く）。
-
-    crosswalk_atus_stula.EXCLUDED の規約は「両側の OTHER_X は構成が違うので
-    『揃った』と扱わない」という評価の比較可能性の話であって、損失に使うかとは別問題。
-    Stage 2 の損失は12チャネルで、評価だけ両方を出す（§6 修正3）。
-    """
+    """11活動マスク"""
     m = np.ones(NUM_COMMON, dtype=bool)
     for c in EXCLUDED:
         m[int(c)] = False
@@ -80,40 +75,42 @@ def mask_11act() -> npt.NDArray[np.bool_]:
 
 
 # ============================================================
-# 教師 A* の構築（P5〜P8）
+# 教師 A* の構築
 # ============================================================
 def load_stula_targets(name: str = DEFAULT_TABLE) -> dict:
-    """timeband CSV -> {"group_rates_tbl": (28,12,96), "pop": (2,7,2)}。率は[0,1]、NaN=非公表。
+    """timeband CSV -> {"group_rates_tbl": (28,12,96), "pop": (2,7,2)}, [0,1]、NaN=非公表
 
-    ★移植元にあった margin_ga / margin_ge / pi_e は移植しない。あれらは公表2表
-      （性×年齢 / 性×就業）への周辺マッチ用で、28群クロス表を直接教師にする
-      Stage 2 では使わない。pop は eval_against が dev_* を作るのに要るので残す。
+    Note:
+        全国・平日は非公表セルは0個, 11大都市圏ではいくつかある
 
-    ★全国・平日では非公表セルは 0 個である（欠測は11大都市圏の145層でだけ起きる）。
-      NaN 経路は地域軸へ拡張したときのために残してあり、現状は1セルも通らない。
+    Args:
+        name: csvファイル名
+
+    Returns:
+        各郡の行動者率と推定人口のdict
     """
     df = pd.read_csv(STULA_DIR / f"{name}.csv")
     df = cast(pd.DataFrame, df[df["region"] == "00_全国"])       # P8: 全国のみ
     com = stula_to_common(df)                                    # P5: 行動20 -> 12（単純和）
-    com["g"] = com["gender"].map({"1_男": 0, "2_女": 1})          # type: ignore
-    com["e"] = com["employment"].map({"1_有業者": 1, "2_無業者": 0})  # type: ignore
+    com["g"] = com["gender"].map({"1_男": 0, "2_女": 1})
+    com["e"] = com["employment"].map({"1_有業者": 1, "2_無業者": 0})
     com["a15"] = com["age_class"].str[:2].map(
         lambda c: int(c) if isinstance(c, str) and c.isdigit() and c != "00" else np.nan)
-    com["a7"] = com["a15"].map(AGE15_TO_7)                        # type: ignore
-    com["ci"] = com["common"].map({c.name: int(c) for c in Common})  # type: ignore
+    com["a7"] = com["a15"].map(AGE15_TO_7)
+    com["ci"] = com["common"].map({c.name: int(c) for c in Common})
 
     # 人口（推定人口・千人）は 行動="00_総数" の行にしか入っていない。
     # 人口は層の属性であって行動の属性ではないため。これが総数行を捨てられない理由で、
     # 率は非定義でも人口の唯一の供給源になっている
     pop_src = cast(pd.DataFrame, df[df["activity"].str.startswith("00_")])
     pop_src = pop_src.assign(
-        g=pop_src["gender"].map({"1_男": 0, "2_女": 1}),            # type: ignore
-        e=pop_src["employment"].map({"1_有業者": 1, "2_無業者": 0}),  # type: ignore
+        g=pop_src["gender"].map({"1_男": 0, "2_女": 1}),
+        e=pop_src["employment"].map({"1_有業者": 1, "2_無業者": 0}),
         a15=pop_src["age_class"].str[:2].map(
             lambda c: int(c) if isinstance(c, str) and c.isdigit() and c != "00" else np.nan),
     ).dropna(subset=["g", "e", "a15"])
     pop15 = np.zeros((N_G, 16, N_E))          # a15 は 1..15（index 0 は使わない）
-    for (g, a15, e), grp in pop_src.groupby(["g", "a15", "e"]):   # type: ignore
+    for (g, a15, e), grp in pop_src.groupby(["g", "a15", "e"]):
         pop15[int(g), int(a15), int(e)] = grp["population_k"].iloc[0]  # type: ignore
     # 5歳2区分ぶんの人口を足して10歳7区分へ。率でなく人数なので単純加算でよい
     pop = np.zeros((N_G, N_A, N_E))
