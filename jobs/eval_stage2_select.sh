@@ -58,11 +58,15 @@ CKPT_DIR="${CKPT_DIR:-${REPO}/outputs/checkpoints/stage2}"
 #   固定名にすると後から回した λ が前の結果を上書きしてしまう。
 OUT_CSV="${OUT_CSV:-${REPO}/data/processed/aggregates/$(basename "${CKPT_DIR}")_selection.csv}"
 DATA="${REPO}/data/processed/atus2024/atus2024_stula_common12_dataset.csv"
+# ★微調整前の重み。step=0 の zero-shot 基準線を同じ n・同じ pool_seed で測るために要る。
+#   妥当性12（§9.6）と多様性6（§9.5b）は ZERO_SHOT_GUARDRAILS に定数が無いので、
+#   これが無いと「悪化させていないか」を判定できない。
+STAGE1="${STAGE1:-${REPO}/outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_20260819.pt}"
 TEACHER="${REPO}/data/processed/stula/timeband_weekday.csv"
 LOG="${WORK}/logs/stage2_select_${PBS_JOBID:-manual}.log"
 
 # --- 事前チェック 1: 入力 ------------------------------------------------
-for f in "${SIF}" "${TEACHER}" "${DATA}"; do
+for f in "${SIF}" "${TEACHER}" "${DATA}" "${STAGE1}"; do
     if [ ! -f "${f}" ]; then
         echo "ERROR: not found: ${f}" >&2
         exit 1
@@ -82,11 +86,12 @@ if [ "${N_CKPT}" -eq 0 ]; then
     echo "       先に jobs/train_ddpm_simple_stage2.sh を流すこと" >&2
     exit 1
 fi
-# 155 秒 / 7168 本 を基準に秒で見積もる（整数演算のため 1000 倍して計算）
-EST_SEC=$(( N_CKPT * 28 * N * 155 / 7168 ))
+# 155 秒 / 7168 本 を基準に秒で見積もる。zero-shot 基準線のぶん 1 本ぶん多く回る
+N_EVAL=$(( N_CKPT + 1 ))
+EST_SEC=$(( N_EVAL * 28 * N * 155 / 7168 ))
 LIMIT_SEC=$(( 5 * 3600 ))
-echo "ckpt=${N_CKPT} 本  n=${N}  pool_seed=${POOL_SEED}"
-echo "生成本数 = ${N_CKPT} × 28 × ${N} = $(( N_CKPT * 28 * N )) 本"
+echo "ckpt=${N_CKPT} 本 + zero-shot 1 本  n=${N}  pool_seed=${POOL_SEED}"
+echo "生成本数 = ${N_EVAL} × 28 × ${N} = $(( N_EVAL * 28 * N )) 本"
 echo "所要見積り = $(( EST_SEC / 3600 ))h $(( (EST_SEC % 3600) / 60 ))m  (枠 5h)"
 if [ "${EST_SEC}" -gt "${LIMIT_SEC}" ]; then
     echo "ERROR: 見積り $(( EST_SEC / 3600 ))h が枠 5h を超えている。" >&2
@@ -107,6 +112,7 @@ mkdir -p "$(dirname "${OUT_CSV}")"
     echo "dirty : $(git status --porcelain 2>/dev/null | wc -l) file(s)"
     echo "ckpt_dir=${CKPT_DIR}  ckpt=${N_CKPT} 本"
     echo "n=${N} pool_seed=${POOL_SEED}"
+    echo "stage1(zero-shot 基準線)=${STAGE1}"
     echo "est=$(( EST_SEC / 3600 ))h $(( (EST_SEC % 3600) / 60 ))m"
     nvidia-smi
     echo "==="
@@ -115,18 +121,22 @@ mkdir -p "$(dirname "${OUT_CSV}")"
 SECONDS=0
 run_gpu python src/models/DDPM_Aggregate_Simple/stage2_select.py \
     --ckpt-dir "${CKPT_DIR}" --n "${N}" --out-csv "${OUT_CSV}" \
-    --pool-seed "${POOL_SEED}" >> "${LOG}" 2>&1
+    --pool-seed "${POOL_SEED}" --stage1-ckpt "${STAGE1}" >> "${LOG}" 2>&1
 status=$?
 
 echo "elapsed: $((SECONDS / 3600))h $(((SECONDS % 3600) / 60))m  (次回の elapstim_req 見直しに使う)"
 
 if [ -f "${OUT_CSV}" ]; then
     echo "書き出し: ${OUT_CSV}  ($(wc -l < "${OUT_CSV}" | tr -d ' ') 行)"
-    echo "次に見る列:"
-    echo "  軸1  rate_mae / dev_rmse   ★dev_rmse が改善しないまま rate_mae だけ下がるのは"
-    echo "                              「さらに平滑化した」だけの可能性がある"
-    echo "  軸2  *_vs_zeroshot          1 を超えたら zero-shot より悪化"
-    echo "  暗記 dcr_gap                ckpt を追って上がるなら暗記寄り"
+    echo "次に見る行（CSV は 1 指標 1 行の縦持ち。statistic 列が循環と非循環を分ける）:"
+    echo "  statistic=slot_rate, metric=rate_mse_split   λ パレート曲線の横軸"
+    echo "     ★metric=rate_mae だけが下がるのは「さらに平滑化した」だけの可能性がある。"
+    echo "       転移したかの判定は metric=dev_rmse で行う"
+    echo "  statistic=diversity                          報酬微調整で最も壊れやすい軸"
+    echo "  statistic=plausibility / sequence            教師が縛らない量＝非循環"
+    echo "  metric=dcr_gap                               step を追って上がるなら暗記寄り"
+    echo "  ★step=0 の行が zero-shot 基準線。vs_zeroshot 列が NaN の指標（妥当性・"
+    echo "    多様性・暗記）は、この step=0 行と比べること"
 else
     echo "WARNING: CSV が書かれていない。ログ末尾を確認すること: ${LOG}" >&2
 fi

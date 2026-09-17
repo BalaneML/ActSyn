@@ -70,6 +70,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -102,6 +103,7 @@ st: Any = _load("simple_stage2_targets", HERE / "stage2_targets.py")
 sl: Any = _load("simple_stage2_loss", HERE / "stage2_loss.py")
 ft: Any = _load("simple_stage2_finetune", HERE / "stage2_finetune.py")
 se: Any = _load("simple_stage2_select", HERE / "stage2_select.py")
+lg: Any = _load("simple_stage2_lgo", HERE / "stage2_lgo.py")
 DEVICE = "cpu"          # テストは決定性重視で CPU 固定
 T_SHORT = 12            # 全1000ステップは重いので、逆過程の往復は短い T で見る
 
@@ -906,7 +908,12 @@ def test_rate_mse_split() -> None:
 
 
 def test_checkpoint_selection() -> None:
-    """(sel) 事後選択が §9.8 の出所列を持ち、LGO で in-teacher と held-out を分けること。"""
+    """(sel) 事後選択が §9.8 の出所列を持ち、LGO で in-teacher と held-out を分けること。
+
+    ★出力は 1 指標 1 行の縦持ちである（実装項目 14）。横持ちだと循環した値
+      （教師適合）と非循環な値（ガードレール）が同じ 1 行に混ざり、後から
+      どちらの性質の数字か区別できなくなる。
+    """
     model = _model()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
     tgt = st.load_stula_targets()
@@ -926,29 +933,225 @@ def test_checkpoint_selection() -> None:
 
     # ★§9.8 の出所列。このリポジトリは数値の出所取り違えを2回起こしている
     for r in rows:
-        for col in ("teacher_groups", "eval_kind", "reference", "mask"):
+        for col in ("teacher_groups", "eval_kind", "reference", "statistic",
+                    "mask", "weight_basis", "metric", "value", "vs_zeroshot"):
             assert col in r, f"出所の列が欠けている: {col}"
-        assert r["reference"] == "teacher"
         assert r["mask"] in ("11act", "12act")
-        assert r["eval_kind"] in ("in-teacher", "held-out")
-    print("  (1) (sel) 全行が teacher_groups / eval_kind / reference / mask を持つ: OK")
+        assert r["eval_kind"] in ("in-teacher", "held-out", "all")
+        assert r["weight_basis"] in ("stula_pop", "atus_comp", "none")
+    print("  (1) (sel) 全行が §9.8 の出所列（statistic / weight_basis を含む）を持つ: OK")
 
-    # LGO なしは in-teacher だけ2行（11act/12act）、LGO ありは held-out も出て4行
-    s1 = [r for r in rows if r["step"] == 1]
-    s2 = [r for r in rows if r["step"] == 2]
-    assert len(s1) == 2 and {r["eval_kind"] for r in s1} == {"in-teacher"}
+    # 軸1（循環）と軸2（非循環）が statistic で機械的に分かれること
+    ax1 = [r for r in rows if r["reference"] == "teacher"]
+    ax2 = [r for r in rows if r["reference"] == "atus"]
+    assert ax1 and ax2
+    assert all(r["statistic"] == "slot_rate" and r["weight_basis"] == "stula_pop"
+               for r in ax1), "軸1 は教師と同じ統計量なので slot_rate / stula_pop"
+    assert all(r["eval_kind"] == "all" for r in ax2), \
+        "軸2 は群で分けずプール全体で測るので eval_kind=all"
+    assert any(r["statistic"] != "slot_rate" for r in ax2)
+    print("  (2) 軸1 は slot_rate（循環）、軸2 は eval_kind=all で分かれる: OK")
+
+    # LGO なしは in-teacher だけ、LGO ありは held-out も出る
+    s1 = [r for r in ax1 if r["step"] == 1]
+    s2 = [r for r in ax1 if r["step"] == 2]
+    assert {r["eval_kind"] for r in s1} == {"in-teacher"}
     assert all(r["teacher_groups"] == 28 for r in s1)
-    assert len(s2) == 4 and {r["eval_kind"] for r in s2} == {"in-teacher", "held-out"}
+    assert {r["eval_kind"] for r in s2} == {"in-teacher", "held-out"}
     assert all(r["teacher_groups"] == 24 for r in s2)
-    held = [r for r in s2 if r["eval_kind"] == "held-out" and r["mask"] == "12act"][0]
-    assert held["n_cells"] == 4 * 12 * 96, "held-out のセル数が4群ぶんでない"
-    print("  (2) LGO 無しは in-teacher のみ、有りは held-out 4群が分かれて出る: OK")
+    held_cells = [r["value"] for r in s2 if r["eval_kind"] == "held-out"
+                  and r["mask"] == "12act" and r["metric"] == "n_cells"]
+    assert held_cells == [float(4 * 12 * 96)], "held-out のセル数が4群ぶんでない"
+    print("  (3) LGO 無しは in-teacher のみ、有りは held-out 4群が分かれて出る: OK")
 
-    # 軸2 のガードレールが全部載っていること（基準は zero-shot 値、§9.5）
+    # 軸2 の指標集合が GUARDRAIL_META と厳密に一致すること。
+    # ★片側だけ増やすと statistic / weight_basis の分類漏れが起きる。meta_of が
+    #   KeyError で落とす側と、この検査で META の書き過ぎを止める側の両方が要る
+    got = {r["metric"] for r in ax2}
+    assert got == set(se.GUARDRAIL_META), \
+        f"GUARDRAIL_META とずれている: 不足={set(se.GUARDRAIL_META) - got} 余分={got - set(se.GUARDRAIL_META)}"
     for key in se.GUARDRAIL_KEYS:
-        assert key in rows[0] and math.isfinite(rows[0][key]), f"ガードレール欠落: {key}"
-    print(f"  (3) 軸2 のガードレール {len(se.GUARDRAIL_KEYS)} 指標が全行に載る: OK")
+        assert key in got, f"ガードレール欠落: {key}"
+    print(f"  (4) 軸2 の {len(got)} 指標が GUARDRAIL_META と一致: OK")
+
+    # 実装項目 13（妥当性12）と多様性・暗記が配線されていること
+    by_stat: dict[str, set[str]] = {}
+    for r in ax2:
+        by_stat.setdefault(r["statistic"], set()).add(r["metric"])
+    assert len(by_stat["plausibility"]) == 15, "妥当性12 + feasibility3 が揃っていない"
+    assert len(by_stat["diversity"]) == 6, "多様性6 指標が揃っていない"
+    assert len(by_stat["memorization"]) == 5
+    assert "sleep_holder_rate" in by_stat["plausibility"]
+    assert "pairwise_hamming_std" in by_stat["diversity"]
+    print(f"  (5) statistic 別: " + " / ".join(
+        f"{k}={len(v)}" for k, v in sorted(by_stat.items())) + ": OK")
+
+    # zero-shot 基準がある指標だけ vs_zeroshot が有限になる
+    for r in ax2:
+        has_base = r["metric"] in se.ZERO_SHOT_GUARDRAILS
+        assert math.isfinite(r["vs_zeroshot"]) == has_base, \
+            f"{r['metric']}: vs_zeroshot の有無が基準の有無と合っていない"
+    print("  (6) vs_zeroshot は zero-shot 実測がある指標にだけ入る: OK")
+
+    # 実装項目 15 の rate_mse_split が軸1 に載る
+    assert any(r["metric"] == "rate_mse_split" for r in ax1), "rate_mse_split が軸1 に無い"
+    print("  (7) rate_mse_split が軸1 に載る（λ パレート曲線の横軸）: OK")
+
+    # 端末表示の pivot が落ちないこと。
+    # ★CSV は pivot より前に書き終わっているので落ちても結果は失われないが、
+    #   12 世代 × 6 本を評価した最後で落ちると読む手が止まる
+    ax1_tbl, ax2_tbl = se.summarize(pd.DataFrame(rows))
+    assert list(ax1_tbl.columns) == list(se.SUMMARY_AXIS1)
+    assert list(ax2_tbl.columns) == list(se.SUMMARY_AXIS2)
+    # 軸1 は step1 の in-teacher と step2 の in-teacher / held-out で3行
+    assert len(ax1_tbl) == 3, f"軸1 の行数が合わない: {len(ax1_tbl)}"
+    # 軸2 は ckpt ごとに1行（群で分けないので eval_kind では増えない）
+    assert len(ax2_tbl) == 2, f"軸2 の行数が合わない: {len(ax2_tbl)}"
+    print("  (8) summarize が軸1（step × eval_kind）と軸2（step）を分けて返す: OK")
     print("test_checkpoint_selection: OK")
+
+
+def test_zeroshot_baseline() -> None:
+    """(zs) zero-shot 基準線が Stage 2 の世代と同じ経路・同じ乱数で測られること。
+
+    ★経路が分かれると基準線と評価値が別の定義・別の乱数で作られ、「悪化させて
+      いないか」の判定が成り立たなくなる。Stage 1 ckpt は ck.load_ckpt が期待する
+      形式ではないので読み口だけ別になるが、その先は evaluate_model を共有する。
+    """
+    model = _model()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    tgt = st.load_stula_targets()
+    cond_idx, sched_real, w_real, _ = sm.load_data()
+    d_real = sm.cond_to_d(cond_idx)
+
+    with tempfile.TemporaryDirectory() as tmp, _short_T():
+        d = Path(tmp)
+        # 同じ重みを Stage 1 形式（"model" キーだけ）と Stage 2 形式の両方で保存する
+        s1_path = d / "ddpm_simple_pretrain_common12_weekday_test.pt"
+        torch.save({"model": model.state_dict()}, s1_path)
+        ck.save_ckpt(ck.ckpt_path(d, 1), model, opt, 1, {"K": 1, "n": 4, "holdout": []})
+
+        zs = se.evaluate_zeroshot(s1_path, tgt, sched_real, d_real, w_real,
+                                  n=2, device=DEVICE)
+        s2 = se.evaluate_ckpt(ck.ckpt_path(d, 1), tgt, sched_real, d_real, w_real,
+                              n=2, device=DEVICE)
+
+    assert {r["step"] for r in zs} == {0}
+    assert {r["eval_kind"] for r in zs} == {"in-teacher", "all"}, \
+        "zero-shot は 28 群すべてで測るので held-out 行は出ない"
+    assert all(r["teacher_groups"] == 28 for r in zs)
+    assert all(r["ckpt"] == s1_path.name for r in zs)
+    print("  (1) (zs) step=0 / teacher_groups=28 / held-out 行なし: OK")
+
+    # ★同じ重み・同じ pool_seed なら読み口が違っても全指標が一致する
+    def _key(r: dict) -> tuple:
+        return (r["eval_kind"], r["mask"], r["metric"])
+    zs_map = {_key(r): r["value"] for r in zs}
+    s2_map = {_key(r): r["value"] for r in s2}
+    assert set(zs_map) == set(s2_map), "行の集合が経路で違う"
+    worst = max(abs(zs_map[k] - s2_map[k]) for k in zs_map)
+    assert worst < 1e-12, f"経路によって値が変わる: max|Δ|={worst:.3e}"
+    print(f"  (2) (zs) Stage 1 経路と Stage 2 経路で全 {len(zs_map)} 指標が一致 "
+          f"(max|Δ|={worst:.1e}): OK")
+    print("test_zeroshot_baseline: OK")
+
+
+def test_lgo_folds() -> None:
+    """(lgo) 28 群が人口シェアで層化された 4群 × 7 fold の分割になること。
+
+    ★分割（partition）であって抽出ではない。stage2_finetune.stratified_holdout は
+      乱数で k 群を引くので全群を覆わないし重複もしうる。こちらは全群が
+      ちょうど 1 回ずつ held-out になる。
+    """
+    tgt = st.load_stula_targets()
+    folds = lg.stratified_folds(tgt["pop"])
+
+    flat = [d for f in folds for d in f]
+    assert len(folds) == lg.N_FOLDS
+    assert all(len(f) == 4 for f in folds), "fold のサイズが 4 でない"
+    assert sorted(flat) == list(range(st.D_GROUPS)), "28 群の分割になっていない"
+    print("  (1) (lgo) 28 群がちょうど 1 回ずつ、4群 × 7 fold に分かれる: OK")
+
+    # ★決定的であること。fold が実行ごとに変わると、どの群がどの fold で
+    #   held-out だったかを後から再現できない
+    assert lg.stratified_folds(tgt["pop"]) == folds
+    print("  (2) 乱数を使わず、同じ pop なら同じ分割: OK")
+
+    # 層化が効いていること。群シェアの開きに対して fold 間の開きが十分小さい
+    pop = np.asarray(tgt["pop"], dtype=np.float64).reshape(st.D_GROUPS)
+    share = pop / pop.sum()
+    group_spread = float(share.max() / share.min())
+    fold_share = lg.fold_shares(tgt["pop"], folds)
+    fold_spread = float(fold_share.max() / fold_share.min())
+    assert abs(fold_share.sum() - 1.0) < 1e-12, "fold のシェア合計が 1 でない"
+    assert fold_spread < 1.5, f"層化が効いていない: fold 間 {fold_spread:.2f} 倍"
+    print(f"  (3) 群シェアは {group_spread:.1f} 倍の開きだが fold 間は "
+          f"{fold_spread:.2f} 倍に収まる: OK")
+
+    # 割り切れない分割は落とす
+    try:
+        lg.stratified_folds(tgt["pop"], 5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("28 群を 5 分割できてしまった")
+    print("  (4) 割り切れない n_folds は ValueError: OK")
+    print("test_lgo_folds: OK")
+
+
+def test_lgo_collect() -> None:
+    """(lgo) fold の結果 CSV を束ねるとき、分割の破れを検出すること。"""
+    def _write(path: Path, holdout: list[int], value: float) -> None:
+        pd.DataFrame([
+            {"eval_kind": "held-out", "mask": "12act", "metric": "rate_mae",
+             "value": value, "holdout": str(holdout), "step": 300},
+            {"eval_kind": "in-teacher", "mask": "12act", "metric": "rate_mae",
+             "value": 0.0, "holdout": str(holdout), "step": 300},
+        ]).to_csv(path, index=False)
+
+    folds = lg.stratified_folds(st.load_stula_targets()["pop"])
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        paths = []
+        for i, f in enumerate(folds):
+            p = d / f"fold{i}.csv"
+            _write(p, f, 0.01 * (i + 1))
+            paths.append(p)
+
+        held = lg.collect_heldout(paths)
+        assert len(held) == lg.N_FOLDS, "held-out 行だけが集まるはず"
+        assert set(held["source_csv"]) == {p.name for p in paths}
+        print(f"  (1) (lgo) {lg.N_FOLDS} fold の held-out 行だけが集まる: OK")
+
+        dist = lg.heldout_distribution(held, metrics=("rate_mae",))
+        assert int(dist.loc["rate_mae", "count"]) == lg.N_FOLDS
+        assert abs(float(dist.loc["rate_mae", "mean"]) - 0.04) < 1e-12
+        print(f"  (2) 分布が出る (mean={float(dist.loc['rate_mae', 'mean']):.4f}): OK")
+
+        # ★同じ群を 2 回 held-out にすると平均がその群へ寄る。黙って通してはいけない
+        bad = d / "bad.csv"
+        _write(bad, folds[0], 0.99)
+        try:
+            lg.collect_heldout(paths + [bad])
+        except ValueError as e:
+            assert "複数の fold" in str(e)
+        else:
+            raise AssertionError("群の重複を見逃した")
+        print("  (3) 同じ群が 2 回 held-out なら ValueError: OK")
+
+        # held-out 行が無い CSV（28群すべて教師で学習した結果）も落とす
+        none_ho = d / "no_heldout.csv"
+        pd.DataFrame([{"eval_kind": "in-teacher", "mask": "12act",
+                       "metric": "rate_mae", "value": 0.02, "holdout": "[]",
+                       "step": 300}]).to_csv(none_ho, index=False)
+        try:
+            lg.collect_heldout([none_ho])
+        except ValueError as e:
+            assert "held-out 行が無い" in str(e)
+        else:
+            raise AssertionError("held-out 行が無い CSV を見逃した")
+        print("  (4) held-out 行が無い CSV は ValueError: OK")
+    print("test_lgo_collect: OK")
 
 
 # ============================================================
@@ -1287,10 +1490,14 @@ def test_memorization_guardrail() -> None:
     assert abs(out["dcr_gap"]) < 3.0, f"交絡が残っている: dcr_gap={out['dcr_gap']}"
     print(f"  (2) 無相関データで dcr_gap={out['dcr_gap']:+.3f}（交絡なし）: OK")
 
-    # 事後選択の行に載ること
-    src = inspect.getsource(se.evaluate_ckpt)
-    assert "memorization_guardrail" in src
-    print("  (3) evaluate_ckpt が呼んで CSV の列にする: OK")
+    # 事後選択の行に載ること。★呼び出しは evaluate_model にある（evaluate_ckpt と
+    #   evaluate_zeroshot が共有する側）。ソース検査だけだと分類漏れを拾えないので、
+    #   §9.8 の statistic に memorization として登録されていることも見る
+    assert "memorization_guardrail" in inspect.getsource(se.evaluate_model)
+    for k in ("dcr_train", "dcr_holdout", "dcr_gap", "exact_copy_rate", "n_ref_per_side"):
+        assert se.GUARDRAIL_META[k] == ("memorization", "none"), \
+            f"{k} の statistic / weight_basis が memorization / none でない"
+    print("  (3) evaluate_model が呼び、statistic=memorization として CSV に載る: OK")
     print("test_memorization_guardrail: OK")
 
 
@@ -1355,17 +1562,27 @@ def test_select_common_random_numbers() -> None:
       乱数差か区別できなくなる（n=2000 のセル当たり MC 標準偏差は最大 0.0112、
       rate_mae の水準 0.0288 と同じ桁）。
     """
-    src = inspect.getsource(se.evaluate_ckpt)
-    load_at = src.index("ck.load_ckpt")
-    seed_at = src.index("torch.manual_seed(pool_seed)")
-    pool_at = src.index("sm.group_pool")
-    assert load_at < seed_at < pool_at, \
-        "torch.manual_seed が load_ckpt の後・group_pool の前に無い"
-    print("  (1) (crn) load_ckpt -> manual_seed(pool_seed) -> group_pool の順: OK")
+    # ★順序は2つの関数にまたがる。evaluate_ckpt が ck.load_ckpt で RNG を壊し、
+    #   その後に呼ぶ evaluate_model が生成の直前で seed を置き直す
+    ck_src = inspect.getsource(se.evaluate_ckpt)
+    assert ck_src.index("ck.load_ckpt") < ck_src.index("evaluate_model("), \
+        "evaluate_ckpt が load_ckpt より先に evaluate_model を呼んでいる"
+    model_src = inspect.getsource(se.evaluate_model)
+    assert model_src.index("torch.manual_seed(pool_seed)") < model_src.index("sm.group_pool"), \
+        "torch.manual_seed が group_pool の前に無い"
+    print("  (1) (crn) load_ckpt -> evaluate_model -> manual_seed(pool_seed) "
+          "-> group_pool の順: OK")
 
     # 出所の列として CSV に残ること
-    assert '"pool_seed": pool_seed' in src
+    assert '"pool_seed": pool_seed' in ck_src
     print("  (2) pool_seed が出力行に載る（§9.8 の出所列）: OK")
+
+    # ★zero-shot 基準線も同じ evaluate_model を通ること。読み口だけが別で
+    #   （Stage 1 ckpt は ck.load_ckpt の形式ではない）、生成と採点は共有する
+    zs_src = inspect.getsource(se.evaluate_zeroshot)
+    assert "sm.load_pretrained" in zs_src and "evaluate_model(" in zs_src, \
+        "evaluate_zeroshot が evaluate_model を通っていない"
+    print("  (3) zero-shot 基準線も同じ evaluate_model を通る: OK")
     print("test_select_common_random_numbers: OK")
 
 
@@ -1389,6 +1606,9 @@ def main() -> None:
     test_eval_against_subset()
     test_rate_mse_split()
     test_checkpoint_selection()
+    test_zeroshot_baseline()
+    test_lgo_folds()
+    test_lgo_collect()
     test_naive_accumulation_is_wrong()
     test_two_pass_matches_full_batch()
     test_two_pass_memory_scaling()
