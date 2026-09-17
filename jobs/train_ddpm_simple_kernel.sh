@@ -1,13 +1,11 @@
 #!/bin/bash
 #PBS -q SQUID-S
-#PBS --group=G16263
 #PBS -l elapstim_req=01:30:00
 #PBS -l cpunum_job=38
 #PBS -l gpunum_job=1
 #PBS -N dt_simple_kernel
 #PBS -r n
 #PBS -m e
-#PBS -M yokoyama.jun@ist.osaka-u.ac.jp
 #
 # Conv の受容野アブレーション（AggDDPM-Simple の kernel_size スイープ）。
 #
@@ -31,7 +29,7 @@
 #   outputs/generated/ddpm_simple_pretrain_samples_k${KERNEL}.csv
 #
 # 投入手順:
-#   for k in 1 3 5 7; do KERNEL=$k qsub -v KERNEL jobs/train_ddpm_simple_kernel.sh; done
+#   for k in 1 3 5 7; do KERNEL=$k jobs/submit.sh -v KERNEL jobs/train_ddpm_simple_kernel.sh; done
 #
 # elapstim_req=01:30:00 の根拠:
 #   同一構成の本学習 (job 1120951) が実測 7 分。k=7 は畳み込みが約2倍になるが
@@ -42,7 +40,7 @@ cd "${PBS_O_WORKDIR}"
 source jobs/_common.sh
 
 EPOCHS="${EPOCHS:-1000}"
-KERNEL="${KERNEL:?KERNEL を指定すること（例: KERNEL=1 qsub -v KERNEL ...）}"
+KERNEL="${KERNEL:?KERNEL を指定すること（例: KERNEL=1 jobs/submit.sh -v KERNEL ...）}"
 
 case "${KERNEL}" in
     1|3|5|7) ;;

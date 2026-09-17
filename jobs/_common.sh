@@ -1,15 +1,22 @@
 #!/bin/bash
 # 全ジョブスクリプトから source される共通設定。
 # 単体で実行するものではない。
-#
-# ★ 利用開始時に GROUP を自分のグループ名に書き換える（フロントエンドで `groups` で確認できる）。
-#   各ジョブスクリプト冒頭の `#PBS --group=` も同じ値に揃える必要がある。
-#   まとめて置換する場合:
-#       sed -i 's/<グループ名>/実際のグループ名/' jobs/*.sh
 
 set -u
 
-GROUP="<グループ名>"
+# --- グループ名 -----------------------------------------------------------
+# 利用者ごとに違うのでリポジトリには置かず、jobs/local.env（git 管理外）から読む。
+# 初回のみ次を実行すること:
+#     cp jobs/local.env.example jobs/local.env   # そのあと自分の値を書く
+# 投入時は jobs/submit.sh が同じファイルを読み、qsub --group= へ渡す。
+_ENV_FILE="$(dirname "${BASH_SOURCE[0]}")/local.env"
+if [ ! -f "${_ENV_FILE}" ]; then
+    echo "ERROR: ${_ENV_FILE} が無い。cp jobs/local.env.example jobs/local.env" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "${_ENV_FILE}"
+GROUP="${GROUP:?GROUP が jobs/local.env に無い}"
 
 # work 領域。home は 10GB 上限なので、コード・データ・出力・キャッシュはすべてここに置く。
 WORK="/sqfs/work/${GROUP}/${USER}"

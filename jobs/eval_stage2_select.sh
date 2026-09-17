@@ -1,13 +1,11 @@
 #!/bin/bash
 #PBS -q SQUID-S
-#PBS --group=G16263
 #PBS -l elapstim_req=05:00:00
 #PBS -l cpunum_job=38
 #PBS -l gpunum_job=1
 #PBS -N dt_stage2_select
 #PBS -r n
 #PBS -m e
-#PBS -M yokoyama.jun@ist.osaka-u.ac.jp
 #
 # Stage 2 の事後チェックポイント選択（教師適合 × ガードレール）
 # 設計: src/models/DDPM_Aggregate_Simple/docs/Stage2_design.md §8.4 / §9.8
@@ -41,11 +39,14 @@
 #   logs/stage2_select_${PBS_JOBID}.log
 #
 # 投入手順:
-#   qsub jobs/eval_stage2_select.sh
+#   jobs/submit.sh jobs/eval_stage2_select.sh
 #
 #   環境変数で上書きできる:
 #     N=2000 POOL_SEED=12345 CKPT_DIR=... OUT_CSV=...
-#   例: N=1000 qsub -v N jobs/eval_stage2_select.sh
+#   例: N=1000 jobs/submit.sh -v N jobs/eval_stage2_select.sh
+#   λ 掃引の 1 本を採点する（CKPT_DIR は学習ジョブが出力したもの）:
+#     CKPT_DIR=${REPO}/outputs/checkpoints/stage2_lam0.01 N=1000 \
+#         jobs/submit.sh -v CKPT_DIR,N jobs/eval_stage2_select.sh
 
 cd "${PBS_O_WORKDIR}"
 source jobs/_common.sh
@@ -53,7 +54,9 @@ source jobs/_common.sh
 N="${N:-2000}"
 POOL_SEED="${POOL_SEED:-12345}"
 CKPT_DIR="${CKPT_DIR:-${REPO}/outputs/checkpoints/stage2}"
-OUT_CSV="${OUT_CSV:-${REPO}/data/processed/aggregates/stage2_checkpoint_selection.csv}"
+# ★出力も CKPT_DIR ごとに分ける。λ 掃引では ckpt ディレクトリが λ ごとに分かれるので、
+#   固定名にすると後から回した λ が前の結果を上書きしてしまう。
+OUT_CSV="${OUT_CSV:-${REPO}/data/processed/aggregates/$(basename "${CKPT_DIR}")_selection.csv}"
 DATA="${REPO}/data/processed/atus2024/atus2024_stula_common12_dataset.csv"
 TEACHER="${REPO}/data/processed/stula/timeband_weekday.csv"
 LOG="${WORK}/logs/stage2_select_${PBS_JOBID:-manual}.log"

@@ -41,3 +41,10 @@ viz/
 # generated
 slides/
 outputs/
+
+# jobs
+# 投入時のローカル設定（グループ名・メールアドレス）。jobs/local.env.example は追跡する。
+jobs/local.env
+# PBS がジョブ投入ディレクトリに吐く標準出力・標準エラー
+dt_*.o[0-9]*
+dt_*.e[0-9]*

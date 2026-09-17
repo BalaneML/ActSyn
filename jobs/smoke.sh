@@ -1,6 +1,5 @@
 #!/bin/bash
 #PBS -q DBG
-#PBS --group=<グループ名>
 #PBS -l elapstim_req=00:10:00
 #PBS -l cpunum_job=38
 #PBS -l gpunum_job=1
@@ -11,7 +10,7 @@
 # 本番ジョブを投入する前に必ずこれを通すこと。GPU はポイント消費が CPU の約6倍で、
 # 環境不備で落ちるジョブは丸ごと無駄になる。
 #
-# 投入: qsub jobs/smoke.sh
+# 投入: jobs/submit.sh jobs/smoke.sh
 
 cd "${PBS_O_WORKDIR}"
 source jobs/_common.sh

@@ -1,13 +1,11 @@
 #!/bin/bash
 #PBS -q SQUID-S
-#PBS --group=<グループ名>
 #PBS -l elapstim_req=01:00:00
 #PBS -l cpunum_job=38
 #PBS -l gpunum_job=1
 #PBS -N dt_dit_stage1
 #PBS -r n
 #PBS -m e
-#PBS -M <メールアドレス>
 #
 # Stage1（pretrain）の本学習: AggDDPM の denoiser を Diffusion Transformer
 # (src/models/DDPM_Aggregate_DiT/model.py; Peebles & Xie 2023) に置き換えた条件付き学習。
@@ -28,12 +26,12 @@
 #   outputs/generated/ddpm_dit_xs_p1_pretrain_samples.csv
 #
 # 投入手順:
-#   qsub jobs/smoke.sh                          # 先に DBG(10分) で通すこと
-#   qsub jobs/train_ddpm_dit.sh                 # 本学習（既定: 1000ep, size=xs, patch=1）
-#   EPOCHS=1500 qsub -v EPOCHS jobs/train_ddpm_dit.sh
-#   SIZE=t qsub -v SIZE jobs/train_ddpm_dit.sh          # Tang w0.5 と同容量 (4.14M)
-#   SIZE=s qsub -v SIZE jobs/train_ddpm_dit.sh          # DiT-S 忠実 (32.4M)
-#   PATCH=2 qsub -v PATCH jobs/train_ddpm_dit.sh        # 1トークン=30分。断片化への効果を見る
+#   jobs/submit.sh jobs/smoke.sh                          # 先に DBG(10分) で通すこと
+#   jobs/submit.sh jobs/train_ddpm_dit.sh                 # 本学習（既定: 1000ep, size=xs, patch=1）
+#   EPOCHS=1500 jobs/submit.sh -v EPOCHS jobs/train_ddpm_dit.sh
+#   SIZE=t jobs/submit.sh -v SIZE jobs/train_ddpm_dit.sh          # Tang w0.5 と同容量 (4.14M)
+#   SIZE=s jobs/submit.sh -v SIZE jobs/train_ddpm_dit.sh          # DiT-S 忠実 (32.4M)
+#   PATCH=2 jobs/submit.sh -v PATCH jobs/train_ddpm_dit.sh        # 1トークン=30分。断片化への効果を見る
 #   （SIZE / PATCH を変えるとチェックポイント名も変わるので既定構成の結果は潰れない）
 #
 # elapstim_req=01:00:00 の根拠:
