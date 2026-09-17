@@ -156,7 +156,7 @@ def test_activity_labels() -> None:
     """(e) 活動ラベルの取り違えが無いこと。
 
     WORK=2 / SCHOOL=3 / HOUSEWORK=4 / CAREGIVING=5 の並びは一度取り違えている
-    （Stage2_design.md §9.3）。ここでは2通りで確かめる:
+    （Stage2_design.md §9.2）。ここでは2通りで確かめる:
         1. 全国の時間シェアが crosswalk_atus_stula.md の公表値と一致する（±0.1pt）
         2. ピークの時刻が常識と合う。s0 = 04:00 なので
            WORK は勤務時間帯 09:00-17:00（s20..s52）、SLEEP は深夜（s72..s8）
