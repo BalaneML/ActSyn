@@ -78,7 +78,10 @@ VAL_EVERY="${VAL_EVERY:-10}"
 STAGE1="${REPO}/outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_20260819.pt"
 TEACHER="${REPO}/data/processed/stula/timeband_weekday.csv"
 DATA="${REPO}/data/processed/atus2024/atus2024_stula_common12_dataset.csv"
-CKPT_DIR="${REPO}/outputs/checkpoints/stage2"
+# ★λ ごとに保存先を分ける。CKPT_DIR を明示すればそちらを使う。
+#   分けないと、複数の λ を同時に投入したときに同じディレクトリへ書き合い、
+#   下の「過去の世代を退避」も互いに踏み合って結果が混ざる。
+CKPT_DIR="${CKPT_DIR:-${REPO}/outputs/checkpoints/stage2_lam${LAM}}"
 LOG="${WORK}/logs/simple_stage2_${PBS_JOBID:-manual}.log"
 
 echo "steps=${STEPS} d_sub=${D_SUB} n=${N} K=${K} chunk=${CHUNK} eps=${EPS} loss=${LOSS} lam=${LAM}"
@@ -181,8 +184,9 @@ N_CKPT="$(ls -1 "${CKPT_DIR}"/stage2_step*.pt 2>/dev/null | wc -l)"
 if [ "${N_CKPT}" -gt 0 ]; then
     echo "checkpoints saved: ${N_CKPT} 世代 in ${CKPT_DIR}"
     echo "次は事後選択（別ジョブ。生成に 1〜4 時間かかる）:"
-    echo "  jobs/submit.sh jobs/eval_stage2_select.sh"
-    echo "  粗い掃引の段階なら N=1000 jobs/submit.sh -v N jobs/eval_stage2_select.sh で半分の時間"
+    echo "  CKPT_DIR=${CKPT_DIR} jobs/submit.sh -v CKPT_DIR jobs/eval_stage2_select.sh"
+    echo "  粗い掃引の段階なら N=1000 も付ける:"
+    echo "  CKPT_DIR=${CKPT_DIR} N=1000 jobs/submit.sh -v CKPT_DIR,N jobs/eval_stage2_select.sh"
 else
     echo "WARNING: checkpoint が1つも書かれていない。ログ末尾を確認すること: ${LOG}" >&2
 fi
