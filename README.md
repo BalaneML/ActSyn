@@ -194,7 +194,7 @@ uv run python src/models/DDPM_Aggregate_Simple/stage2_finetune.py --smoke
 uv run python src/models/DDPM_Aggregate_Simple/stage2_finetune.py \
     --steps 300 --d-sub 7 --n 256 --K 1 --eps inf --lam auto
 
-# 事後チェックポイント選択
+# 事後チェックポイント選択（全 ckpt を共通乱数で生成して比べる。SQUID は qsub jobs/eval_stage2_select.sh）
 uv run python src/models/DDPM_Aggregate_Simple/stage2_select.py \
     --ckpt-dir outputs/checkpoints/stage2 --n 2000
 ```
@@ -208,12 +208,27 @@ uv run python src/models/DDPM_Aggregate_Simple/stage2_select.py \
 | `--K N` | 勾配を保持する末尾ステップ数（DRaFT-K） |
 | `--chunk N` | 1度に勾配を保持する個票数。0 で自動。B 未満なら2パス勾配蓄積へ切替 |
 | `--eps V` | 損失の重み床。`inf` = 素の MSE（主A）、`0.01` = χ²（主B） |
-| `--lam V` | リハーサル重み。`auto` で初回の L_agg / L_atus 比から決める |
+| `--lam V` | リハーサル重み。`auto` で最初の5更新の \|L_agg\| / L_atus の中央値から決めて固定。**★`auto` の値 X では集計側が更新方向の 3.4% しか占めない**（実測）。掃引は `{0, 0.01X, 0.03X, 0.1X, 0.3X, X}` |
+| `--val-every N` | ATUS val 分割の ε-MSE を測る間隔。0 で無効。リハーサル項の過学習を見る |
 | `--holdout-groups d1,d2,...` | leave-groups-out。損失から外す群（生成と評価は常に全28群） |
-| `--resume` | 最新チェックポイントから再開 |
+| `--resume` | 最新チェックポイントから再開。torch / numpy 両方の RNG と λ を引き継ぐ |
 
 `--holdout-groups` を使うと held-out 側の評価が非循環になる。全28群を教師にした条件での
 教師適合は「集計にどこまで合わせられるかの上限」であって、汎化の主張ではない。
+
+**学習ログで最初に見るのは `agg_gnorm_*`（集計側だけで θ に載った勾配の L2 ノルム）である。**
+`L_agg` も `rate_mae` も straight-through と `clamp` より上流の量なので、代理勾配が潰れて
+θ が全く動いていなくても正常値を出す。空回りが見えるのはこれと `x0_floor_frac`
+（下側 `clamp` の飽和率、zero-shot 0.338）だけである。
+
+**★`λ` の既定（`auto`）では集計側は更新方向をほとんど動かさない。** 実測で
+`λ‖g_atus‖ / ‖g_agg‖ = 22〜51 倍`、さらに `cos(g_agg, g_atus) = −0.27` で
+**2 つの勾配は逆を向いている**（リハーサルは ATUS へ、集計は日本へ引く）。
+`λ=X` では集計成分は更新の 3.4%、`0.03X` で 86.6% になる。詳細と実測表は
+`docs/Stage2_implementation.md` §6.2。
+
+**事後選択は別ジョブ**（`jobs/eval_stage2_select.sh`）。12 ckpt × n=2000 で約 4 時間かかる。
+粗い掃引の段階は `SAVE_EVERY=50` と `--n 1000` で 1 時間に落とせる。
 
 ---
 
@@ -296,6 +311,8 @@ uv run python src/models/DDPM_Aggregate_Simple/test_stage2.py
 │   │   └── DDPM_Aggregate_Simple/          簡素版 + Stage2 パラメータ微調整一式
 │   └── eval/                               個票指標 / 実現可能性 / 時計診断（モデル非依存）
 ├── jobs/                                   SQUID (PBS) ジョブスクリプト
+│   ├── train_ddpm_simple_stage2.sh      Stage 2 の学習（約 3.2 時間）
+│   └── eval_stage2_select.sh            Stage 2 の事後選択（生成に 1〜4 時間）
 ├── container/                              Singularity イメージ定義とビルド手順
 ├── data/                                   生データ・前処理結果（Git 管理外）
 └── outputs/                                チェックポイント・生成結果（Git 管理外）

@@ -12,10 +12,22 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     8. teacher_mask と --holdout-groups       stage2_finetune.py
     9. 事後チェックポイント選択                stage2_select.py
    11. 2パス勾配蓄積（gradient caching）      stage2_finetune.py
+   12. 学習ループの監視と λ の決め方          stage2_finetune.py / stage2_select.py
 
 検証する内容:
     (ckpt) save_ckpt -> load_ckpt の往復で model/optimizer/step/RNG が戻る。
            一時ファイルが残らない。latest_ckpt が step を数値順で選ぶ
+    (np)   ★numpy の RNG（群サブサンプリング）も往復する。torch 側だけ戻しても
+           再開後の d_pick は step 1 からの並びを繰り返す（例外は出ない）
+    (shape) K=0 / D_sub=0 / 奇数 n を、生成を1回でも回す前に落とす
+    (gn)   θ の勾配ノルムが層別 LR の群ごとに取れる
+    (x0)   ★clamp の飽和と straight-through の鋭さが観測できる。L_agg も
+           g_diagnostics も clamp より上流なので、これ無しでは空回りが見えない
+    (lam)  λ=auto が1更新の外れ値で決まらない
+    (val)  ★val の ε-MSE が決定的で、学習の乱数もモードも汚さない
+    (mem-g) ★暗記チェックが参照集合のサイズ交絡を持ち込まない
+    (jsd-mem) jsd は chunk を使えないので K×B で予算判定する
+    (crn)  事後選択が全 ckpt を同じ乱数列（common random numbers）で生成する
     (f2)   _reverse_step が旧インライン式と厳密一致し、smoke_test が通る
     (f)    同一シードで sample_differentiable(K=0) が sample と一致
            ＝ 切り出しリファクタで生成の数値が1ビットも変わっていない
@@ -32,7 +44,7 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     (lr)   層別 LR の分割が条件経路と conv/attention を取り違えていない
     (mem)  K×D_sub×n の予算超過を学習前に落とす
     (lgo)  teacher_mask が損失群だけを外し、人口層化が大小を混ぜる
-    (sel)  事後選択が §9.4 の出所4列を必ず持ち、in-teacher と held-out を分ける
+    (sel)  事後選択が §9.8 の出所列を必ず持ち、in-teacher と held-out を分ける
     (d)    ピークメモリが K に線形かつ n に依存しない
     (e)    ★2パス蓄積の勾配が一括計算と一致する（近似ではない）
     (e2)   2パス目に1パス目と同じ zs を渡すと x_0 が一致する
@@ -50,6 +62,7 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
 """
 import contextlib
 import importlib.util
+import inspect
 import math
 import sys
 import tempfile
@@ -146,7 +159,13 @@ def test_checkpoint_roundtrip() -> None:
         path = ck.ckpt_path(d, 250)
         assert path.name == "stage2_step250.pt"
         rng_at_save = torch.get_rng_state()   # ★save_ckpt が payload に入れるのはこの状態
-        ck.save_ckpt(path, model, opt, 250, {"K": 1, "n": 256})
+        # ★numpy 側も渡す。群サブサンプリング d_pick はこの Generator から引く
+        np_rng = np.random.default_rng(42)
+        np_rng.integers(0, 100, size=7)       # 保存前に何回か消費しておく
+        next_after_save = np_rng.integers(0, 10**9, size=3).tolist()
+        np_rng.bit_generator.state = np.random.default_rng(42).bit_generator.state
+        np_rng.integers(0, 100, size=7)       # 保存時点の状態へ戻す
+        ck.save_ckpt(path, model, opt, 250, {"K": 1, "n": 256}, np_rng=np_rng)
         assert path.exists()
         assert not path.with_suffix(".tmp").exists(), "一時ファイルが残っている"
         print("  (1) save_ckpt: 保存され .tmp が残らない: OK")
@@ -175,6 +194,19 @@ def test_checkpoint_roundtrip() -> None:
         step_ml, _ = ck.load_ckpt(path, model2, map_location=sm.DEVICE)
         assert step_ml == 250
         print(f"  (2b) map_location={sm.DEVICE} でも RNG を復元できる: OK")
+
+        # ★(np) numpy の RNG（群サブサンプリング）も往復すること。
+        #   torch 側だけ戻しても d_pick は step 1 からの並びを繰り返す（例外は出ない）
+        fresh = np.random.default_rng(0)             # 保存時とは無関係な状態から始める
+        ck.load_ckpt(path, model2, np_rng=fresh)
+        assert fresh.integers(0, 10**9, size=3).tolist() == next_after_save, \
+            "numpy の RNG が復元されていない（再開後の d_pick が別系列になる）"
+        # np_rng を渡さなければ numpy 側は触らない（評価用途で副作用を出さない）
+        untouched = np.random.default_rng(0)
+        before = untouched.bit_generator.state
+        ck.load_ckpt(path, model2)
+        assert untouched.bit_generator.state == before
+        print("  (2c) (np) numpy RNG も往復し、np_rng 未指定なら触らない: OK")
 
         # 上書き保存しても既存が壊れない（atomic な差し替え）
         ck.save_ckpt(path, model, opt, 250, {"K": 1, "n": 256})
@@ -661,32 +693,38 @@ def test_layered_lr() -> None:
     """(lr) 層別 LR の分割（§8.3）。条件経路と conv/attention を取り違えていないこと。"""
     model = _model()
     opt = ft.build_optimizer(model)
-    assert len(opt.param_groups) == 2
-    cond_g, conv_g = opt.param_groups
-    assert cond_g["lr"] == ft.LR_COND and conv_g["lr"] == ft.LR_CONV
-    assert ft.LR_COND > ft.LR_CONV, "条件経路の方が高い LR でなければならない"
+    assert ft.PARAM_GROUP_NAMES == ("cond", "emb", "conv")
+    assert len(opt.param_groups) == 3
+    cond_g, emb_g, conv_g = opt.param_groups
+    assert cond_g["lr"] == ft.LR_COND and emb_g["lr"] == ft.LR_EMB \
+        and conv_g["lr"] == ft.LR_CONV
+    assert ft.LR_COND > ft.LR_EMB > ft.LR_CONV, \
+        "cond > emb > conv の順でなければならない（emb は時刻と条件の共有路）"
 
-    cond_names = [n for n, _ in model.named_parameters()
-                  if any(k in n for k in ft.COND_PATH_KEYS)]
-    conv_names = [n for n, _ in model.named_parameters()
-                  if not any(k in n for k in ft.COND_PATH_KEYS)]
-    # 条件経路に入るべきもの / 入ってはいけないもの
-    assert any("cond_embeds" in n for n in cond_names)
-    assert any("cond_proj" in n for n in cond_names)
-    assert "null_emb" in cond_names
-    assert any("emb_proj" in n for n in cond_names)
-    assert not any(".conv1." in n or ".conv2." in n for n in cond_names), \
+    groups = ft.split_param_groups(model)
+    names = {k: [n for n, p in model.named_parameters()
+                 if any(p is q for q in v)] for k, v in groups.items()}
+    # cond には「群ごとに違う値を持つ」ものだけが入る
+    assert any("cond_embeds" in n for n in names["cond"])
+    assert any("cond_proj" in n for n in names["cond"])
+    assert "null_emb" in names["cond"]
+    # ★emb_proj は cond ではなく emb へ。時刻埋め込みとの和を受けるため
+    assert not any("emb_proj" in n for n in names["cond"]), \
+        "emb_proj が cond 群へ混入している（時刻応答まで 1e-4 で動いてしまう）"
+    assert all("emb_proj" in n for n in names["emb"]) and names["emb"]
+    assert not any(".conv1." in n or ".conv2." in n for n in names["cond"]), \
         "畳み込みが条件経路へ混入している"
-    assert any("out_conv" in n for n in conv_names)
-    assert any("attn" in n for n in conv_names)
+    assert any("out_conv" in n for n in names["conv"])
+    assert any("attn" in n for n in names["conv"])
 
-    n_cond = sum(p.numel() for p in cond_g["params"])
-    n_conv = sum(p.numel() for p in conv_g["params"])
-    assert n_cond + n_conv == sum(p.numel() for p in model.parameters()) == 1_759_124
-    # §8.1: cond_embeds+cond_proj+null_emb = 4,680、emb_proj×11 = 312,512
-    assert n_cond == 4_680 + 312_512, f"条件経路のパラメータ数が §8.1 と違う: {n_cond}"
-    print(f"  (1) (lr) 条件経路 {n_cond:,} / conv・attn {n_conv:,} "
-          f"（§8.1 の内訳と一致）: OK")
+    n = {k: sum(p.numel() for p in v) for k, v in groups.items()}
+    assert sum(n.values()) == sum(p.numel() for p in model.parameters()) == 1_759_124
+    # §8.1: cond_embeds 72 + cond_proj 4,352 + null_emb 256 = 4,680、emb_proj×11 = 312,512
+    assert n["cond"] == 4_680, f"群専用の条件パラメータ数が §8.1 と違う: {n['cond']}"
+    assert n["emb"] == 312_512, f"emb_proj のパラメータ数が §8.1 と違う: {n['emb']}"
+    print(f"  (1) (lr) cond {n['cond']:,} (0.27%) / emb {n['emb']:,} / "
+          f"conv {n['conv']:,}（§8.1 の内訳と一致）: OK")
+    print(f"  (2) emb_proj は cond ではなく emb 群（LR {ft.LR_EMB:g}）: OK")
     print("test_layered_lr: OK")
 
 
@@ -703,6 +741,39 @@ def test_memory_budget() -> None:
             raise AssertionError(f"予算超過が弾かれていない: {bad}")
     print("  (1) (mem) D_sub=24 は通り、28 と K=4 と n=1024 は落ちる: OK")
     print("test_memory_budget: OK")
+
+
+def test_check_shapes() -> None:
+    """(shape) K / D_sub / n の前提を、生成を1回でも回す前に落とすこと。
+
+    ★どれも以前は「生成（本番で約40秒）の後に」壊れていた。K=0 は resolve_chunk の
+      budget//K が ZeroDivisionError、奇数 n は group_rates_split の ValueError。
+    """
+    ft.check_shapes(1, 7, 256)
+    ft.check_shapes(3, 1, 2)
+    for bad, why in (((0, 7, 256), "K=0"), ((-1, 7, 256), "K<0"),
+                     ((1, 0, 256), "D_sub=0"),
+                     ((1, 7, 255), "n が奇数"), ((1, 7, 0), "n=0")):
+        try:
+            ft.check_shapes(*bad)
+        except SystemExit:
+            continue
+        raise AssertionError(f"{why} が弾かれていない: {bad}")
+    print("  (1) (shape) K=0 / D_sub=0 / 奇数 n を SystemExit で弾く: OK")
+
+    # ★K=0 は resolve_chunk / check_memory_budget 単体でも ZeroDivisionError ではなく
+    #   SystemExit にする（テストが K=0 を別用途で使うので CLI から届いてしまう）
+    for fn, args in ((ft.resolve_chunk, (0, 7, 256)),
+                     (ft.check_memory_budget, (0, 7, 256))):
+        try:
+            fn(*args)
+        except SystemExit:
+            continue
+        except ZeroDivisionError as e:
+            raise AssertionError(f"{fn.__name__} が ZeroDivisionError のまま: {e}") from e
+        raise AssertionError(f"{fn.__name__} が K=0 を弾いていない")
+    print("  (2) K=0 が resolve_chunk / check_memory_budget でも SystemExit: OK")
+    print("test_check_shapes: OK")
 
 
 def test_teacher_mask_and_holdout() -> None:
@@ -755,7 +826,7 @@ def test_eval_against_subset() -> None:
 
 
 def test_checkpoint_selection() -> None:
-    """(sel) 事後選択が §9.4 の出所4列を持ち、LGO で in-teacher と held-out を分けること。"""
+    """(sel) 事後選択が §9.8 の出所列を持ち、LGO で in-teacher と held-out を分けること。"""
     model = _model()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
     tgt = st.load_stula_targets()
@@ -773,7 +844,7 @@ def test_checkpoint_selection() -> None:
             rows.extend(se.evaluate_ckpt(ck.ckpt_path(d, step), tgt, sched_real, d_real,
                                          w_real, n=2, device=DEVICE))
 
-    # ★§9.4 の出所4列。このリポジトリは数値の出所取り違えを2回起こしている
+    # ★§9.8 の出所列。このリポジトリは数値の出所取り違えを2回起こしている
     for r in rows:
         for col in ("teacher_groups", "eval_kind", "reference", "mask"):
             assert col in r, f"出所の列が欠けている: {col}"
@@ -793,7 +864,7 @@ def test_checkpoint_selection() -> None:
     assert held["n_cells"] == 4 * 12 * 96, "held-out のセル数が4群ぶんでない"
     print("  (2) LGO 無しは in-teacher のみ、有りは held-out 4群が分かれて出る: OK")
 
-    # 軸2 のガードレールが全部載っていること（基準は zero-shot 値、§9.2）
+    # 軸2 のガードレールが全部載っていること（基準は zero-shot 値、§9.5）
     for key in se.GUARDRAIL_KEYS:
         assert key in rows[0] and math.isfinite(rows[0][key]), f"ガードレール欠落: {key}"
     print(f"  (3) 軸2 のガードレール {len(se.GUARDRAIL_KEYS)} 指標が全行に載る: OK")
@@ -886,23 +957,25 @@ def test_two_pass_matches_full_batch() -> None:
         for chunk in (total, 12, 6, 1):
             model.zero_grad(set_to_none=True)
             torch.manual_seed(7)          # zs と x_T を参照と同じに引き直す
-            loss, got_A, got_B = ft._aggregate_step_two_pass(
+            loss, got_A, got_B, diag = ft._aggregate_step_two_pass(
                 diff, model, cond, K, n, q, omega, chunk, 1.0)
             assert abs(loss - ref_val) < 1e-6, f"損失が一致しない (chunk={chunk})"
             assert torch.equal(got_A, a_A.detach()) and torch.equal(got_B, a_B.detach())
             absd, rel = _max_grad_diff(_grads(model), ref)
             # float32 の丸め誤差レベル。設計書 §2.9 の実測は 5.96e-08（絶対）
             assert rel < 1e-5, f"勾配が一致しない (chunk={chunk}): 相対 {rel:.2e}"
+            # x_0 診断は chunk に依らない（同じ x_0 を見ているため）
+            assert set(diag) == {"x0_floor_frac", "x0_max", "st_p_max_mean"}, diag
             print(f"  (2) (e) chunk={chunk:3d}: 勾配 max|Δ|={absd:.2e}（相対 {rel:.1e}）: OK")
 
         # aggregate_step が chunk>=B で1パス、chunk<B で2パスへ分かれること
         model.zero_grad(set_to_none=True)
         torch.manual_seed(7)
-        one, _, _ = ft.aggregate_step(diff, model, cond, K, n, q, omega, total, "sq")
+        one, _, _, _ = ft.aggregate_step(diff, model, cond, K, n, q, omega, total, "sq")
         one_g = _grads(model)
         model.zero_grad(set_to_none=True)
         torch.manual_seed(7)
-        two, _, _ = ft.aggregate_step(diff, model, cond, K, n, q, omega, 6, "sq")
+        two, _, _, _ = ft.aggregate_step(diff, model, cond, K, n, q, omega, 6, "sq")
         assert abs(one - two) < 1e-6, "1パスと2パスで損失が違う"
         _, rel = _max_grad_diff(_grads(model), one_g)
         assert rel < 1e-5, f"1パスと2パスで勾配が違う: 相対 {rel:.2e}"
@@ -993,6 +1066,229 @@ def test_resolve_chunk() -> None:
     print("test_resolve_chunk: OK")
 
 
+# ============================================================
+# 12. 学習ループの監視（θ の勾配・x_0 診断・λ の決め方）
+# ============================================================
+def test_grad_norms() -> None:
+    """(gn) 層別 LR の群ごとに θ の勾配ノルムが取れること。
+
+    ★これが「Stage 2 が実際に θ を動かしているか」を見る唯一の量である。
+      L_agg も rate_mae も g_diagnostics も straight-through と clamp の上流なので、
+      代理勾配が潰れて θ が全く動かなくても正常値を出す。
+    """
+    model = _model()
+    opt = ft.build_optimizer(model)
+
+    # 勾配が無い状態では全て 0
+    zero = ft.grad_norms(opt, "agg")
+    assert zero == {f"agg_gnorm_{k}": 0.0 for k in ft.PARAM_GROUP_NAMES}, zero
+
+    model(torch.randn(2, sm.IN_CH, sm.NUM_SLOTS), torch.zeros(2, dtype=torch.long),
+          _cond(2)).square().mean().backward()
+    got = ft.grad_norms(opt, "total")
+    assert set(got) == {f"total_gnorm_{k}" for k in ft.PARAM_GROUP_NAMES}, got
+    assert all(v > 0 for v in got.values()), got
+
+    # param_groups の並びが split_param_groups と一致していること。
+    # ★ここがずれると「conv のノルムを cond として報告する」壊れ方をする
+    groups = ft.split_param_groups(model)
+    for name in ft.PARAM_GROUP_NAMES:
+        sq = sum(float(p.grad.pow(2).sum()) for p in groups[name] if p.grad is not None)
+        assert abs(got[f"total_gnorm_{name}"] - math.sqrt(sq)) < 1e-5, name
+    print("  (1) (gn) " + " / ".join(
+        f"{k} {got[f'total_gnorm_{k}']:.3e}" for k in ft.PARAM_GROUP_NAMES)
+        + "、群の割り当ても一致: OK")
+    print("test_grad_norms: OK")
+
+
+def test_x0_diagnostics() -> None:
+    """(x0) clamp の飽和と straight-through の鋭さが観測できること。
+
+    ★逆過程の各段は x0_hat を clamp(0,1) する。clamp は飽和した要素の勾配を
+      厳密に 0 にするので、飽和が増えるほど代理勾配が痩せる。L_agg からは見えない。
+    """
+    # 下側 clamp は厳密に 0.0 になる（post_coef_xt[0] が厳密 0 なので混ざらない）
+    x0 = torch.zeros(2, sm.NUM_ACT, sm.NUM_SLOTS)
+    x0[:, 3] = 0.9998
+    d = ft._x0_diagnostics(x0)
+    # 12チャネル中 11 が 0 に張り付いている
+    assert abs(d["x0_floor_frac"] - 11 / 12) < 1e-6, d
+    assert abs(d["x0_max"] - 0.9998) < 1e-6, d
+    # softmax(τ=1) の最大値。設計書 §2.8 の最悪ケース 0.198 と一致する
+    assert abs(d["st_p_max_mean"] - 0.198) < 5e-3, d
+    print(f"  (1) (x0) floor {d['x0_floor_frac']:.4f} / "
+          f"p_max {d['st_p_max_mean']:.4f}（§2.8 の 0.198）: OK")
+
+    # 飽和が無ければ floor は 0
+    d2 = ft._x0_diagnostics(torch.full((2, sm.NUM_ACT, sm.NUM_SLOTS), 0.5))
+    assert d2["x0_floor_frac"] == 0.0 and abs(d2["st_p_max_mean"] - 1 / 12) < 1e-6, d2
+    print("  (2) 飽和が無ければ floor=0、p_max は一様 1/12: OK")
+
+    # 実際の生成（短い T）でも同じキーが出て、値域が壊れていないこと
+    with _short_T() as diff:
+        model = _model()
+        cond = _cond(2).repeat_interleave(2, dim=0)
+        _, _, _, diag = ft.aggregate_step(
+            diff, model, cond, 1, 2,
+            torch.rand(2, sm.NUM_ACT, sm.NUM_SLOTS),
+            torch.ones(2, sm.NUM_ACT, sm.NUM_SLOTS), cond.size(0), "sq")
+    assert 0.0 <= diag["x0_floor_frac"] <= 1.0 and diag["st_p_max_mean"] >= 1 / 12
+    print(f"  (3) aggregate_step からも取れる（floor={diag['x0_floor_frac']:.3f}）: OK")
+    print("test_x0_diagnostics: OK")
+
+
+def test_val_epsilon_mse() -> None:
+    """(val) val の ε-MSE が決定的で、学習の乱数もモードも汚さないこと。
+
+    ★Diffusion.loss は t と ε を大域 RNG から引く。素朴に呼ぶと学習側の乱数列が
+      ずれて --resume の再現性が壊れる。また Stage 2 は train と eval を 1 更新の
+      中で行き来するので、モードを戻さないと集計側に dropout が乗る。
+    """
+    with _short_T() as diff:
+        model = _model()
+        cond_idx = torch.as_tensor(sm.cond_grid()[:8], device=DEVICE)
+        sched = torch.randint(0, sm.NUM_ACT, (8, sm.NUM_SLOTS), device=DEVICE)
+        loader = [(cond_idx[:4], sched[:4]), (cond_idx[4:], sched[4:])]
+
+        # 同じ seed なら何度呼んでも同じ値（毎回 t を引き直さない）
+        a = ft.val_epsilon_mse(diff, model, loader, DEVICE)
+        b = ft.val_epsilon_mse(diff, model, loader, DEVICE)
+        assert a == b, f"val が決定的でない: {a} vs {b}"
+        assert ft.val_epsilon_mse(diff, model, loader, DEVICE, seed=1) != a, \
+            "seed を変えても値が変わらない（t/ε を引いていない）"
+        print(f"  (1) (val) 同じ seed で決定的（{a:.6f}）、seed を変えると動く: OK")
+
+        # 大域 RNG を汚さない
+        torch.manual_seed(123)
+        before = torch.randn(3)
+        torch.manual_seed(123)
+        ft.val_epsilon_mse(diff, model, loader, DEVICE)
+        assert torch.equal(torch.randn(3), before), \
+            "val の評価が学習側の乱数列をずらしている（--resume が壊れる）"
+        print("  (2) 大域 RNG を退避・復元している: OK")
+
+        # モードを戻す
+        for want in (True, False):
+            model.train(want)
+            ft.val_epsilon_mse(diff, model, loader, DEVICE)
+            assert model.training is want, "呼び出し前のモードへ戻っていない"
+        print("  (3) model のモードも復元する: OK")
+
+    # run() が実際に呼び、ログへ載せること
+    src = inspect.getsource(ft.run)
+    assert "val_epsilon_mse" in src and "L_atus_val" in src, \
+        "run() が val を測っていない"
+    print("  (4) run() が --val-every ごとに測って L_atus_val へ載せる: OK")
+    print("test_val_epsilon_mse: OK")
+
+
+def test_memorization_guardrail() -> None:
+    """(mem-g) 暗記チェックが参照集合のサイズ交絡を持ち込まないこと。
+
+    ★DCR_gap は「holdout への最近傍距離 − train への最近傍距離」だが、最近傍距離は
+      参照集合が大きいほど小さくなる。ATUS 平日は train 3,363 / val 373 で 9 倍違うので、
+      間引かないと暗記が無くても gap が正に出る。
+    """
+    rng = np.random.default_rng(0)
+    real = rng.integers(0, sm.NUM_ACT, size=(400, sm.NUM_SLOTS))
+    gen = rng.integers(0, sm.NUM_ACT, size=(60, sm.NUM_SLOTS))
+
+    out = se.memorization_guardrail(gen, real, seed=0)
+    assert set(out) >= {"dcr_train", "dcr_holdout", "dcr_gap",
+                        "exact_copy_rate", "n_ref_per_side"}, out
+    # 参照集合は train / holdout とも同数（小さい方＝val に合わせる）
+    train_idx, val_idx = sm.split_indices(len(real))
+    assert out["n_ref_per_side"] == min(len(train_idx), len(val_idx))
+    assert abs(out["dcr_gap"] - (out["dcr_holdout"] - out["dcr_train"])) < 1e-9
+    print(f"  (1) (mem-g) 参照集合を両側 {int(out['n_ref_per_side'])} 本へ揃える"
+          f"（train {len(train_idx)} / val {len(val_idx)}）: OK")
+
+    # 乱数データなので train 側だけ近いはずがない ＝ gap は 0 の近く
+    assert abs(out["dcr_gap"]) < 3.0, f"交絡が残っている: dcr_gap={out['dcr_gap']}"
+    print(f"  (2) 無相関データで dcr_gap={out['dcr_gap']:+.3f}（交絡なし）: OK")
+
+    # 事後選択の行に載ること
+    src = inspect.getsource(se.evaluate_ckpt)
+    assert "memorization_guardrail" in src
+    print("  (3) evaluate_ckpt が呼んで CSV の列にする: OK")
+    print("test_memorization_guardrail: OK")
+
+
+def test_lam_warmup_is_robust() -> None:
+    """(lam) λ=auto が1更新の外れ値で決まらないこと。
+
+    ★L_agg は split-batch 推定量なので、期待値が bias² でも実現値は大きく振れ、
+      負にもなる。初回がたまたま 0 近傍だと λ≈0 が全ステップ固定され、
+      リハーサル項が実質無効のまま予算を回し切る。
+    """
+    assert ft.LAM_WARMUP_STEPS >= 3, "中央値を採るのに更新数が足りない"
+
+    # 1更新目だけ 0 近傍という最悪ケース。中央値なら引きずられない
+    l_aggs = [1e-9, 0.020, 0.024, 0.019, 0.022]
+    l_atus = [0.50] * len(l_aggs)
+    naive = abs(l_aggs[0]) / l_atus[0]
+    robust = float(np.median(l_aggs[:ft.LAM_WARMUP_STEPS])
+                   / np.median(l_atus[:ft.LAM_WARMUP_STEPS]))
+    assert naive < 1e-8, naive
+    assert 0.03 < robust < 0.05, robust
+    print(f"  (1) (lam) 初回のみ採ると λ={naive:.1e}（リハーサル無効）、"
+          f"{ft.LAM_WARMUP_STEPS} 更新の中央値なら λ={robust:.4f}: OK")
+
+    # run() が warmup 中も暫定 λ で回すこと（0 で回す期間を作らない）
+    src = inspect.getsource(ft.run)
+    assert "lam_samples.append" in src and "np.median" in src, \
+        "run() が warmup 中央値で λ を決めていない"
+    assert "prev_config.get(\"lam\")" in src, "run() が --resume で λ を引き継いでいない"
+    print("  (2) run() が warmup 中央値で決め、--resume では ckpt の λ を継ぐ: OK")
+    print("test_lam_warmup_is_robust: OK")
+
+
+def test_jsd_memory_gate() -> None:
+    """(jsd-mem) jsd は chunk を使えないので K×B で予算判定すること。
+
+    ★jsd は群平均の非線形関数で split-batch が使えず、2パスに要る g（∂L/∂ā の
+      解析形）を持たない。aggregate_step は chunk を無視して1パスで回るので、
+      K×chunk だけを見ると「両方のゲートを通ってから OOM」になる。
+    """
+    # sq なら chunk が下がって通る設定
+    ft.check_memory_budget(1, 28, 256, chunk=ft.resolve_chunk(1, 28, 256))
+    # jsd の実ピークは K×B = 7,168 > 6,600 なので落ちなければならない
+    try:
+        ft.check_memory_budget(1, 28, 256, chunk=28 * 256)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("jsd 相当の K×B 判定が弾かれていない")
+
+    src = inspect.getsource(ft.run)
+    assert 'loss_kind == "jsd"' in src and "chunk=d_sub * n" in src, \
+        "run() が jsd を K×B で判定していない"
+    print("  (1) (jsd-mem) run() が jsd のとき K×B で予算判定する: OK")
+    print("test_jsd_memory_gate: OK")
+
+
+def test_select_common_random_numbers() -> None:
+    """(crn) 事後選択が全 ckpt を同じ乱数列で生成すること。
+
+    ★ck.load_ckpt は学習時の torch RNG を復元する副作用を持つ。seed を置き直さないと
+      ckpt ごとに別の乱数列でプールを作ることになり、rate_mae の差がモデル差か
+      乱数差か区別できなくなる（n=2000 のセル当たり MC 標準偏差は最大 0.0112、
+      rate_mae の水準 0.0288 と同じ桁）。
+    """
+    src = inspect.getsource(se.evaluate_ckpt)
+    load_at = src.index("ck.load_ckpt")
+    seed_at = src.index("torch.manual_seed(pool_seed)")
+    pool_at = src.index("sm.group_pool")
+    assert load_at < seed_at < pool_at, \
+        "torch.manual_seed が load_ckpt の後・group_pool の前に無い"
+    print("  (1) (crn) load_ckpt -> manual_seed(pool_seed) -> group_pool の順: OK")
+
+    # 出所の列として CSV に残ること
+    assert '"pool_seed": pool_seed' in src
+    print("  (2) pool_seed が出力行に載る（§9.8 の出所列）: OK")
+    print("test_select_common_random_numbers: OK")
+
+
 def main() -> None:
     test_checkpoint_roundtrip()
     test_reverse_step_matches_inline()
@@ -1008,6 +1304,7 @@ def main() -> None:
     test_jsd_loss()
     test_layered_lr()
     test_memory_budget()
+    test_check_shapes()
     test_teacher_mask_and_holdout()
     test_eval_against_subset()
     test_checkpoint_selection()
@@ -1015,6 +1312,13 @@ def main() -> None:
     test_two_pass_matches_full_batch()
     test_two_pass_memory_scaling()
     test_resolve_chunk()
+    test_grad_norms()
+    test_x0_diagnostics()
+    test_val_epsilon_mse()
+    test_memorization_guardrail()
+    test_lam_warmup_is_robust()
+    test_jsd_memory_gate()
+    test_select_common_random_numbers()
     print("\ntest_stage2: OK")
 
 

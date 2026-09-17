@@ -1,7 +1,7 @@
 """
 stage2_select.py
 ================
-Stage 2 の事後チェックポイント選択（Stage2_design.md §8.4, §9.3, §9.4）
+Stage 2 の事後チェックポイント選択（Stage2_design.md §8.4, §9.4, §9.8）
 
 Stage 2 は早期終了を使わず固定ステップ予算で回し切る。学習中に「良くなったか」を
 判定できないのは、目的関数（集計適合）と守りたいもの（個票の構造）が別物だからである。
@@ -17,16 +17,23 @@ Stage 2 は早期終了を使わず固定ステップ予算で回し切る。学
                     ★非循環。集計損失が一切見ていない量なので独立した情報を持つ
 
 ★基準は zero-shot 値であって実データ値ではない。Stage 1 の時点でガードレール全指標が
-  既にノイズ床の外にあるので（§9.2）、「Stage 2 はガードレールを壊さない」という主張は
+  既にノイズ床の外にあるので（§9.5）、「Stage 2 はガードレールを壊さない」という主張は
   使えない。使えるのは「悪化させない」「改善する」の2つ。
 
-★出力 CSV は数値の出所を列で機械的に区別する（§9.4）。このリポジトリは出所の
+★出力 CSV は数値の出所を列で機械的に区別する（§9.8）。このリポジトリは出所の
   取り違えを2回起こしている。
 
     teacher_groups  損失に使った群数（28 or それ未満）
     eval_kind       in-teacher / held-out
     reference       teacher / atus       （何と比べた値か）
     mask            11act / 12act        （OTHER_X を含むか）
+    pool_seed       プール生成の乱数種    （どの乱数列で測った値か）
+    stage1_ckpt     出発点の Stage 1 重み （config 由来。どの重みから微調整したか）
+
+★全 ckpt のプールは共通乱数（pool_seed）で作る。ck.load_ckpt は学習時の torch RNG を
+  復元する副作用を持つので、seed を置き直さないと ckpt ごとに別の乱数列で生成される。
+  n=2000 でもセル当たりの MC 標準偏差は最大 0.0112 あり、rate_mae の水準 0.0288 と
+  同じ桁になるため、ckpt 間の差がモデル差か乱数差か区別できなくなる。
 
 使い方:
     .venv/bin/python3 src/models/DDPM_Aggregate_Simple/stage2_select.py \\
@@ -75,7 +82,14 @@ cd: Any = _load("select_conditioning", REPO_ROOT / "src" / "eval" / "conditionin
 OUT_CSV = REPO_ROOT / "data" / "processed" / "aggregates" / "stage2_checkpoint_selection.csv"
 DEFAULT_N = 2000
 
-# 軸2 で追いかける指標と、その zero-shot 実測値（Stage2_design.md §9.2）。
+# 全チェックポイントのプールを同じ乱数列で作るための種（common random numbers）。
+# ★固定が必須である。ck.load_ckpt は学習時の torch RNG を復元する副作用を持つので、
+#   何もしないと ckpt ごとに別の乱数列で生成することになる。n=2000 でもセル当たりの
+#   MC 標準偏差は σ=√(A*(1−A*)/n) で最大 0.0112 あり、rate_mae の実測水準 0.0288 と
+#   同じ桁になる。共通乱数でなければ ckpt 間の差がモデル差か乱数差か区別できない。
+DEFAULT_POOL_SEED = 12345
+
+# 軸2 で追いかける指標と、その zero-shot 実測値（Stage2_design.md §9.5）。
 # ★基準は実データ値ではなく zero-shot 値。Stage 1 の時点で全指標がノイズ床の外に
 #   あるので、「壊さない」ではなく「悪化させない／改善する」で主張を立てる。
 # ★bigram_jsd と switch_emd は「重み付き・対角除く・行平均」の値。重み無しだと
@@ -93,6 +107,46 @@ ZERO_SHOT_GUARDRAILS = {
     "other_x_share":        0.0136,
 }
 GUARDRAIL_KEYS = tuple(ZERO_SHOT_GUARDRAILS)
+
+
+def memorization_guardrail(gen: np.ndarray, sched_real: np.ndarray,
+                           seed: int = 0) -> dict[str, float]:
+    """暗記の診断。Stage 2 は ATUS 学習分割の上でさらに約23エポック回るので要る。
+
+    Note:
+        ★参照集合を同数に間引くことが要点。DCR_gap は「holdout への最近傍距離 −
+        train への最近傍距離」だが、最近傍距離は参照集合が大きいほど小さくなる。
+        ATUS 平日は train 3,363 / val 373 で 9 倍違うため、間引かないと
+        **暗記が無くても gap が +4.7 出る**（過去に一度この交絡で誤読している）。
+        両方を min(len(train), len(holdout)) まで同じ seed で間引いて比べる。
+        ★train / holdout の分割は sm.split_indices ただ一つ。学習側と同じ規則で
+        再現しないと「学習に使っていない個票」という前提が静かに壊れる。
+
+    Args:
+        gen: 生成スケジュール, dtype=int64, (M, 96)
+        sched_real: 実 ATUS 平日のスケジュール全体, dtype=int64, (N, 96)
+            学習側と同じ並びであること（sm.load_data の戻り値そのまま）
+        seed: 参照集合の間引きに使う seed, default=0
+
+    Returns:
+        dict[str, float]
+            dcr_train / dcr_holdout: 最近傍距離の平均（同数に間引いた参照集合に対して）
+            dcr_gap: holdout − train。正で大きいほど暗記寄り
+            exact_copy_rate: 学習個票と完全一致した生成の割合
+    """
+    train_idx, val_idx = sm.split_indices(len(sched_real))
+    k = min(len(train_idx), len(val_idx))
+    rng = np.random.default_rng(seed)
+    tr = sched_real[rng.choice(train_idx, size=k, replace=False)]
+    ho = sched_real[rng.choice(val_idx, size=k, replace=False)]
+    m = im.memorization(gen, tr, ho, seed=seed)
+    return {
+        "dcr_train": float(m["DCR_mean[train]"]),
+        "dcr_holdout": float(m["DCR_mean[holdout]"]),
+        "dcr_gap": float(m["DCR_gap(holdout-train)"]),
+        "exact_copy_rate": float(m["exact_copy_rate[train]"]),
+        "n_ref_per_side": float(k),
+    }
 
 
 def guardrails(gen: np.ndarray, gen_d: np.ndarray, sched_real: np.ndarray,
@@ -132,8 +186,28 @@ def guardrails(gen: np.ndarray, gen_d: np.ndarray, sched_real: np.ndarray,
 
 
 def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndarray,
-                  w_real: np.ndarray, n: int, device: str) -> list[dict]:
-    """1チェックポイントを2軸で測り、11act / 12act の2行を返す。"""
+                  w_real: np.ndarray, n: int, device: str,
+                  pool_seed: int = DEFAULT_POOL_SEED) -> list[dict]:
+    """1チェックポイントを2軸で測り、11act / 12act の2行を返す。
+
+    Args:
+        path: 評価するチェックポイント（stage2_step*.pt）
+        tgt: load_stula_targets の戻り値。28群ぶんの教師 A* と人口
+        sched_real: 実 ATUS 平日のスケジュール, dtype=int64, (N, 96)
+        d_real: 実 ATUS の群インデックス, dtype=int64, (N,)
+        w_real: 実 ATUS の調査ウェイト, dtype=float64, (N,)
+        n: 群あたりの生成本数 M
+        device: モデルを載せるデバイス
+        pool_seed: プール生成の乱数種, default=DEFAULT_POOL_SEED
+
+    Returns:
+        1 ckpt ぶんの行 list[dict]。mask（12act/11act）× eval_kind（in-teacher/held-out）
+        の組み合わせぶんだけ返る
+
+    Note:
+        ★torch.manual_seed を ck.load_ckpt の **後** に置くこと。load_ckpt は学習時の
+        RNG を復元する副作用を持つので、先に seed を置くと上書きされてしまう。
+    """
     model = sm.UNet1D().to(device)
     step, config = ck.load_ckpt(path, model, map_location=device)
     holdout = list(config.get("holdout", []))
@@ -141,12 +215,18 @@ def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndar
     for d in holdout:
         teacher_mask[d] = False
 
+    # 全 ckpt を同じ乱数列で生成する（common random numbers）
+    torch.manual_seed(pool_seed)
     pool = sm.group_pool(model, n, verbose=False)                  # (28, n, 96)
     gen = pool.reshape(-1, sm.NUM_SLOTS)
     gen_d = np.repeat(np.arange(sm.D_GROUPS), n)
 
     rates = sm.pool_to_rates(pool)                                 # (28, 12*96) act-major
     guard = guardrails(gen, gen_d, sched_real, d_real, w_real)
+    # ★暗記チェックは zero-shot 基準を持たない（ZERO_SHOT_GUARDRAILS に入れていない）。
+    #   Stage 1 の実測が無いので比を出すと出所不明の数字になる。生の値で並べ、
+    #   ckpt 間で dcr_gap が上がっていくかどうかを見る
+    guard.update(memorization_guardrail(gen, sched_real, seed=pool_seed))
 
     rows: list[dict] = []
     for mask_c, mask_name in ((st.mask_12act(), "12act"), (st.mask_11act(), "11act")):
@@ -163,12 +243,13 @@ def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndar
             rows.append({"ckpt": path.name, "step": step,
                          "teacher_groups": int(teacher_mask.sum()),
                          "eval_kind": kind, "reference": "teacher", "mask": mask_name,
-                         "n_per_group": n, **config, **scores, **guard})
+                         "n_per_group": n, "pool_seed": pool_seed,
+                         **config, **scores, **guard})
     return rows
 
 
 def run(ckpt_dir: Path, n: int = DEFAULT_N, out_csv: Path = OUT_CSV,
-        device: str | None = None) -> pd.DataFrame:
+        device: str | None = None, pool_seed: int = DEFAULT_POOL_SEED) -> pd.DataFrame:
     dev = device or sm.DEVICE
     paths = sorted([p for p in ckpt_dir.glob("stage2_step*.pt")],
                    key=lambda p: int(p.stem.removeprefix("stage2_step")))
@@ -181,8 +262,9 @@ def run(ckpt_dir: Path, n: int = DEFAULT_N, out_csv: Path = OUT_CSV,
 
     rows: list[dict] = []
     for i, path in enumerate(paths, 1):
-        print(f"[{i}/{len(paths)}] {path.name} を評価中 (28群 × {n} 本を生成) ...")
-        rows.extend(evaluate_ckpt(path, tgt, sched_real, d_real, w_real, n, dev))
+        print(f"[{i}/{len(paths)}] {path.name} を評価中 "
+              f"(28群 × {n} 本を生成, pool_seed={pool_seed}) ...")
+        rows.extend(evaluate_ckpt(path, tgt, sched_real, d_real, w_real, n, dev, pool_seed))
     df = pd.DataFrame(rows)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
@@ -194,7 +276,9 @@ def run(ckpt_dir: Path, n: int = DEFAULT_N, out_csv: Path = OUT_CSV,
     print("\n--- 軸1 教師適合 × 軸2 ガードレール（12act）---")
     print(show.round(5).to_string(index=False))
     print("\n★軸1 は teacher_groups=28 のとき循環している（学習目的そのもの）。"
-          "\n  ガードレールの基準は実データ値ではなく zero-shot 値（§9.2）。")
+          "\n  ガードレールの基準は実データ値ではなく zero-shot 値（§9.5）。"
+          f"\n  全 ckpt は共通乱数 pool_seed={pool_seed} で生成してある"
+          "（ckpt 間の差から生成の MC ノイズを除くため）。")
     return df
 
 
@@ -206,8 +290,11 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=DEFAULT_N,
                     help="群あたり生成本数。評価用なので学習時の n と揃える必要はない")
     ap.add_argument("--out-csv", type=Path, default=OUT_CSV)
+    ap.add_argument("--pool-seed", type=int, default=DEFAULT_POOL_SEED,
+                    help="プール生成の乱数種。全 ckpt に同じ値を使う（common random numbers）。"
+                        "別のシードで測り直したいときだけ変える")
     args = ap.parse_args()
-    run(args.ckpt_dir, args.n, args.out_csv)
+    run(args.ckpt_dir, args.n, args.out_csv, pool_seed=args.pool_seed)
 
 
 if __name__ == "__main__":

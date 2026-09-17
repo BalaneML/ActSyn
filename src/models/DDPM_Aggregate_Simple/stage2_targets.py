@@ -33,7 +33,7 @@ Stage 2 の教師テンソル A*(28,12,96) と、28群表への採点（Stage2_d
 """
 import sys
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -54,6 +54,27 @@ SLOT_COLS = [f"s{j}" for j in range(NUM_SLOTS)]
 
 # 社会生活基本調査の5歳15区分 → モデルの10歳7区分
 AGE15_TO_7 = {i: min((i - 1) // 2, 6) for i in range(1, 16)}
+
+
+def _map_codes(col: Any, table: dict) -> "pd.Series":
+    """カテゴリ列を対応表でコードへ引き当てる, 未知のキーは NaN になる
+
+    Note:
+        ★型チェックのためだけに挟む薄い関数である。`df["col"]` の戻り値は
+        pandas のスタブ上 Series と DataFrame の union なので、辞書を渡すと
+        DataFrame.map（callable しか取らない）の側に解決されて
+        reportArgumentType になる。Series へ絞ってから map を呼ぶ。
+        ★挙動は `col.map(table)` そのままで、未知のキーは NaN になる。
+        呼び出し側はこの NaN を dropna(subset=...) で落として使っている。
+
+    Args:
+        col: 引き当てる列。`df["col"]` をそのまま渡す
+        table: 元の値 -> コードの対応表
+
+    Returns:
+        コードに置き換わった Series, 未知のキーは NaN
+    """
+    return cast("pd.Series", col).map(table)
 
 
 def d_index(g: int, a: int, e: int) -> int:
@@ -92,26 +113,28 @@ def load_stula_targets(name: str = DEFAULT_TABLE) -> dict:
     df = pd.read_csv(STULA_DIR / f"{name}.csv")
     df = cast(pd.DataFrame, df[df["region"] == "00_全国"])       # P8: 全国のみ
     com = stula_to_common(df)                                    # P5: 行動20 -> 12（単純和）
-    com["g"] = com["gender"].map({"1_男": 0, "2_女": 1})
-    com["e"] = com["employment"].map({"1_有業者": 1, "2_無業者": 0})
-    com["a15"] = com["age_class"].str[:2].map(
+    com["g"] = _map_codes(com["gender"], {"1_男": 0, "2_女": 1})
+    com["e"] = _map_codes(com["employment"], {"1_有業者": 1, "2_無業者": 0})
+    com["a15"] = cast("pd.Series", com["age_class"]).str[:2].map(
         lambda c: int(c) if isinstance(c, str) and c.isdigit() and c != "00" else np.nan)
-    com["a7"] = com["a15"].map(AGE15_TO_7)
-    com["ci"] = com["common"].map({c.name: int(c) for c in Common})
+    com["a7"] = _map_codes(com["a15"], AGE15_TO_7)
+    com["ci"] = _map_codes(com["common"], {c.name: int(c) for c in Common})
 
     # 人口（推定人口・千人）は 行動="00_総数" の行にしか入っていない。
     # 人口は層の属性であって行動の属性ではないため。これが総数行を捨てられない理由で、
     # 率は非定義でも人口の唯一の供給源になっている
     pop_src = cast(pd.DataFrame, df[df["activity"].str.startswith("00_")])
     pop_src = pop_src.assign(
-        g=pop_src["gender"].map({"1_男": 0, "2_女": 1}),
-        e=pop_src["employment"].map({"1_有業者": 1, "2_無業者": 0}),
-        a15=pop_src["age_class"].str[:2].map(
+        g=_map_codes(pop_src["gender"], {"1_男": 0, "2_女": 1}),
+        e=_map_codes(pop_src["employment"], {"1_有業者": 1, "2_無業者": 0}),
+        a15=cast("pd.Series", pop_src["age_class"]).str[:2].map(
             lambda c: int(c) if isinstance(c, str) and c.isdigit() and c != "00" else np.nan),
     ).dropna(subset=["g", "e", "a15"])
     pop15 = np.zeros((N_G, 16, N_E))          # a15 は 1..15（index 0 は使わない）
-    for (g, a15, e), grp in pop_src.groupby(["g", "a15", "e"]):
-        pop15[int(g), int(a15), int(e)] = grp["population_k"].iloc[0]  # type: ignore
+    for key, grp in pop_src.groupby(["g", "a15", "e"]):
+        # ★groupby のキーはスタブ上 Hashable なので、そのまま3つへ展開できない
+        g, a15, e = cast(tuple, key)
+        pop15[int(g), int(a15), int(e)] = grp["population_k"].iloc[0]
     # 5歳2区分ぶんの人口を足して10歳7区分へ。率でなく人数なので単純加算でよい
     pop = np.zeros((N_G, N_A, N_E))
     for a15, a7 in AGE15_TO_7.items():
@@ -175,7 +198,7 @@ def eval_against(mu_hat: np.ndarray, tgt: dict,
       群のズレの誤差 ＝ 条件付け能力。dev_* は共通成分が引かれるぶん必ず小さくなる。
 
     ★mask 列を返す。このリポジトリは数値の出所取り違えを2回起こしているので、
-      11act/12act のどちらで測った値かを機械的に区別できる形にしておく（§9.4）。
+      11act/12act のどちらで測った値かを機械的に区別できる形にしておく（§9.8）。
     """
     # ★群数は教師テンソルから読む。28群固定にしないのは、LGO で教師群と held-out 群を
     #   分けて採点するときに同じ定義をもう一度書かずに済ませるため（stage2_select）
