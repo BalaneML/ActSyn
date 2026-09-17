@@ -103,6 +103,7 @@ st: Any = _load("simple_stage2_targets", HERE / "stage2_targets.py")
 sl: Any = _load("simple_stage2_loss", HERE / "stage2_loss.py")
 ft: Any = _load("simple_stage2_finetune", HERE / "stage2_finetune.py")
 se: Any = _load("simple_stage2_select", HERE / "stage2_select.py")
+lg: Any = _load("simple_stage2_lgo", HERE / "stage2_lgo.py")
 DEVICE = "cpu"          # テストは決定性重視で CPU 固定
 T_SHORT = 12            # 全1000ステップは重いので、逆過程の往復は短い T で見る
 
@@ -1055,6 +1056,104 @@ def test_zeroshot_baseline() -> None:
     print("test_zeroshot_baseline: OK")
 
 
+def test_lgo_folds() -> None:
+    """(lgo) 28 群が人口シェアで層化された 4群 × 7 fold の分割になること。
+
+    ★分割（partition）であって抽出ではない。stage2_finetune.stratified_holdout は
+      乱数で k 群を引くので全群を覆わないし重複もしうる。こちらは全群が
+      ちょうど 1 回ずつ held-out になる。
+    """
+    tgt = st.load_stula_targets()
+    folds = lg.stratified_folds(tgt["pop"])
+
+    flat = [d for f in folds for d in f]
+    assert len(folds) == lg.N_FOLDS
+    assert all(len(f) == 4 for f in folds), "fold のサイズが 4 でない"
+    assert sorted(flat) == list(range(st.D_GROUPS)), "28 群の分割になっていない"
+    print("  (1) (lgo) 28 群がちょうど 1 回ずつ、4群 × 7 fold に分かれる: OK")
+
+    # ★決定的であること。fold が実行ごとに変わると、どの群がどの fold で
+    #   held-out だったかを後から再現できない
+    assert lg.stratified_folds(tgt["pop"]) == folds
+    print("  (2) 乱数を使わず、同じ pop なら同じ分割: OK")
+
+    # 層化が効いていること。群シェアの開きに対して fold 間の開きが十分小さい
+    pop = np.asarray(tgt["pop"], dtype=np.float64).reshape(st.D_GROUPS)
+    share = pop / pop.sum()
+    group_spread = float(share.max() / share.min())
+    fold_share = lg.fold_shares(tgt["pop"], folds)
+    fold_spread = float(fold_share.max() / fold_share.min())
+    assert abs(fold_share.sum() - 1.0) < 1e-12, "fold のシェア合計が 1 でない"
+    assert fold_spread < 1.5, f"層化が効いていない: fold 間 {fold_spread:.2f} 倍"
+    print(f"  (3) 群シェアは {group_spread:.1f} 倍の開きだが fold 間は "
+          f"{fold_spread:.2f} 倍に収まる: OK")
+
+    # 割り切れない分割は落とす
+    try:
+        lg.stratified_folds(tgt["pop"], 5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("28 群を 5 分割できてしまった")
+    print("  (4) 割り切れない n_folds は ValueError: OK")
+    print("test_lgo_folds: OK")
+
+
+def test_lgo_collect() -> None:
+    """(lgo) fold の結果 CSV を束ねるとき、分割の破れを検出すること。"""
+    def _write(path: Path, holdout: list[int], value: float) -> None:
+        pd.DataFrame([
+            {"eval_kind": "held-out", "mask": "12act", "metric": "rate_mae",
+             "value": value, "holdout": str(holdout), "step": 300},
+            {"eval_kind": "in-teacher", "mask": "12act", "metric": "rate_mae",
+             "value": 0.0, "holdout": str(holdout), "step": 300},
+        ]).to_csv(path, index=False)
+
+    folds = lg.stratified_folds(st.load_stula_targets()["pop"])
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        paths = []
+        for i, f in enumerate(folds):
+            p = d / f"fold{i}.csv"
+            _write(p, f, 0.01 * (i + 1))
+            paths.append(p)
+
+        held = lg.collect_heldout(paths)
+        assert len(held) == lg.N_FOLDS, "held-out 行だけが集まるはず"
+        assert set(held["source_csv"]) == {p.name for p in paths}
+        print(f"  (1) (lgo) {lg.N_FOLDS} fold の held-out 行だけが集まる: OK")
+
+        dist = lg.heldout_distribution(held, metrics=("rate_mae",))
+        assert int(dist.loc["rate_mae", "count"]) == lg.N_FOLDS
+        assert abs(float(dist.loc["rate_mae", "mean"]) - 0.04) < 1e-12
+        print(f"  (2) 分布が出る (mean={float(dist.loc['rate_mae', 'mean']):.4f}): OK")
+
+        # ★同じ群を 2 回 held-out にすると平均がその群へ寄る。黙って通してはいけない
+        bad = d / "bad.csv"
+        _write(bad, folds[0], 0.99)
+        try:
+            lg.collect_heldout(paths + [bad])
+        except ValueError as e:
+            assert "複数の fold" in str(e)
+        else:
+            raise AssertionError("群の重複を見逃した")
+        print("  (3) 同じ群が 2 回 held-out なら ValueError: OK")
+
+        # held-out 行が無い CSV（28群すべて教師で学習した結果）も落とす
+        none_ho = d / "no_heldout.csv"
+        pd.DataFrame([{"eval_kind": "in-teacher", "mask": "12act",
+                       "metric": "rate_mae", "value": 0.02, "holdout": "[]",
+                       "step": 300}]).to_csv(none_ho, index=False)
+        try:
+            lg.collect_heldout([none_ho])
+        except ValueError as e:
+            assert "held-out 行が無い" in str(e)
+        else:
+            raise AssertionError("held-out 行が無い CSV を見逃した")
+        print("  (4) held-out 行が無い CSV は ValueError: OK")
+    print("test_lgo_collect: OK")
+
+
 # ============================================================
 # 11. 2パス勾配蓄積
 # ============================================================
@@ -1508,6 +1607,8 @@ def main() -> None:
     test_rate_mse_split()
     test_checkpoint_selection()
     test_zeroshot_baseline()
+    test_lgo_folds()
+    test_lgo_collect()
     test_naive_accumulation_is_wrong()
     test_two_pass_matches_full_batch()
     test_two_pass_memory_scaling()
