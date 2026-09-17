@@ -38,10 +38,28 @@
 #
 #   環境変数で上書きできる:
 #     STEPS=300 D_SUB=7 N=256 K=1 CHUNK=0 EPS=inf LAM=auto LOSS=sq HOLDOUT= RESUME=0
+#     SAVE_EVERY=25 VAL_EVERY=10
 #     CHUNK=0 は予算からの自動決定。B 未満になると2パス勾配蓄積へ切り替わる
 #     （勾配は一括計算と厳密に一致するので、下がっても学習の意味は変わらない）
 #   例: EPS=0.01 qsub -v EPS jobs/train_ddpm_simple_stage2.sh     # 主B（χ²）
 #       RESUME=1 qsub -v RESUME jobs/train_ddpm_simple_stage2.sh  # 途中から再開
+#
+# ★LAM について（2026-09-17 の実測。Stage2_implementation.md §6.2）
+#   λ=auto が返す値を X とすると、実測で λ‖g_atus‖/‖g_agg‖ = 22〜51 倍、
+#   さらに cos(g_agg, g_atus) = −0.27 で **2 つの勾配は逆を向いている**。
+#   λ=X では集計側は更新方向を 1.9° 回すだけで、共有軸では 100:1 で押し戻される。
+#
+#       λ      集計成分のシェア
+#       X               3.4%     ← auto の既定。L_agg は横ばいか微増になる見込み
+#       0.1X           34.5%
+#       0.03X          86.6%     ← 転換点
+#       0               100%
+#
+#   掃引は {0, 0.01X, 0.03X, 0.1X, 0.3X, X}（設計書 §12 D）。
+#   1 本目は auto で X を実測し、2 本目以降は LAM=<数値> で下側を攻めること。
+#
+# ★学習のあとに jobs/eval_stage2_select.sh が要る（生成に 1〜4 時間）。
+#   SAVE_EVERY を上げると ckpt 数が減り、その時間も比例して減る。
 
 cd "${PBS_O_WORKDIR}"
 source jobs/_common.sh
@@ -57,6 +75,7 @@ LAM="${LAM:-auto}"
 HOLDOUT="${HOLDOUT:-}"
 RESUME="${RESUME:-0}"
 SAVE_EVERY="${SAVE_EVERY:-25}"
+VAL_EVERY="${VAL_EVERY:-10}"
 
 STAGE1="${REPO}/outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_20260819.pt"
 TEACHER="${REPO}/data/processed/stula/timeband_weekday.csv"
@@ -97,7 +116,14 @@ TOTAL=$(( D_SUB * N ))
 # CHUNK=0（自動）なら Python 側が予算に収まるところまで chunk を下げて2パスへ切り替える。
 # ここではその「下がる先」で判定し、自動でも収まらない場合だけを弾く。
 # CHUNK を明示したときはその値をそのまま判定する。
-if [ "${CHUNK}" -gt 0 ]; then
+#
+# ★LOSS=jsd だけは別扱い。JSD は群平均の非線形関数で split-batch が使えず、
+#   2パスに必要な g（∂L/∂ā の解析形）を持たないので chunk を無視して1パスで回る。
+#   ここで分けないと「両方のゲートを通ってから OOM」になり、5時間の枠を失う。
+if [ "${LOSS}" = "jsd" ]; then
+    LOAD=$(( K * TOTAL ))
+    echo "note: LOSS=jsd は2パス蓄積を使えないので、ピークは K×B=${LOAD} で決まる"
+elif [ "${CHUNK}" -gt 0 ]; then
     LOAD=$(( K * CHUNK ))
 else
     LOAD=$(( K * TOTAL ))
@@ -108,9 +134,13 @@ else
 fi
 echo "VRAM=${VRAM_MIB} MiB  予算 K×chunk <= ${BUDGET}  要求=${LOAD}  (B=${TOTAL})"
 if [ "${LOAD}" -gt "${BUDGET}" ]; then
-    echo "ERROR: K×chunk = ${LOAD} が予算 ${BUDGET} を超えている（K=${K} CHUNK=${CHUNK}）。" >&2
-    echo "       逃げ道は優先順に (1) CHUNK を下げる／0 にして自動決定させる" >&2
-    echo "                        (2) D_SUB を下げる  (3) 勾配チェックポイント" >&2
+    echo "ERROR: K×chunk = ${LOAD} が予算 ${BUDGET} を超えている（K=${K} CHUNK=${CHUNK} LOSS=${LOSS}）。" >&2
+    if [ "${LOSS}" = "jsd" ]; then
+        echo "       LOSS=jsd は chunk を使えないので、逃げ道は D_SUB か N か K を下げること" >&2
+    else
+        echo "       逃げ道は優先順に (1) CHUNK を下げる／0 にして自動決定させる" >&2
+        echo "                        (2) D_SUB を下げる  (3) 勾配チェックポイント" >&2
+    fi
     exit 1
 fi
 
@@ -130,7 +160,7 @@ mkdir -p "${CKPT_DIR}"
     echo "dirty : $(git status --porcelain 2>/dev/null | wc -l) file(s)"
     echo "stage1: ${STAGE1}"
     echo "steps=${STEPS} d_sub=${D_SUB} n=${N} K=${K} chunk=${CHUNK} eps=${EPS} loss=${LOSS} lam=${LAM}"
-    echo "holdout='${HOLDOUT}' resume=${RESUME} save_every=${SAVE_EVERY}"
+    echo "holdout='${HOLDOUT}' resume=${RESUME} save_every=${SAVE_EVERY} val_every=${VAL_EVERY}"
     echo "VRAM=${VRAM_MIB} MiB  budget=${BUDGET}  load=${LOAD}  B=${TOTAL}"
     nvidia-smi
     echo "==="
@@ -138,7 +168,8 @@ mkdir -p "${CKPT_DIR}"
 
 ARGS=(--steps "${STEPS}" --d-sub "${D_SUB}" --n "${N}" --K "${K}" --chunk "${CHUNK}"
       --eps "${EPS}" --loss "${LOSS}" --lam "${LAM}"
-      --save-every "${SAVE_EVERY}" --ckpt-dir "${CKPT_DIR}" --stage1-ckpt "${STAGE1}")
+      --save-every "${SAVE_EVERY}" --val-every "${VAL_EVERY}"
+      --ckpt-dir "${CKPT_DIR}" --stage1-ckpt "${STAGE1}")
 [ -n "${HOLDOUT}" ] && ARGS+=(--holdout-groups "${HOLDOUT}")
 [ "${RESUME}" = "1" ] && ARGS+=(--resume)
 
@@ -151,8 +182,9 @@ echo "elapsed: $((SECONDS / 3600))h $(((SECONDS % 3600) / 60))m"
 N_CKPT="$(ls -1 "${CKPT_DIR}"/stage2_step*.pt 2>/dev/null | wc -l)"
 if [ "${N_CKPT}" -gt 0 ]; then
     echo "checkpoints saved: ${N_CKPT} 世代 in ${CKPT_DIR}"
-    echo "次は事後選択:"
-    echo "  python src/models/DDPM_Aggregate_Simple/stage2_select.py --ckpt-dir ${CKPT_DIR}"
+    echo "次は事後選択（別ジョブ。生成に 1〜4 時間かかる）:"
+    echo "  qsub jobs/eval_stage2_select.sh"
+    echo "  粗い掃引の段階なら N=1000 qsub -v N jobs/eval_stage2_select.sh で半分の時間"
 else
     echo "WARNING: checkpoint が1つも書かれていない。ログ末尾を確認すること: ${LOG}" >&2
 fi
