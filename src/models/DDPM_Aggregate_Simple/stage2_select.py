@@ -339,17 +339,105 @@ def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndar
         ★torch.manual_seed を ck.load_ckpt の **後** に置くこと。load_ckpt は学習時の
         RNG を復元する副作用を持つので、先に seed を置くと上書きされてしまう。
     """
-    # ★生成の前に落とす。1 ckpt の生成は 28群 × n 本で数十秒かかるので、
-    #   払ってから弾くと掃引の本数ぶん無駄になる
-    if n % 2 != 0:
-        raise ValueError(f"split-batch 不偏推定には n が偶数である必要がある: {n}")
-
     model = sm.UNet1D().to(device)
     step, config = ck.load_ckpt(path, model, map_location=device)
     holdout = list(config.get("holdout", []))
     teacher_mask = np.ones(sm.D_GROUPS, dtype=bool)
     for d in holdout:
         teacher_mask[d] = False
+
+    base = {"ckpt": path.name, "step": step,
+            "teacher_groups": int(teacher_mask.sum()),
+            "n_per_group": n, "pool_seed": pool_seed, **config}
+    return evaluate_model(model, tgt, sched_real, d_real, w_real, n,
+                          teacher_mask, base, pool_seed)
+
+
+def evaluate_zeroshot(stage1_ckpt: Path, tgt: dict, sched_real: np.ndarray,
+                      d_real: np.ndarray, w_real: np.ndarray, n: int, device: str,
+                      pool_seed: int = DEFAULT_POOL_SEED) -> list[dict]:
+    """微調整前の Stage 1 重みを同じ経路で測り、step=0 の基準線にする。
+
+    ★なぜ定数 ZERO_SHOT_GUARDRAILS では足りないか。あちらに載っているのは
+      feasibility と断片化の 10 指標だけで、妥当性 12（§9.6）と多様性 6（§9.5b）
+      には zero-shot 実測が無い。§9.5 は「壊さない」ではなく「悪化させない／
+      改善する」で主張を立てるとしており、多様性はパレート曲線の縦軸に必ず
+      1 本入れると決めているので、基準線が無いと判定できない。
+    ★さらに定数は n=256（28群 × 256 = 7,168 本）で測った値なので、評価既定の
+      n=2000 の行とそのまま比べられない。同じ n・同じ pool_seed で測り直した
+      この行が要る。
+    ★Stage 1 ckpt は ck.load_ckpt が期待する形式（step / config / RNG を持つ）では
+      ないので、sm.load_pretrained で読む。load_pretrained は torch の RNG を
+      触らないが、evaluate_model が生成の直前に manual_seed を置くので、
+      Stage 2 の世代と同じ乱数列になる（common random numbers が成立する）。
+
+    Args:
+        stage1_ckpt: Stage 1 の重み（ddpm_simple_pretrain_common12_weekday_*.pt）
+        tgt: load_stula_targets の戻り値
+        sched_real: 実 ATUS 平日のスケジュール, dtype=int64, (N, 96)
+        d_real: 実 ATUS の群インデックス, dtype=int64, (N,)
+        w_real: 実 ATUS の調査ウェイト, dtype=float64, (N,)
+        n: 群あたりの生成本数 M。偶数であること
+        device: モデルを載せるデバイス（load_pretrained は sm.DEVICE を使う）
+        pool_seed: プール生成の乱数種, default=DEFAULT_POOL_SEED
+
+    Returns:
+        step=0 の行 list[dict]。Stage 2 の世代と同じ縦持ち形式なので、
+        同じ CSV に並べてパレート曲線の起点にできる
+    """
+    model = sm.load_pretrained(stage1_ckpt).to(device)
+    # zero-shot は教師を一度も見ていないが、軸1 の採点は 28 群すべてに対して行う
+    # （§9.4 の zero-shot 基準線がまさにこの値）。したがって held-out 行は出ない
+    teacher_mask = np.ones(sm.D_GROUPS, dtype=bool)
+    base = {"ckpt": stage1_ckpt.name, "step": 0,
+            "teacher_groups": int(teacher_mask.sum()),
+            "n_per_group": n, "pool_seed": pool_seed,
+            "holdout": [], "stage1_ckpt": stage1_ckpt.name, "lam": float("nan")}
+    return evaluate_model(model, tgt, sched_real, d_real, w_real, n,
+                          teacher_mask, base, pool_seed)
+
+
+def evaluate_model(model: Any, tgt: dict, sched_real: np.ndarray,
+                   d_real: np.ndarray, w_real: np.ndarray, n: int,
+                   teacher_mask: np.ndarray, base: dict,
+                   pool_seed: int = DEFAULT_POOL_SEED) -> list[dict]:
+    """モデルからプールを作り、2軸で測って縦持ちの行を返す。
+
+    evaluate_ckpt（Stage 2 の世代）と evaluate_zeroshot（Stage 1 の基準線）の
+    共通部分。**同じ関数を通すことが要点**で、経路が分かれると基準線と評価値が
+    別の定義・別の乱数で作られ、比較が成り立たなくなる。
+
+    Args:
+        model: 生成に使うモデル
+        tgt: load_stula_targets の戻り値
+        sched_real: 実 ATUS 平日のスケジュール, dtype=int64, (N, 96)
+        d_real: 実 ATUS の群インデックス, dtype=int64, (N,)
+        w_real: 実 ATUS の調査ウェイト, dtype=float64, (N,)
+        n: 群あたりの生成本数 M。偶数であること
+        teacher_mask: 教師に使った群が True, dtype=bool, (28,)
+        base: 全行に付ける識別列（ckpt / step / teacher_groups / config など）
+        pool_seed: プール生成の乱数種, default=DEFAULT_POOL_SEED
+
+    Returns:
+        1 モデルぶんの行 list[dict]（1 指標 1 行の縦持ち）
+
+    Raises:
+        ValueError: n が奇数（rate_mse_split が群内で二分できない）
+
+    Note:
+        ★torch.manual_seed はこの関数の中、生成の直前に置く。呼び出し側の
+        ck.load_ckpt は学習時の RNG を復元する副作用を持つので、先に置くと
+        上書きされて ckpt ごとに別の乱数列になる。
+    """
+    # ★生成の前に落とす。1 モデルの生成は 28群 × n 本で数十秒かかるので、
+    #   払ってから弾くと掃引の本数ぶん無駄になる
+    if n % 2 != 0:
+        raise ValueError(f"split-batch 不偏推定には n が偶数である必要がある: {n}")
+
+    # ★経路でモードが変わらないようにする。sm.load_pretrained は eval() を呼ぶが
+    #   sm.UNet1D() は train のままなので、揃えておかないと将来 dropout を足した
+    #   ときに zero-shot 基準線とだけ値がずれる
+    model.eval()
 
     # 全 ckpt を同じ乱数列で生成する（common random numbers）
     torch.manual_seed(pool_seed)
@@ -370,9 +458,6 @@ def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndar
     #   ckpt 間で dcr_gap が上がっていくかどうかを見る
     guard.update(memorization_guardrail(gen, sched_real, seed=pool_seed))
 
-    base = {"ckpt": path.name, "step": step,
-            "teacher_groups": int(teacher_mask.sum()),
-            "n_per_group": n, "pool_seed": pool_seed, **config}
     rows: list[dict] = []
 
     # --- 軸1: 教師適合。statistic=slot_rate は教師と同じ統計量＝循環している ---
@@ -446,7 +531,24 @@ def summarize(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def run(ckpt_dir: Path, n: int = DEFAULT_N, out_csv: Path = OUT_CSV,
-        device: str | None = None, pool_seed: int = DEFAULT_POOL_SEED) -> pd.DataFrame:
+        device: str | None = None, pool_seed: int = DEFAULT_POOL_SEED,
+        stage1_ckpt: Path | None = None) -> pd.DataFrame:
+    """ckpt_dir の全世代を 2 軸で採点し、縦持ちの CSV に落とす。
+
+    Args:
+        ckpt_dir: stage2_step*.pt が入っているディレクトリ
+        n: 群あたりの生成本数。偶数であること, default=DEFAULT_N
+        out_csv: 出力先, default=OUT_CSV
+        device: モデルを載せるデバイス。None なら sm.DEVICE
+        pool_seed: 全世代に共通の乱数種, default=DEFAULT_POOL_SEED
+        stage1_ckpt: 微調整前の Stage 1 重み。渡すと step=0 の zero-shot 基準線を
+            同じ n・同じ pool_seed で測って先頭に入れる。妥当性と多様性は
+            ZERO_SHOT_GUARDRAILS に定数が無いので、これが無いと「悪化させて
+            いないか」を判定できない, default=None
+
+    Returns:
+        全世代ぶんの行を連結した DataFrame（1 指標 1 行の縦持ち）
+    """
     dev = device or sm.DEVICE
     paths = sorted([p for p in ckpt_dir.glob("stage2_step*.pt")],
                    key=lambda p: int(p.stem.removeprefix("stage2_step")))
@@ -458,6 +560,13 @@ def run(ckpt_dir: Path, n: int = DEFAULT_N, out_csv: Path = OUT_CSV,
     d_real = sm.cond_to_d(cond_idx)
 
     rows: list[dict] = []
+    # ★基準線を先に測る。Stage 2 の世代と同じ evaluate_model を通すので、
+    #   定義も乱数列も揃う（別経路で測ると比較が成り立たない）
+    if stage1_ckpt is not None:
+        print(f"[0/{len(paths)}] zero-shot 基準線 {stage1_ckpt.name} を評価中 "
+              f"(28群 × {n} 本を生成, pool_seed={pool_seed}) ...")
+        rows.extend(evaluate_zeroshot(stage1_ckpt, tgt, sched_real, d_real,
+                                      w_real, n, dev, pool_seed))
     for i, path in enumerate(paths, 1):
         print(f"[{i}/{len(paths)}] {path.name} を評価中 "
               f"(28群 × {n} 本を生成, pool_seed={pool_seed}) ...")
@@ -494,8 +603,14 @@ def main() -> None:
     ap.add_argument("--pool-seed", type=int, default=DEFAULT_POOL_SEED,
                     help="プール生成の乱数種。全 ckpt に同じ値を使う（common random numbers）。"
                         "別のシードで測り直したいときだけ変える")
+    ap.add_argument("--stage1-ckpt", type=Path, default=None,
+                    help="微調整前の Stage 1 重み。渡すと step=0 の zero-shot 基準線を "
+                        "同じ n・同じ pool_seed で測って先頭に入れる。妥当性12 と "
+                        "多様性6 は ZERO_SHOT_GUARDRAILS に定数が無いので、"
+                        "これが無いと悪化したかを判定できない（§9.5）")
     args = ap.parse_args()
-    run(args.ckpt_dir, args.n, args.out_csv, pool_seed=args.pool_seed)
+    run(args.ckpt_dir, args.n, args.out_csv, pool_seed=args.pool_seed,
+        stage1_ckpt=args.stage1_ckpt)
 
 
 if __name__ == "__main__":
