@@ -181,7 +181,8 @@ def nan_renorm_pop_weights(grp_tbl: np.ndarray, pi_d: np.ndarray) -> np.ndarray:
 
 
 def eval_against(mu_hat: np.ndarray, tgt: dict,
-                 mask_c: npt.NDArray[np.bool_]) -> dict:
+                 mask_c: npt.NDArray[np.bool_],
+                 mu_hat_split: tuple[np.ndarray, np.ndarray] | None = None) -> dict:
     """μ̂ (D, 12*96 act-major) vs 公表の群別行動者率。NaN と mask_c 外を除外して採点する。
 
     D は教師テンソルの群数。全28群でも、LGO で絞った部分集合でも同じ定義で採点する。
@@ -199,6 +200,30 @@ def eval_against(mu_hat: np.ndarray, tgt: dict,
 
     ★mask 列を返す。このリポジトリは数値の出所取り違えを2回起こしているので、
       11act/12act のどちらで測った値かを機械的に区別できる形にしておく（§9.8）。
+
+    ★rate_mse_split は mu_hat_split を渡したときだけ返す（§9.4）。素の rate_mse は
+      E[(ā − A*)²] = (E[ā] − A*)² + Var(ā) で、第2項に生成側のモンテカルロ雑音が
+      床として残る。実測で n=2000 のとき rate_mae 換算 0.00271（zero-shot 比 9.6%）
+      あり、λ 掃引で見たい差と同じ桁になる。独立な2つの半分から
+      E[(ā_A − A*)(ā_B − A*)] = (E[ā] − A*)² を推定すればこの項が落ちる。
+      λ パレート曲線の横軸はこちらを使う。MAE は絶対値が非線形で同じ手が
+      使えないため、rate_mae は補助として残す。
+
+    Args:
+        mu_hat: 群別行動者率 μ̂, dtype=float64, (D, 12*96) act-major
+        tgt: 教師。group_rates_tbl (D,12,96) と pop (D,) を持つ
+        mask_c: 採点対象の活動, dtype=bool, (12,)
+        mu_hat_split: プールを群ごとに二分して作った (μ̂_A, μ̂_B)。各 (D, 12*96)。
+            2つが独立であることが不偏性の条件で、群をまたいで分けると成立しない。
+            None なら rate_mse_split を返さない, default=None
+
+    Returns:
+        指標の dict。rate_mae / rate_mse / rate_rmse / max_abs_err / dev_mae /
+        dev_rmse / n_cells / mask と、活動別の mae_* / rmse_* / rel_*。
+        mu_hat_split を渡した場合は rate_mse_split を追加する。
+        ★rate_mse_split は負になりうる。ā_A と ā_B の誤差の符号が逆のセルでは
+        積が負になるためで、期待値が bias² で下限0なのは変わらない
+        （推定量の分散が見えているだけ）。したがって平方根は取らない。
     """
     # ★群数は教師テンソルから読む。28群固定にしないのは、LGO で教師群と held-out 群を
     #   分けて採点するときに同じ定義をもう一度書かずに済ませるため（stage2_select）
@@ -230,15 +255,25 @@ def eval_against(mu_hat: np.ndarray, tgt: dict,
         per_act[f"rmse_{c.name}"] = float(np.sqrt((e ** 2).mean()))
         per_act[f"rel_{c.name}"] = mae_c / q_bar if q_bar > 0 else float("nan")
 
-    return {"mask": "12act" if bool(mask_c.all()) else "11act",
-            "n_cells": int(m.sum()),
-            "rate_mae": float(np.abs(err).mean()),
-            "rate_mse": mse,
-            "rate_rmse": float(np.sqrt(mse)),
-            "max_abs_err": float(np.abs(err).max()),
-            "dev_mae": float(np.abs(dev).mean()),
-            "dev_rmse": float(np.sqrt((dev ** 2).mean())),
-            **per_act}
+    out = {"mask": "12act" if bool(mask_c.all()) else "11act",
+           "n_cells": int(m.sum()),
+           "rate_mae": float(np.abs(err).mean()),
+           "rate_mse": mse,
+           "rate_rmse": float(np.sqrt(mse)),
+           "max_abs_err": float(np.abs(err).max()),
+           "dev_mae": float(np.abs(dev).mean()),
+           "dev_rmse": float(np.sqrt((dev ** 2).mean())),
+           **per_act}
+
+    # ★学習側 stage2_loss.agg_loss_from_rates を ω=1 で呼んだ式と同一である
+    #   （L = mean (ā_A − A*)(ā_B − A*)）。あちらは torch、ここは numpy で、
+    #   さらに NaN セルと mask_c 外を m で除外する点だけが違う。
+    if mu_hat_split is not None:
+        mh_a = mu_hat_split[0].reshape(n_d, NUM_COMMON, NUM_SLOTS)
+        mh_b = mu_hat_split[1].reshape(n_d, NUM_COMMON, NUM_SLOTS)
+        out["rate_mse_split"] = float(((mh_a - grp_tbl) * (mh_b - grp_tbl))[m].mean())
+
+    return out
 
 
 def eval_both(mu_hat: np.ndarray, tgt: dict) -> list[dict]:
