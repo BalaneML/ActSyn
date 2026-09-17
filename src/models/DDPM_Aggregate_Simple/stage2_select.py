@@ -196,7 +196,7 @@ def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndar
         sched_real: 実 ATUS 平日のスケジュール, dtype=int64, (N, 96)
         d_real: 実 ATUS の群インデックス, dtype=int64, (N,)
         w_real: 実 ATUS の調査ウェイト, dtype=float64, (N,)
-        n: 群あたりの生成本数 M
+        n: 群あたりの生成本数 M。rate_mse_split が群内で二分するので偶数であること
         device: モデルを載せるデバイス
         pool_seed: プール生成の乱数種, default=DEFAULT_POOL_SEED
 
@@ -208,6 +208,11 @@ def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndar
         ★torch.manual_seed を ck.load_ckpt の **後** に置くこと。load_ckpt は学習時の
         RNG を復元する副作用を持つので、先に seed を置くと上書きされてしまう。
     """
+    # ★生成の前に落とす。1 ckpt の生成は 28群 × n 本で数十秒かかるので、
+    #   払ってから弾くと掃引の本数ぶん無駄になる
+    if n % 2 != 0:
+        raise ValueError(f"split-batch 不偏推定には n が偶数である必要がある: {n}")
+
     model = sm.UNet1D().to(device)
     step, config = ck.load_ckpt(path, model, map_location=device)
     holdout = list(config.get("holdout", []))
@@ -222,6 +227,12 @@ def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndar
     gen_d = np.repeat(np.arange(sm.D_GROUPS), n)
 
     rates = sm.pool_to_rates(pool)                                 # (28, 12*96) act-major
+    # ★split-batch 不偏推定の材料（§9.4）。群の内側で前半・後半に割るので、
+    #   2つの平均は独立で、かつ群をまたがない。群をまたいで割ると別の群の平均に
+    #   なり、交差項が bias² を推定しなくなる（stage2_loss.group_rates_split と同じ理屈）
+    half = n // 2
+    rates_a = sm.pool_to_rates(pool[:, :half])                     # (28, 12*96)
+    rates_b = sm.pool_to_rates(pool[:, half:])                     # (28, 12*96)
     guard = guardrails(gen, gen_d, sched_real, d_real, w_real)
     # ★暗記チェックは zero-shot 基準を持たない（ZERO_SHOT_GUARDRAILS に入れていない）。
     #   Stage 1 の実測が無いので比を出すと出所不明の数字になる。生の値で並べ、
@@ -238,7 +249,8 @@ def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndar
                        "pop": tgt["pop"].reshape(sm.D_GROUPS)[sel]}
             # ★採点の定義は stage2_targets.eval_against ただ一つ。群数は教師テンソルから
             #   読むので、教師群と held-out 群を同じ関数で測れる
-            scores = st.eval_against(rates[sel], sub_tgt, mask_c)
+            scores = st.eval_against(rates[sel], sub_tgt, mask_c,
+                                     (rates_a[sel], rates_b[sel]))
             scores.pop("mask")          # mask は下の行で明示的に持たせる
             rows.append({"ckpt": path.name, "step": step,
                          "teacher_groups": int(teacher_mask.sum()),

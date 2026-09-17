@@ -825,6 +825,86 @@ def test_eval_against_subset() -> None:
     print("test_eval_against_subset: OK")
 
 
+def _fake_pool(probs: np.ndarray, n: int, rng: np.random.Generator) -> np.ndarray:
+    """各スロットで probs に従う活動 index を群あたり n 本引く, (D,12,96) -> (D,n,96)
+
+    生成器の代わりに使う合成データ。真の群平均が probs だと分かっているので、
+    推定量の期待値を解析値と突き合わせられる。numpy 版なのは評価側
+    (stage2_select / pool_to_rates) が numpy の int プールを扱うためで、
+    torch 版の _fake_onehot とは用途が別である。
+
+    Args:
+        probs: 各群・各スロットの活動分布, dtype=float64, (D, 12, 96)
+            活動方向の和が 1 であること
+        n: 群あたりの本数
+        rng: 乱数生成器
+
+    Returns:
+        活動 index のプール, dtype=int64, (D, n, 96)
+    """
+    d, _, n_slot = probs.shape
+    cdf = probs.transpose(0, 2, 1).cumsum(axis=2)                  # (D,96,12)
+    u = rng.random((d, n_slot, n, 1))
+    idx = (u > cdf[:, :, None, :]).sum(axis=3)                     # (D,96,n) 逆関数法
+    return idx.transpose(0, 2, 1).astype(np.int64)                 # (D,n,96)
+
+
+def test_rate_mse_split() -> None:
+    """rate_mse_split が生成側のモンテカルロ雑音を落とすことを確認する（設計書 §9.4）。
+
+    素の rate_mse は E[(ā − A*)²] = (E[ā] − A*)² + Var(ā) で、第2項がモデルの
+    良し悪しと無関係な床になる。ここでは「モデルが完璧」= 教師と同じ分布から
+    引くので bias² = 0 であり、素の mse は床そのもの、split は 0 になるはずである。
+    """
+    rng = np.random.default_rng(0)
+    d, n, reps = 3, 40, 30
+
+    # 真の率。各スロットで活動方向の和が 1。NaN は置かない（マスクの効果を混ぜないため）
+    raw = rng.random((d, st.NUM_COMMON, st.NUM_SLOTS)) + 0.05
+    probs = raw / raw.sum(axis=1, keepdims=True)
+    tgt = {"group_rates_tbl": probs, "pop": np.full(d, 1.0)}
+    shape3 = (d, st.NUM_COMMON, st.NUM_SLOTS)
+
+    def _measure(pool: np.ndarray) -> tuple[dict, np.ndarray, np.ndarray]:
+        half = n // 2
+        ra = sm.pool_to_rates(pool[:, :half])
+        rb = sm.pool_to_rates(pool[:, half:])
+        return st.eval_against(sm.pool_to_rates(pool), tgt, st.mask_12act(), (ra, rb)), ra, rb
+
+    # (1) 学習側 agg_loss_from_rates を ω=1 で呼んだ値と厳密に一致すること。
+    #     教師に NaN が無く 12act 全通しなので、eval_against のマスクは全 True になり
+    #     両者は同じセル集合を平均する
+    r, ra, rb = _measure(_fake_pool(probs, n, rng))
+    ref = sl.agg_loss_from_rates(torch.from_numpy(ra.reshape(shape3)),
+                                 torch.from_numpy(rb.reshape(shape3)),
+                                 torch.from_numpy(probs),
+                                 torch.ones(shape3, dtype=torch.float64))
+    assert abs(r["rate_mse_split"] - float(ref)) < 1e-12, \
+        "学習側 agg_loss_from_rates(ω=1) と定義がずれている"
+    print(f"  (1) agg_loss_from_rates(ω=1) と一致 ({r['rate_mse_split']:+.3e}): OK")
+
+    # (2) mu_hat_split を渡さなければ返さない（後方互換）
+    assert "rate_mse_split" not in st.eval_against(
+        sm.pool_to_rates(_fake_pool(probs, n, rng)), tgt, st.mask_12act())
+    print("  (2) mu_hat_split 未指定なら rate_mse_split を返さない: OK")
+
+    # (3) ★本題。素の mse は解析的な床 Var(ā)=mean p(1-p)/n に一致し、split は 0 に寄る
+    mse_s, split_s = [], []
+    for _ in range(reps):
+        r, _, _ = _measure(_fake_pool(probs, n, rng))
+        mse_s.append(r["rate_mse"])
+        split_s.append(r["rate_mse_split"])
+    floor = float((probs * (1.0 - probs)).mean() / n)
+    mse_bar, split_bar = float(np.mean(mse_s)), float(np.mean(split_s))
+    assert abs(mse_bar - floor) < 0.1 * floor, \
+        f"素の rate_mse が解析的な床と合わない: {mse_bar:.3e} vs {floor:.3e}"
+    assert abs(split_bar) < 0.1 * floor, \
+        f"split が 0 に寄っていない: {split_bar:+.3e} (床 {floor:.3e})"
+    print(f"  (3) bias=0 のとき 素 {mse_bar:.3e} ≒ 床 {floor:.3e} / "
+          f"split {split_bar:+.3e} ≒ 0: OK")
+    print("test_rate_mse_split: OK")
+
+
 def test_checkpoint_selection() -> None:
     """(sel) 事後選択が §9.8 の出所列を持ち、LGO で in-teacher と held-out を分けること。"""
     model = _model()
@@ -1307,6 +1387,7 @@ def main() -> None:
     test_check_shapes()
     test_teacher_mask_and_holdout()
     test_eval_against_subset()
+    test_rate_mse_split()
     test_checkpoint_selection()
     test_naive_accumulation_is_wrong()
     test_two_pass_matches_full_batch()
