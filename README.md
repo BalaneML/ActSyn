@@ -194,7 +194,7 @@ uv run python src/models/DDPM_Aggregate_Simple/stage2_finetune.py --smoke
 uv run python src/models/DDPM_Aggregate_Simple/stage2_finetune.py \
     --steps 300 --d-sub 7 --n 256 --K 1 --eps inf --lam auto
 
-# 事後チェックポイント選択（全 ckpt を共通乱数で生成して比べる。SQUID は qsub jobs/eval_stage2_select.sh）
+# 事後チェックポイント選択（全 ckpt を共通乱数で生成して比べる。SQUID は jobs/submit.sh jobs/eval_stage2_select.sh）
 uv run python src/models/DDPM_Aggregate_Simple/stage2_select.py \
     --ckpt-dir outputs/checkpoints/stage2 --n 2000
 ```

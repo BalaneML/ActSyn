@@ -1,13 +1,11 @@
 #!/bin/bash
 #PBS -q SQUID-S
-#PBS --group=<グループ名>
 #PBS -l elapstim_req=08:00:00
 #PBS -l cpunum_job=38
 #PBS -l gpunum_job=1
 #PBS -N dt_tang_stage1
 #PBS -r n
 #PBS -m e
-#PBS -M <メールアドレス>
 #
 # Stage1（pretrain）の本学習: AggDDPM の denoiser を Tang et al. 2025 バックボーン
 # (src/models/DDPM_Aggregate_Tang/model.py) に置き換えた条件付き学習。
@@ -24,10 +22,10 @@
 #   outputs/generated/ddpm_tang_w050_pretrain_samples.csv
 #
 # 投入手順:
-#   qsub jobs/smoke.sh                              # 先に DBG(10分) で通すこと
-#   qsub jobs/train_ddpm_tang.sh                    # 本学習（既定: 1000ep, width 0.5）
-#   EPOCHS=1500 qsub -v EPOCHS jobs/train_ddpm_tang.sh
-#   WIDTH_SCALE=1.0 qsub -v WIDTH_SCALE jobs/train_ddpm_tang.sh   # Tang 忠実な幅
+#   jobs/submit.sh jobs/smoke.sh                              # 先に DBG(10分) で通すこと
+#   jobs/submit.sh jobs/train_ddpm_tang.sh                    # 本学習（既定: 1000ep, width 0.5）
+#   EPOCHS=1500 jobs/submit.sh -v EPOCHS jobs/train_ddpm_tang.sh
+#   WIDTH_SCALE=1.0 jobs/submit.sh -v WIDTH_SCALE jobs/train_ddpm_tang.sh   # Tang 忠実な幅
 #   （WIDTH_SCALE を変えるとチェックポイント名も変わるので既定幅の結果は潰れない）
 #
 # elapstim_req=08:00:00 の根拠:

@@ -1,13 +1,11 @@
 #!/bin/bash
 #PBS -q SQUID-S
-#PBS --group=G16263
 #PBS -l elapstim_req=06:00:00
 #PBS -l cpunum_job=38
 #PBS -l gpunum_job=1
 #PBS -N dt_simple_stage2
 #PBS -r n
 #PBS -m e
-#PBS -M yokoyama.jun@ist.osaka-u.ac.jp
 #
 # AggDDPM-Simple Stage 2: 公表集計表だけを教師にした微調整
 # 設計: src/models/DDPM_Aggregate_Simple/docs/Stage2_design.md
@@ -33,16 +31,16 @@
 #   logs/simple_stage2_${PBS_JOBID}.log
 #
 # 投入手順:
-#   qsub jobs/smoke.sh                    # まず DBG キューで 10 分の動作確認
-#   qsub jobs/train_ddpm_simple_stage2.sh
+#   jobs/submit.sh jobs/smoke.sh                    # まず DBG キューで 10 分の動作確認
+#   jobs/submit.sh jobs/train_ddpm_simple_stage2.sh
 #
 #   環境変数で上書きできる:
 #     STEPS=300 D_SUB=7 N=256 K=1 CHUNK=0 EPS=inf LAM=auto LOSS=sq HOLDOUT= RESUME=0
 #     SAVE_EVERY=25 VAL_EVERY=10
 #     CHUNK=0 は予算からの自動決定。B 未満になると2パス勾配蓄積へ切り替わる
 #     （勾配は一括計算と厳密に一致するので、下がっても学習の意味は変わらない）
-#   例: EPS=0.01 qsub -v EPS jobs/train_ddpm_simple_stage2.sh     # 主B（χ²）
-#       RESUME=1 qsub -v RESUME jobs/train_ddpm_simple_stage2.sh  # 途中から再開
+#   例: EPS=0.01 jobs/submit.sh -v EPS jobs/train_ddpm_simple_stage2.sh     # 主B（χ²）
+#       RESUME=1 jobs/submit.sh -v RESUME jobs/train_ddpm_simple_stage2.sh  # 途中から再開
 #
 # ★LAM について（2026-09-17 の実測。Stage2_implementation.md §6.2）
 #   λ=auto が返す値を X とすると、実測で λ‖g_atus‖/‖g_agg‖ = 22〜51 倍、
@@ -183,8 +181,8 @@ N_CKPT="$(ls -1 "${CKPT_DIR}"/stage2_step*.pt 2>/dev/null | wc -l)"
 if [ "${N_CKPT}" -gt 0 ]; then
     echo "checkpoints saved: ${N_CKPT} 世代 in ${CKPT_DIR}"
     echo "次は事後選択（別ジョブ。生成に 1〜4 時間かかる）:"
-    echo "  qsub jobs/eval_stage2_select.sh"
-    echo "  粗い掃引の段階なら N=1000 qsub -v N jobs/eval_stage2_select.sh で半分の時間"
+    echo "  jobs/submit.sh jobs/eval_stage2_select.sh"
+    echo "  粗い掃引の段階なら N=1000 jobs/submit.sh -v N jobs/eval_stage2_select.sh で半分の時間"
 else
     echo "WARNING: checkpoint が1つも書かれていない。ログ末尾を確認すること: ${LOG}" >&2
 fi

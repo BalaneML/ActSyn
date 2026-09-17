@@ -1,13 +1,11 @@
 #!/bin/bash
 #PBS -q SQUID-S
-#PBS --group=G16263
 #PBS -l elapstim_req=05:00:00
 #PBS -l cpunum_job=38
 #PBS -l gpunum_job=1
 #PBS -N dt_stage2_select
 #PBS -r n
 #PBS -m e
-#PBS -M yokoyama.jun@ist.osaka-u.ac.jp
 #
 # Stage 2 の事後チェックポイント選択（教師適合 × ガードレール）
 # 設計: src/models/DDPM_Aggregate_Simple/docs/Stage2_design.md §8.4 / §9.8
@@ -41,11 +39,11 @@
 #   logs/stage2_select_${PBS_JOBID}.log
 #
 # 投入手順:
-#   qsub jobs/eval_stage2_select.sh
+#   jobs/submit.sh jobs/eval_stage2_select.sh
 #
 #   環境変数で上書きできる:
 #     N=2000 POOL_SEED=12345 CKPT_DIR=... OUT_CSV=...
-#   例: N=1000 qsub -v N jobs/eval_stage2_select.sh
+#   例: N=1000 jobs/submit.sh -v N jobs/eval_stage2_select.sh
 
 cd "${PBS_O_WORKDIR}"
 source jobs/_common.sh

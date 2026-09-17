@@ -1,6 +1,5 @@
 #!/bin/bash
 #PBS -q SQUID-S
-#PBS --group=<グループ名>
 #PBS -l elapstim_req=02:00:00
 #PBS -l cpunum_job=38
 #PBS -l gpunum_job=1
@@ -10,7 +9,7 @@
 # 学習済み AggDDPM を使った日本側マッチング実験（サンプリング + 指数傾け）。
 # train_ddpm.sh の完了後に投入する。
 #
-# 投入: qsub jobs/sample_japan_match.sh
+# 投入: jobs/submit.sh jobs/sample_japan_match.sh
 #
 # 学習より短時間で終わるため elapstim_req を短くしてポイント消費を抑える。
 
