@@ -43,7 +43,7 @@ import argparse
 import importlib.util
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -78,6 +78,8 @@ st: Any = _load("simple_stage2_targets", HERE / "stage2_targets.py")
 im: Any = _load("select_individual_metrics", REPO_ROOT / "src" / "eval" / "individual_metrics.py")
 fe: Any = _load("select_feasibility", REPO_ROOT / "src" / "eval" / "feasibility.py")
 cd: Any = _load("select_conditioning", REPO_ROOT / "src" / "eval" / "conditioning.py")
+sp: Any = _load("select_schedule_plausibility",
+                REPO_ROOT / "src" / "eval" / "schedule_plausibility.py")
 
 OUT_CSV = REPO_ROOT / "data" / "processed" / "aggregates" / "stage2_checkpoint_selection.csv"
 DEFAULT_N = 2000
@@ -107,6 +109,89 @@ ZERO_SHOT_GUARDRAILS = {
     "other_x_share":        0.0136,
 }
 GUARDRAIL_KEYS = tuple(ZERO_SHOT_GUARDRAILS)
+
+# 軸2 の指標名 -> (statistic, weight_basis)。§9.8 が CSV に必ず持たせろと定めた2列。
+#
+# ★statistic 列が循環と非循環を機械的に分ける。教師（社会生活基本調査の時刻別
+#   行動者率）が縛るのは slot_rate だけで、残りは教師から導出できない（§9.2）。
+#   この区別を列に持たせないと、同じ「行動者率」という語が循環した値と非循環な値の
+#   両方を指してしまう。
+#
+# ★設計書 §9.8 が例示する5値（slot_rate / daily_participation / derived_clock /
+#   sequence / plausibility）に diversity / memorization / conditioning を足してある。
+#   多様性（§9.5(b)）・暗記（§9.5(c)）・条件付け（§9.4）はいずれも5値のどれにも
+#   収まらず、まとめると「非循環」としか言えなくなるため分けた。
+#   daily_participation と derived_clock は実装項目 17（§9.7）が入ったときに使う。
+#
+# ★weight_basis 列が重みの取り違えを止める。同じ指標でも重み次第で値が変わる
+#   （例: WORK の日次行動者率は非加重 0.4698 / TUFINLWGT 加重 0.5097）。
+#     atus_comp : im.group_reweight で実 ATUS 平日の群構成へ重み付けして測った行
+#     stula_pop : 日本の公表人口で重み付けして測った行（軸1 の dev_* など）
+#     none      : 重みを使わない行
+GUARDRAIL_META: dict[str, tuple[str, str]] = {
+    # feasibility（§9.5(a)）
+    "travel_single_rate":     ("plausibility", "atus_comp"),
+    "travel_odd_rate":        ("plausibility", "atus_comp"),
+    "night_intrusion_rate":   ("plausibility", "atus_comp"),
+    # 断片化と系列（§9.5(a)）
+    "switch_mean":            ("sequence", "atus_comp"),
+    "single_slot_ratio":      ("sequence", "atus_comp"),
+    "wrap_closure_rate":      ("sequence", "atus_comp"),
+    "bigram_jsd":             ("sequence", "atus_comp"),
+    "switch_emd":             ("sequence", "atus_comp"),
+    # 条件付け（§9.4）
+    "separation_ratio":       ("conditioning", "atus_comp"),
+    # 活動シェア。教師と同種の統計量だが、比べる先は zero-shot であって教師ではない
+    "other_x_share":          ("slot_rate", "none"),
+    # 妥当性 12 指標（§9.6 / 実装項目 13）
+    "sleep_holder_rate":      ("plausibility", "atus_comp"),
+    "main_sleep_nocturnal":   ("plausibility", "atus_comp"),
+    "main_sleep_share_ok":    ("plausibility", "atus_comp"),
+    "main_sleep_share_mean":  ("plausibility", "atus_comp"),
+    "main_sleep_mean_min":    ("plausibility", "atus_comp"),
+    "work_holder_rate":       ("plausibility", "atus_comp"),
+    "work_block_daytime":     ("plausibility", "atus_comp"),
+    "work_span_daytime":      ("plausibility", "atus_comp"),
+    "work_block_mean_min":    ("plausibility", "atus_comp"),
+    "work_span_mean_min":     ("plausibility", "atus_comp"),
+    "meals_count_ok":         ("plausibility", "atus_comp"),
+    "meals_count_mean":       ("plausibility", "atus_comp"),
+    # 多様性（§9.5(b)）。pairwise と group_dispersion は重みを取らないので none
+    "pairwise_hamming_mean":  ("diversity", "none"),
+    "pairwise_hamming_std":   ("diversity", "none"),
+    "pairwise_hamming_iqr":   ("diversity", "none"),
+    "group_hamming_mean":     ("diversity", "none"),
+    "var_ratio_median":       ("diversity", "atus_comp"),
+    "var_ratio_switches":     ("diversity", "atus_comp"),
+    # 暗記（§9.5(c)）
+    "dcr_train":              ("memorization", "none"),
+    "dcr_holdout":            ("memorization", "none"),
+    "dcr_gap":                ("memorization", "none"),
+    "exact_copy_rate":        ("memorization", "none"),
+    "n_ref_per_side":         ("memorization", "none"),
+}
+
+
+def meta_of(metric: str) -> tuple[str, str]:
+    """軸2 の指標名から (statistic, weight_basis) を引く。
+
+    ★未登録なら KeyError で落とす。既定値を返すと、指標を足したときに分類を
+      忘れても黙って通り、循環／非循環の区別が壊れた CSV が出てしまう。
+
+    Args:
+        metric: 指標名。GUARDRAIL_META のキー
+
+    Returns:
+        (statistic, weight_basis)
+
+    Raises:
+        KeyError: GUARDRAIL_META に登録が無い指標
+    """
+    if metric not in GUARDRAIL_META:
+        raise KeyError(
+            f"{metric} が GUARDRAIL_META に無い。指標を足したら statistic と "
+            f"weight_basis の分類も同時に決めること（§9.8）")
+    return GUARDRAIL_META[metric]
 
 
 def memorization_guardrail(gen: np.ndarray, sched_real: np.ndarray,
@@ -150,13 +235,31 @@ def memorization_guardrail(gen: np.ndarray, sched_real: np.ndarray,
 
 
 def guardrails(gen: np.ndarray, gen_d: np.ndarray, sched_real: np.ndarray,
-               d_real: np.ndarray, w_real: np.ndarray) -> dict[str, float]:
+               d_real: np.ndarray, w_real: np.ndarray,
+               seed: int = 0) -> dict[str, float]:
     """軸2 のガードレール一式。生成側は実 ATUS 平日の群構成へ重み付けして測る。
 
     ★重みの出所は im.group_reweight ただ一つ。プールは群一様なので、非加重の人数比を
       使うと総変動距離で 0.139 ずれる。
     ★bigram_jsd と switch_emd は「重み付き・対角除く・行平均」で測る。重み無しだと
       別の値になり（0.0059 / 0.7765）、過去の記録に両方が混在しているので揃える。
+    ★多様性（§9.5(b)）は報酬微調整で最も壊れやすい軸なので必ず 1 本入れる。DRaFT は
+      報酬を上げ続けると出力が似通うことを実測しており、本リポジトリでも指数傾けで
+      2,000 本のプールが実効 115 本（5.76%）まで痩せた。
+    ★妥当性（§9.6）の 12 指標は sp.plausibility_summary をそのまま使う。窓・閾値は
+      ATUS 実測から置いた値で、日本の実測ではない（Limitations に書く）。
+
+    Args:
+        gen: 生成スケジュール, dtype=int64, (M, 96)
+        gen_d: 生成の群インデックス, dtype=int64, (M,)
+        sched_real: 実 ATUS 平日のスケジュール, dtype=int64, (N, 96)
+        d_real: 実 ATUS の群インデックス, dtype=int64, (N,)
+        w_real: 実 ATUS の調査ウェイト, dtype=float64, (N,)
+        seed: 多様性指標のペア標本抽出に使う seed, default=0
+
+    Returns:
+        指標名 -> 値。ZERO_SHOT_GUARDRAILS に基準がある指標は
+        「指標名_vs_zeroshot」も併せて返す
     """
     w_gen = im.group_reweight(gen_d, w_real, d_real, sm.D_GROUPS)
     feas = fe.feasibility_summary(gen, w_gen)
@@ -179,6 +282,32 @@ def guardrails(gen: np.ndarray, gen_d: np.ndarray, sched_real: np.ndarray,
         # OTHER_X シェア（群等重み。§6 修正3 の基準に揃える）
         "other_x_share": float((gen == int(st.Common.OTHER_X)).mean()),
     }
+
+    # --- 妥当性 12 指標（§9.6 / 実装項目 13）------------------------------
+    # 教師は時刻別行動者率しか縛らないので、この層は教師から導出できない＝非循環。
+    out.update({k: float(v) for k, v in
+                sp.plausibility_summary(gen, w_gen).items()})
+
+    # --- 多様性（§9.5(b) / 実装項目 14）-----------------------------------
+    # ★pairwise は平均だけ見ても real / gen が 1% しか違わず判別できない。
+    #   分布の広さ（std / iqr）が狭まったかどうかが多様性の崩壊を捉える。
+    pair = im.pairwise_distance_dist(gen, seed=seed)
+    out["pairwise_hamming_mean"] = float(pair["mean"])
+    out["pairwise_hamming_std"] = float(pair["std"])
+    out["pairwise_hamming_iqr"] = float(pair["iqr"])
+    # 群内のばらつき。条件付けが強すぎて群が潰れていないかを見る（群で平均する）
+    out["group_hamming_mean"] = float(
+        im.group_dispersion(gen, gen_d, sm.D_GROUPS, seed=seed)["hamming_mean"].mean())
+    # 個人別要約の散らばり。主役は var_ratio（生成の分散 / 実データの分散）。
+    # ★平均ではなく中央値で縮約する。n_unique_act のように実データ側の分散が
+    #   ほぼ 0 になる quantity があり、そこで var_ratio が 1e+26 まで発散して
+    #   平均を支配してしまうため。switches は解釈しやすいので個別にも出す。
+    cmp_disp = im.compare_dispersion(sched_real, gen, sm.NUM_ACT, sm.ACT_NAMES,
+                                     w_real, w_gen)
+    out["var_ratio_median"] = float(cmp_disp["var_ratio"].median())
+    sw = cmp_disp.loc[cmp_disp["quantity"] == "switches", "var_ratio"]
+    out["var_ratio_switches"] = float(sw.iloc[0]) if len(sw) else float("nan")
+
     # zero-shot からの変化。λ パレート曲線の縦軸はこちらで、実データからの乖離ではない
     for k, base in ZERO_SHOT_GUARDRAILS.items():
         out[f"{k}_vs_zeroshot"] = out[k] / base if base else float("nan")
@@ -201,8 +330,10 @@ def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndar
         pool_seed: プール生成の乱数種, default=DEFAULT_POOL_SEED
 
     Returns:
-        1 ckpt ぶんの行 list[dict]。mask（12act/11act）× eval_kind（in-teacher/held-out）
-        の組み合わせぶんだけ返る
+        1 ckpt ぶんの行 list[dict]。**1 指標 1 行の縦持ち**で、値は metric / value /
+        vs_zeroshot に入り、出所は statistic / weight_basis / eval_kind / reference /
+        mask が表す（§9.8）。横持ちだと循環した値（教師適合）と非循環な値
+        （ガードレール）が同じ 1 行に混ざり、後から区別できない
 
     Note:
         ★torch.manual_seed を ck.load_ckpt の **後** に置くこと。load_ckpt は学習時の
@@ -233,13 +364,18 @@ def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndar
     half = n // 2
     rates_a = sm.pool_to_rates(pool[:, :half])                     # (28, 12*96)
     rates_b = sm.pool_to_rates(pool[:, half:])                     # (28, 12*96)
-    guard = guardrails(gen, gen_d, sched_real, d_real, w_real)
+    guard = guardrails(gen, gen_d, sched_real, d_real, w_real, seed=pool_seed)
     # ★暗記チェックは zero-shot 基準を持たない（ZERO_SHOT_GUARDRAILS に入れていない）。
     #   Stage 1 の実測が無いので比を出すと出所不明の数字になる。生の値で並べ、
     #   ckpt 間で dcr_gap が上がっていくかどうかを見る
     guard.update(memorization_guardrail(gen, sched_real, seed=pool_seed))
 
+    base = {"ckpt": path.name, "step": step,
+            "teacher_groups": int(teacher_mask.sum()),
+            "n_per_group": n, "pool_seed": pool_seed, **config}
     rows: list[dict] = []
+
+    # --- 軸1: 教師適合。statistic=slot_rate は教師と同じ統計量＝循環している ---
     for mask_c, mask_name in ((st.mask_12act(), "12act"), (st.mask_11act(), "11act")):
         # 教師群と held-out 群を分けて測る。28群すべてが教師なら held-out 行は出ない
         for kind, sel in (("in-teacher", teacher_mask), ("held-out", ~teacher_mask)):
@@ -251,13 +387,62 @@ def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndar
             #   読むので、教師群と held-out 群を同じ関数で測れる
             scores = st.eval_against(rates[sel], sub_tgt, mask_c,
                                      (rates_a[sel], rates_b[sel]))
-            scores.pop("mask")          # mask は下の行で明示的に持たせる
-            rows.append({"ckpt": path.name, "step": step,
-                         "teacher_groups": int(teacher_mask.sum()),
-                         "eval_kind": kind, "reference": "teacher", "mask": mask_name,
-                         "n_per_group": n, "pool_seed": pool_seed,
-                         **config, **scores, **guard})
+            scores.pop("mask")          # mask は行の列として明示的に持たせる
+            for metric, value in scores.items():
+                rows.append({**base, "eval_kind": kind, "reference": "teacher",
+                             "statistic": "slot_rate", "mask": mask_name,
+                             "weight_basis": "stula_pop", "metric": metric,
+                             "value": float(value), "vs_zeroshot": float("nan")})
+
+    # --- 軸2: ガードレール。教師が縛らない量＝非循環 ---
+    # ★群で分けずにプール全体で測るので eval_kind は "all"、mask は 12act 固定。
+    #   横持ちのときは mask × eval_kind の各行へ同じ値を複製していたが、縦持ちなら
+    #   1 指標 1 行で重複しない
+    for metric, value in guard.items():
+        if metric.endswith("_vs_zeroshot"):
+            continue                    # 生値の行の vs_zeroshot 列として載せる
+        statistic, weight_basis = meta_of(metric)
+        rows.append({**base, "eval_kind": "all", "reference": "atus",
+                     "statistic": statistic, "mask": "12act",
+                     "weight_basis": weight_basis, "metric": metric,
+                     "value": float(value),
+                     "vs_zeroshot": float(guard.get(f"{metric}_vs_zeroshot",
+                                                    float("nan")))})
     return rows
+
+
+# 端末に出す要約表の列。CSV には全指標が入っているので、ここは「まず見る」ものだけ。
+SUMMARY_AXIS1 = ("rate_mse_split", "rate_mae", "dev_rmse")
+SUMMARY_AXIS2 = ("switch_mean", "travel_single_rate", "bigram_jsd",
+                 "pairwise_hamming_std", "var_ratio_median", "dcr_gap")
+
+
+def summarize(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """縦持ちの結果表から、端末に出す軸1・軸2 の要約表を作る。
+
+    ★軸1 と軸2 を別の表にする。軸1 は eval_kind（in-teacher / held-out）で行が
+      分かれるのに対し、軸2 は群で分けずプール全体で測る（eval_kind="all"）。
+      1つの表に混ぜると pivot が意味の違う行を平均してしまう。
+
+    Args:
+        df: evaluate_ckpt が返した行の DataFrame（1 指標 1 行の縦持ち）
+
+    Returns:
+        (軸1 の表, 軸2 の表)。軸1 は index=(step, eval_kind)、軸2 は index=step、
+        いずれも columns は SUMMARY_AXIS1 / SUMMARY_AXIS2 の順に並ぶ。
+        該当する指標が 1 つも無ければ空の DataFrame を返す
+    """
+    ax1_src = df[(df["mask"] == "12act") & (df["statistic"] == "slot_rate")
+                 & (df["metric"].isin(SUMMARY_AXIS1))]
+    ax2_src = df[df["metric"].isin(SUMMARY_AXIS2)]
+    ax1 = (ax1_src.pivot_table(index=["step", "eval_kind"], columns="metric",
+                               values="value")
+           .reindex(columns=[m for m in SUMMARY_AXIS1])
+           if len(ax1_src) else pd.DataFrame())
+    ax2 = (ax2_src.pivot_table(index="step", columns="metric", values="value")
+           .reindex(columns=[m for m in SUMMARY_AXIS2])
+           if len(ax2_src) else pd.DataFrame())
+    return ax1, ax2
 
 
 def run(ckpt_dir: Path, n: int = DEFAULT_N, out_csv: Path = OUT_CSV,
@@ -282,13 +467,17 @@ def run(ckpt_dir: Path, n: int = DEFAULT_N, out_csv: Path = OUT_CSV,
     df.to_csv(out_csv, index=False)
     print(f"\n書き出し: {out_csv}")
 
-    cols = ["step", "eval_kind", "rate_mae", "dev_rmse",
-            "travel_single_rate", "switch_mean", "bigram_jsd", "other_x_share"]
-    show = cast(pd.DataFrame, df[df["mask"] == "12act"])[cols]
-    print("\n--- 軸1 教師適合 × 軸2 ガードレール（12act）---")
-    print(show.round(5).to_string(index=False))
+    ax1_tbl, ax2_tbl = summarize(df)
+    print("\n--- 軸1 教師適合（12act）★statistic=slot_rate は教師と同じ統計量 ---")
+    print(ax1_tbl.round(6).to_string())
+    print("\n--- 軸2 ガードレール（非循環）---")
+    print(ax2_tbl.round(5).to_string())
+
     print("\n★軸1 は teacher_groups=28 のとき循環している（学習目的そのもの）。"
-          "\n  ガードレールの基準は実データ値ではなく zero-shot 値（§9.5）。"
+          "\n  非循環の証拠は --holdout-groups で群を抜いた held-out 行から取る。"
+          "\n  パレート曲線の横軸は rate_mse_split（生成側の MC 雑音を抜いた二乗誤差、§9.4）。"
+          "\n  ガードレールの基準は実データ値ではなく zero-shot 値で、vs_zeroshot 列に入る"
+          "\n  （多様性・妥当性・暗記は zero-shot 実測が無いので生値のまま並ぶ）。"
           f"\n  全 ckpt は共通乱数 pool_seed={pool_seed} で生成してある"
           "（ckpt 間の差から生成の MC ノイズを除くため）。")
     return df

@@ -70,6 +70,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -906,7 +907,12 @@ def test_rate_mse_split() -> None:
 
 
 def test_checkpoint_selection() -> None:
-    """(sel) 事後選択が §9.8 の出所列を持ち、LGO で in-teacher と held-out を分けること。"""
+    """(sel) 事後選択が §9.8 の出所列を持ち、LGO で in-teacher と held-out を分けること。
+
+    ★出力は 1 指標 1 行の縦持ちである（実装項目 14）。横持ちだと循環した値
+      （教師適合）と非循環な値（ガードレール）が同じ 1 行に混ざり、後から
+      どちらの性質の数字か区別できなくなる。
+    """
     model = _model()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
     tgt = st.load_stula_targets()
@@ -926,28 +932,81 @@ def test_checkpoint_selection() -> None:
 
     # ★§9.8 の出所列。このリポジトリは数値の出所取り違えを2回起こしている
     for r in rows:
-        for col in ("teacher_groups", "eval_kind", "reference", "mask"):
+        for col in ("teacher_groups", "eval_kind", "reference", "statistic",
+                    "mask", "weight_basis", "metric", "value", "vs_zeroshot"):
             assert col in r, f"出所の列が欠けている: {col}"
-        assert r["reference"] == "teacher"
         assert r["mask"] in ("11act", "12act")
-        assert r["eval_kind"] in ("in-teacher", "held-out")
-    print("  (1) (sel) 全行が teacher_groups / eval_kind / reference / mask を持つ: OK")
+        assert r["eval_kind"] in ("in-teacher", "held-out", "all")
+        assert r["weight_basis"] in ("stula_pop", "atus_comp", "none")
+    print("  (1) (sel) 全行が §9.8 の出所列（statistic / weight_basis を含む）を持つ: OK")
 
-    # LGO なしは in-teacher だけ2行（11act/12act）、LGO ありは held-out も出て4行
-    s1 = [r for r in rows if r["step"] == 1]
-    s2 = [r for r in rows if r["step"] == 2]
-    assert len(s1) == 2 and {r["eval_kind"] for r in s1} == {"in-teacher"}
+    # 軸1（循環）と軸2（非循環）が statistic で機械的に分かれること
+    ax1 = [r for r in rows if r["reference"] == "teacher"]
+    ax2 = [r for r in rows if r["reference"] == "atus"]
+    assert ax1 and ax2
+    assert all(r["statistic"] == "slot_rate" and r["weight_basis"] == "stula_pop"
+               for r in ax1), "軸1 は教師と同じ統計量なので slot_rate / stula_pop"
+    assert all(r["eval_kind"] == "all" for r in ax2), \
+        "軸2 は群で分けずプール全体で測るので eval_kind=all"
+    assert any(r["statistic"] != "slot_rate" for r in ax2)
+    print("  (2) 軸1 は slot_rate（循環）、軸2 は eval_kind=all で分かれる: OK")
+
+    # LGO なしは in-teacher だけ、LGO ありは held-out も出る
+    s1 = [r for r in ax1 if r["step"] == 1]
+    s2 = [r for r in ax1 if r["step"] == 2]
+    assert {r["eval_kind"] for r in s1} == {"in-teacher"}
     assert all(r["teacher_groups"] == 28 for r in s1)
-    assert len(s2) == 4 and {r["eval_kind"] for r in s2} == {"in-teacher", "held-out"}
+    assert {r["eval_kind"] for r in s2} == {"in-teacher", "held-out"}
     assert all(r["teacher_groups"] == 24 for r in s2)
-    held = [r for r in s2 if r["eval_kind"] == "held-out" and r["mask"] == "12act"][0]
-    assert held["n_cells"] == 4 * 12 * 96, "held-out のセル数が4群ぶんでない"
-    print("  (2) LGO 無しは in-teacher のみ、有りは held-out 4群が分かれて出る: OK")
+    held_cells = [r["value"] for r in s2 if r["eval_kind"] == "held-out"
+                  and r["mask"] == "12act" and r["metric"] == "n_cells"]
+    assert held_cells == [float(4 * 12 * 96)], "held-out のセル数が4群ぶんでない"
+    print("  (3) LGO 無しは in-teacher のみ、有りは held-out 4群が分かれて出る: OK")
 
-    # 軸2 のガードレールが全部載っていること（基準は zero-shot 値、§9.5）
+    # 軸2 の指標集合が GUARDRAIL_META と厳密に一致すること。
+    # ★片側だけ増やすと statistic / weight_basis の分類漏れが起きる。meta_of が
+    #   KeyError で落とす側と、この検査で META の書き過ぎを止める側の両方が要る
+    got = {r["metric"] for r in ax2}
+    assert got == set(se.GUARDRAIL_META), \
+        f"GUARDRAIL_META とずれている: 不足={set(se.GUARDRAIL_META) - got} 余分={got - set(se.GUARDRAIL_META)}"
     for key in se.GUARDRAIL_KEYS:
-        assert key in rows[0] and math.isfinite(rows[0][key]), f"ガードレール欠落: {key}"
-    print(f"  (3) 軸2 のガードレール {len(se.GUARDRAIL_KEYS)} 指標が全行に載る: OK")
+        assert key in got, f"ガードレール欠落: {key}"
+    print(f"  (4) 軸2 の {len(got)} 指標が GUARDRAIL_META と一致: OK")
+
+    # 実装項目 13（妥当性12）と多様性・暗記が配線されていること
+    by_stat: dict[str, set[str]] = {}
+    for r in ax2:
+        by_stat.setdefault(r["statistic"], set()).add(r["metric"])
+    assert len(by_stat["plausibility"]) == 15, "妥当性12 + feasibility3 が揃っていない"
+    assert len(by_stat["diversity"]) == 6, "多様性6 指標が揃っていない"
+    assert len(by_stat["memorization"]) == 5
+    assert "sleep_holder_rate" in by_stat["plausibility"]
+    assert "pairwise_hamming_std" in by_stat["diversity"]
+    print(f"  (5) statistic 別: " + " / ".join(
+        f"{k}={len(v)}" for k, v in sorted(by_stat.items())) + ": OK")
+
+    # zero-shot 基準がある指標だけ vs_zeroshot が有限になる
+    for r in ax2:
+        has_base = r["metric"] in se.ZERO_SHOT_GUARDRAILS
+        assert math.isfinite(r["vs_zeroshot"]) == has_base, \
+            f"{r['metric']}: vs_zeroshot の有無が基準の有無と合っていない"
+    print("  (6) vs_zeroshot は zero-shot 実測がある指標にだけ入る: OK")
+
+    # 実装項目 15 の rate_mse_split が軸1 に載る
+    assert any(r["metric"] == "rate_mse_split" for r in ax1), "rate_mse_split が軸1 に無い"
+    print("  (7) rate_mse_split が軸1 に載る（λ パレート曲線の横軸）: OK")
+
+    # 端末表示の pivot が落ちないこと。
+    # ★CSV は pivot より前に書き終わっているので落ちても結果は失われないが、
+    #   12 世代 × 6 本を評価した最後で落ちると読む手が止まる
+    ax1_tbl, ax2_tbl = se.summarize(pd.DataFrame(rows))
+    assert list(ax1_tbl.columns) == list(se.SUMMARY_AXIS1)
+    assert list(ax2_tbl.columns) == list(se.SUMMARY_AXIS2)
+    # 軸1 は step1 の in-teacher と step2 の in-teacher / held-out で3行
+    assert len(ax1_tbl) == 3, f"軸1 の行数が合わない: {len(ax1_tbl)}"
+    # 軸2 は ckpt ごとに1行（群で分けないので eval_kind では増えない）
+    assert len(ax2_tbl) == 2, f"軸2 の行数が合わない: {len(ax2_tbl)}"
+    print("  (8) summarize が軸1（step × eval_kind）と軸2（step）を分けて返す: OK")
     print("test_checkpoint_selection: OK")
 
 
