@@ -43,14 +43,27 @@ fi
 # fold の割り当てはコンテナ内の python で出す。
 # ★フロントエンドの system python には numpy / pandas が入っていないので、
 #   ここで直接 python を呼ぶと ModuleNotFoundError になる。
-# stdout（機械可読な `fold_id 群,群,...`）だけを受け取り、層化の確認は
+# stdout から機械可読な `fold_id 群,群,...` の行だけを拾い、層化の確認は
 # stderr としてそのまま端末へ流す。
 echo "=== fold の割り当て ==="
-FOLDS="$(singularity run "${SIF}" python \
+RAW="$(singularity run "${SIF}" python \
     src/models/DDPM_Aggregate_Simple/stage2_lgo.py --print-folds)"
 status=$?
-if [ ${status} -ne 0 ] || [ -z "${FOLDS}" ]; then
+if [ ${status} -ne 0 ]; then
     echo "ERROR: fold を計算できなかった（exit ${status}）" >&2
+    exit 1
+fi
+
+# ★NGC コンテナは起動バナー（"== PyTorch ==" やバージョン表示など約 40 行）を
+#   **stdout** へ出す。素通しすると `fold` にバナー行、`HOLDOUT` に空文字が入り、
+#   holdout 無しのジョブが何十本も qsub される（2026-09-18 に実機で確認）。
+#   機械可読な `fold_id 群,群,...` の行だけを残すこと。
+FOLDS="$(printf '%s\n' "${RAW}" | grep -E '^[0-9]+ [0-9]+(,[0-9]+)*$')"
+N_FOLD_LINES="$(printf '%s\n' "${FOLDS}" | grep -c . || true)"
+if [ "${N_FOLD_LINES}" -ne 7 ]; then
+    echo "ERROR: fold 行が 7 本でない（${N_FOLD_LINES} 本）。1 本も投入していない。" >&2
+    echo "--- stage2_lgo.py の stdout ---" >&2
+    printf '%s\n' "${RAW}" >&2
     exit 1
 fi
 
