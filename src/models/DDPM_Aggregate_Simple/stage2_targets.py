@@ -77,6 +77,44 @@ def _map_codes(col: Any, table: dict) -> "pd.Series":
     return cast("pd.Series", col).map(table)
 
 
+def load_layer_sizes(name: str = DEFAULT_TABLE) -> np.ndarray | None:
+    """層表 `<name>_layers.csv` から全国・平日の実回答者数を読む, -> (2,16,2) or None
+
+    原表の列 104（`サンプルサイズ`）が出所である。教師 `A*` の各セルは有限標本からの
+    推定値なので、それ自体が標本誤差を持つ。その大きさを決めるのがこの値である。
+
+    Note:
+        ★戻り値の軸 1 は 5 歳 15 区分の**コード 1..15 をそのまま添字**にする
+          （index 0 は使わない）。`pop15` と同じ形にして、両者を同じ添字で引けるように
+          してある。
+        ★ファイルが無ければ None を返す。教師の床は評価のための付加情報であって
+          学習には要らないので、層表が無い環境（古いチェックアウト、層表を配る前の
+          計算機）でも `load_stula_targets` がそのまま動く必要がある。
+
+    Args:
+        name: timeband 表の名前, default=DEFAULT_TABLE
+
+    Returns:
+        層の実回答者数, dtype=float64, (N_G, 16, N_E)。層表が無ければ None
+    """
+    path = STULA_DIR / f"{name}_layers.csv"
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    df = cast(pd.DataFrame, df[df["region"] == "00_全国"])
+    df = df.assign(
+        g=_map_codes(df["gender"], {"1_男": 0, "2_女": 1}),
+        e=_map_codes(df["employment"], {"1_有業者": 1, "2_無業者": 0}),
+        a15=cast("pd.Series", df["age_class"]).str[:2].map(
+            lambda c: int(c) if isinstance(c, str) and c.isdigit() and c != "00" else np.nan),
+    ).dropna(subset=["g", "e", "a15", "sample_size"])
+    n15 = np.zeros((N_G, 16, N_E))
+    for key, grp in df.groupby(["g", "a15", "e"]):
+        g, a15, e = cast(tuple, key)
+        n15[int(g), int(a15), int(e)] = grp["sample_size"].iloc[0]
+    return n15
+
+
 def d_index(g: int, a: int, e: int) -> int:
     """(性2, 年齢7区分, 就業2) -> 群インデックス 0..27"""
     return g * (N_A * N_E) + a * N_E + e
@@ -99,16 +137,21 @@ def mask_11act() -> npt.NDArray[np.bool_]:
 # 教師 A* の構築
 # ============================================================
 def load_stula_targets(name: str = DEFAULT_TABLE) -> dict:
-    """timeband CSV -> {"group_rates_tbl": (28,12,96), "pop": (2,7,2)}, [0,1]、NaN=非公表
+    """timeband CSV -> {"group_rates_tbl": (28,12,96), "pop": (2,7,2), ...}, [0,1]、NaN=非公表
 
     Note:
         全国・平日は非公表セルは0個, 11大都市圏ではいくつかある
+        ★`group_rates_var` は教師自身の標本誤差の分散である。`A*` を作るのと
+          同じ重み・同じ非公表の扱いで 1 度に積むので、平均と分散が食い違いようがない。
+          層表 `<name>_layers.csv` が無ければ None になる（`load_layer_sizes` 参照）。
 
     Args:
         name: csvファイル名
 
     Returns:
-        各郡の行動者率と推定人口のdict
+        各郡の行動者率と推定人口のdict。
+        group_rates_tbl (28,12,96) / pop (2,7,2) /
+        group_rates_var (28,12,96) or None / n_layer (2,16,2) or None
     """
     df = pd.read_csv(STULA_DIR / f"{name}.csv")
     df = cast(pd.DataFrame, df[df["region"] == "00_全国"])       # P8: 全国のみ
@@ -164,7 +207,28 @@ def load_stula_targets(name: str = DEFAULT_TABLE) -> dict:
     with np.errstate(invalid="ignore"):
         group_rates_tbl = (acc / wsum).reshape(D_GROUPS, NUM_COMMON, NUM_SLOTS)
 
-    return {"group_rates_tbl": group_rates_tbl, "pop": pop}
+    # 教師自身の標本誤差（§9.4 / 実装項目 16）。
+    #   A*[d,c,s] = Σ_ℓ w_ℓ p_ℓ / W      （ℓ は群 d を構成する 5 歳区分、W = Σ w_ℓ）
+    #   Var       = Σ_ℓ (w_ℓ/W)² p_ℓ(1−p_ℓ)/n_ℓ
+    # ★12 分類は 20 分類の**排他的な**部分集合の和なので、その和もまた二項である。
+    #   したがってセルごとに p(1−p)/n を当てられる（多項分布の部分和の分散）。
+    # ★標本抽出が層化多段なので実効標本は n_ℓ より小さい。ここは design effect を
+    #   無視した**下限値**である（§9.4 の指示どおり、論文にもそう書く）。
+    n15 = load_layer_sizes(name)
+    group_rates_var = None
+    if n15 is not None:
+        n_row = n15[g_i, a15_i, e_i]                                # 行ごとの実回答者数
+        var_acc = np.zeros((N_G, N_A, N_E, NUM_COMMON, NUM_SLOTS))
+        usable = published & (n_row[:, None] > 0)
+        np.add.at(var_acc, idx,
+                  np.where(usable,
+                           (w_row ** 2 / np.maximum(n_row, 1.0))[:, None]
+                           * vals * (1.0 - vals), 0.0))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            group_rates_var = (var_acc / wsum ** 2).reshape(D_GROUPS, NUM_COMMON, NUM_SLOTS)
+
+    return {"group_rates_tbl": group_rates_tbl, "pop": pop,
+            "group_rates_var": group_rates_var, "n_layer": n15}
 
 
 # ============================================================
@@ -178,6 +242,70 @@ def nan_renorm_pop_weights(grp_tbl: np.ndarray, pi_d: np.ndarray) -> np.ndarray:
     w = np.where(np.isnan(grp_tbl), 0.0, pi_d[:, None, None])
     with np.errstate(invalid="ignore", divide="ignore"):
         return w / w.sum(axis=0)
+
+
+def teacher_floor(tgt: dict, mask_c: npt.NDArray[np.bool_]) -> dict:
+    """教師自身の標本誤差が作る評価指標の下限（§9.4 / 実装項目 16）。
+
+    **完全なモデルでも到達できない値**を返す。教師 `A*` は有限標本からの推定値なので、
+    モデルが真の率 `p_true` をぴたりと当てても、採点は `|p_true − A*|` のぶん残る。
+    λ 間の差がこの下限より小さければ、それは教師の標本誤差に埋もれており、
+    モデルの優劣とは読めない。
+
+    Note:
+        ★`eval_against` と重み付けを揃えてある。あちらは masked セルの**素平均**を
+          取る（人口加重ではない）ので、こちらも素平均にする。片方だけ加重にすると
+          「床」と「実測」が別の量になり、比較が成り立たない。
+        ★`dev_rmse` の床は `rate_mse` の床より小さい。dev は人口平均を引くので、
+          教師の誤差のうち全群に共通な成分が相殺されるためである。
+          群 d の dev 誤差の分散は、`e_d = A*_d − p_true_d` が群をまたいで独立
+          （層が互いに素な標本だから）なので
+
+              Var(dev_d) = V_d (1 − 2 W_d) + Σ_d' W_d'² V_d'
+
+          となる。第1項の `−2 W_d V_d` が自分自身を引いたぶんの相殺である。
+        ★`rate_mae` の床は正規近似 `E|N(0,V)| = √(2V/π)` で出す。厳密には二項の
+          絶対偏差だが、`n_ℓ` が最小 162 でも正規近似の誤差は床の水準に対して小さい。
+        ★design effect を無視しているので、いずれも**下限の下限**である。層化多段
+          抽出の実効標本は `n_ℓ` より小さく、真の床はここで出す値より大きい。
+
+    Args:
+        tgt: `load_stula_targets` の戻り値。`group_rates_var` が None なら使えない
+        mask_c: 採点対象の活動, dtype=bool, (12,)
+
+    Returns:
+        床の dict。`rate_mse` / `rate_mae` / `dev_mse` / `dev_rmse` と、
+        参照用に `n_cells`（床を取ったセル数）と `sd_mean`（セル当たりの標準偏差の平均）
+
+    Raises:
+        ValueError: `group_rates_var` が無い場合（層表 `<name>_layers.csv` を
+            作っていない。`src/common/preprocess/stula/parse_timeband.py` を流すこと）
+    """
+    var = tgt.get("group_rates_var")
+    if var is None:
+        raise ValueError(
+            "group_rates_var が無いので教師の床を出せない。\n"
+            "       層表が未生成である。"
+            "python src/common/preprocess/stula/parse_timeband.py を流すこと")
+    grp_tbl = tgt["group_rates_tbl"]
+    pop = np.asarray(tgt["pop"]).reshape(-1)
+    m = ~np.isnan(grp_tbl) & mask_c[None, :, None]
+
+    # rate_*: セルごとの分散がそのまま床になる
+    v = np.where(m, var, np.nan)
+    rate_mse = float(np.nanmean(v))
+    rate_mae = float(np.nanmean(np.sqrt(2.0 * v / np.pi)))
+
+    # dev_*: 人口平均を引くぶん共通成分が相殺する
+    W = nan_renorm_pop_weights(grp_tbl, pop / pop.sum())        # (28,12,96)
+    v0 = np.where(np.isnan(var), 0.0, var)
+    pooled = np.nansum(W ** 2 * v0, axis=0)                     # (12,96) Σ_d' W² V
+    dev_v = np.where(m, v0 * (1.0 - 2.0 * W) + pooled[None, :, :], np.nan)
+    dev_mse = float(np.nanmean(dev_v))
+
+    return {"rate_mse": rate_mse, "rate_mae": rate_mae,
+            "dev_mse": dev_mse, "dev_rmse": float(np.sqrt(max(dev_mse, 0.0))),
+            "n_cells": int(m.sum()), "sd_mean": float(np.nanmean(np.sqrt(v)))}
 
 
 def eval_against(mu_hat: np.ndarray, tgt: dict,

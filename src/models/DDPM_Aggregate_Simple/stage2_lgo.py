@@ -120,6 +120,56 @@ def fold_shares(pop: np.ndarray, folds: list[list[int]]) -> np.ndarray:
     return np.array([share[f].sum() for f in folds], dtype=np.float64)
 
 
+def fold_floors(tgt: dict, folds: list[list[int]]) -> pd.DataFrame:
+    """fold ごとの「教師自身の標本誤差による床」を出す（実装項目 16 × 18）。
+
+    **LGO の 7 個の値を読むための物差しである。**fold 間のばらつきがここで出る床より
+    小さければ、それは教師の標本誤差の揺らぎであってモデルの当たり外れではない。
+
+    Note:
+        ★fold ごとに床が違う。held-out 4 群の実回答者数はまちまちで、30 代の無業男性
+          （n=162〜227）のような薄い層を含む fold は床が高くなる。全 fold 共通の
+          1 本の床で読むと、薄い fold の値を過小に評価する。
+        ★`stage2_select` の held-out 行と同じ部分集合の取り方に揃えてある。あちらは
+          `group_rates_tbl[sel]` と `pop[sel]` で `sub_tgt` を作るので、こちらも
+          `group_rates_var[sel]` を足した同じ形を `teacher_floor` へ渡す。
+          dev_* は「その 4 群の中での人口平均からのズレ」なので、28 群全体で
+          取った床とは別の値になる。
+
+    Args:
+        tgt: `stage2_targets.load_stula_targets` の戻り値。`group_rates_var` が要る
+        folds: `stratified_folds` の戻り値
+
+    Returns:
+        fold ごとの床。列は fold / groups / pop_share / n_layer_min /
+        rate_mse / rate_mae / dev_mse / dev_rmse
+    """
+    if tgt.get("group_rates_var") is None:
+        raise ValueError(
+            "group_rates_var が無いので fold ごとの床を出せない。\n"
+            "       python src/common/preprocess/stula/parse_timeband.py を流すこと")
+    pop = np.asarray(tgt["pop"]).reshape(st.D_GROUPS)
+    share = pop / pop.sum()
+    n15 = tgt["n_layer"]
+    rows = []
+    for i, f in enumerate(folds):
+        sel = np.asarray(f, dtype=np.int64)
+        sub = {"group_rates_tbl": tgt["group_rates_tbl"][sel],
+               "group_rates_var": tgt["group_rates_var"][sel],
+               "pop": pop[sel]}
+        fl = st.teacher_floor(sub, st.mask_12act())
+        # 群 d -> (性, 年齢7, 就業) を戻して、構成する 5 歳区分の最小標本数を見る
+        n_min = min(n15[d // (st.N_A * st.N_E), a15, d % st.N_E]
+                    for d in f
+                    for a15, a7 in st.AGE15_TO_7.items()
+                    if a7 == (d // st.N_E) % st.N_A)
+        rows.append({"fold": i, "groups": ",".join(str(d) for d in f),
+                     "pop_share": float(share[sel].sum()), "n_layer_min": int(n_min),
+                     "rate_mse": fl["rate_mse"], "rate_mae": fl["rate_mae"],
+                     "dev_mse": fl["dev_mse"], "dev_rmse": fl["dev_rmse"]})
+    return pd.DataFrame(rows)
+
+
 def collect_heldout(csv_paths: list[Path]) -> pd.DataFrame:
     """7 本の結果 CSV から held-out 行だけを集めて 1 枚にする。
 
@@ -211,6 +261,8 @@ def main() -> None:
                         "（`fold_id 群,群,...` の形式）。層化の効き具合は stderr")
     ap.add_argument("--collect", type=Path, nargs="+", default=None,
                     help="fold ごとの結果 CSV。held-out 行を束ねて分布を出す")
+    ap.add_argument("--floors", action="store_true",
+                    help="fold ごとの教師の床を出す。LGO の 7 個を読む物差しになる")
     args = ap.parse_args()
 
     if args.collect:
@@ -226,6 +278,21 @@ def main() -> None:
     tgt = st.load_stula_targets()
     folds = stratified_folds(tgt["pop"], args.n_folds)
     shares = fold_shares(tgt["pop"], folds)
+
+    if args.floors:
+        fl = fold_floors(tgt, folds)
+        print("=== fold ごとの教師の床（12act、design effect 無視の下限）===")
+        print(fl.to_string(index=False,
+                           formatters={"rate_mse": "{:.3e}".format,
+                                       "rate_mae": "{:.5f}".format,
+                                       "dev_mse": "{:.3e}".format,
+                                       "dev_rmse": "{:.5f}".format,
+                                       "pop_share": "{:.4f}".format}))
+        print(f"\nrate_mse の床: {fl['rate_mse'].min():.3e}〜{fl['rate_mse'].max():.3e} "
+              f"(比 {fl['rate_mse'].max() / fl['rate_mse'].min():.2f}倍)")
+        print("★fold 間の差がこの床より小さければ、モデルの当たり外れではなく"
+              "\n  教師の標本誤差の揺らぎである。fold ごとに床が違う点に注意する。")
+        return
 
     if args.print_folds:
         for i, f in enumerate(folds):

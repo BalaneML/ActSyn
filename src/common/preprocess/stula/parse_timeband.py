@@ -55,6 +55,8 @@ ROT       = 16   # 0:00起点 -> 04:00起点の回転量 (4h / 15min)
 HEADER_KEYS_ROW = 9   # キー列名の行
 DATA_START_ROW  = 10
 SLOT_LABEL_ROW  = 7   # 時刻区分ラベルの行
+BLOCK_HEAD_ROW  = 5   # ブロック見出しの行 (推定人口 / 行動者率 / サンプルサイズ)
+SAMPLE_SIZE_HEAD = "サンプルサイズ"   # 行5 でこの見出しを持つ列 = 層の実回答者数
 
 # キー列名の正規化 (表側の日本語ヘッダ -> 出力列名)
 KEY_RENAME = {
@@ -67,7 +69,26 @@ KEY_RENAME = {
 }
 
 
-def parse_table(path: Path) -> pd.DataFrame:
+def parse_table(path: Path) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """時間帯編の表を wide 形式と層形式の 2 枚に変換する。
+
+    Note:
+        ★サンプルサイズを wide 側の列に足してはいけない。下流の
+          `crosswalk_atus_stula.stula_to_common` は groupby のキーを
+          「除外リストに無い非スロット列」として組むので、列を足すと
+          キーに混ざる。しかもこの値は行動=`00_総数` 行にしか入らず
+          他行は NaN なので、NaN キーとして全行が捨てられる。
+        ★サンプルサイズと推定人口は**層**（曜日・地域・男女・就業・年齢）の
+          属性であって行動の属性ではない。層粒度の別表に出すのが素直である。
+
+    Args:
+        path: 時間帯編の xlsx
+
+    Returns:
+        (wide, layers) の組。wide はキー列 + population_k + s0..s95。
+        layers は層粒度で population_k と sample_size を持つ。
+        表にサンプルサイズ列が無ければ layers は None
+    """
     wb = load_workbook(path, read_only=True)  # Excelファイルを読み込む
     ws = wb[wb.sheetnames[0]]  # Excelファイルの1番左のシートを取得
     rows = ws.iter_rows(values_only=True)  # 各行ごとに処理するイテレータを作成
@@ -83,6 +104,11 @@ def parse_table(path: Path) -> pd.DataFrame:
     assert len(slot_cols) == N_SLOTS, f"時刻区分が96列でない: {len(slot_cols)} ({path.name})"
     # 推定人口列: キー列と時刻列の間の残り1列 (行8の単位=千人)
     pop_col = [c for c in range(min(slot_cols)) if c not in key_cols][-1]
+    # サンプルサイズ列: 行5 の見出しで引く (時刻列より右にある最終列)
+    size_cols = [c for c, v in enumerate(grid_head[BLOCK_HEAD_ROW - 1])
+                 if v is not None and str(v).strip() == SAMPLE_SIZE_HEAD]
+    assert len(size_cols) <= 1, f"サンプルサイズ列が複数ある: {size_cols} ({path.name})"
+    size_col = size_cols[0] if size_cols else None
 
     def to_num(v):
         # 推定人口列用: 非数値 ('-', '…' 等) は一律 NaN
@@ -98,18 +124,24 @@ def parse_table(path: Path) -> pd.DataFrame:
         return to_num(v)
 
     records = []
+    layer_records = []
     for row in rows:
         if row[list(key_cols)[0]] is None:
             continue
         rec: dict[str, str | float] = {KEY_RENAME.get(name, name): str(row[c]).strip() for c, name in key_cols.items()}
         rec["population_k"] = to_num(row[pop_col])
+        # 推定人口とサンプルサイズは行動=00_総数 行にしか入らない。そこだけ層表へ落とす
+        if size_col is not None and str(rec.get("activity", "")).startswith("00_"):
+            layer_records.append({k: v for k, v in rec.items() if k != "activity"}
+                                 | {"sample_size": to_num(row[size_col])})
         vals = np.full(N_SLOTS, np.nan)
         for c, k0 in slot_cols.items():
             vals[(k0 - ROT) % N_SLOTS] = to_rate(row[c])   # 04:00起点へ回転
         for j in range(N_SLOTS):
             rec[f"s{j}"] = vals[j]
         records.append(rec)
-    return fix_rate_semantics(pd.DataFrame(records))
+    layers = pd.DataFrame(layer_records) if layer_records else None
+    return fix_rate_semantics(pd.DataFrame(records)), layers
 
 
 def fix_rate_semantics(df: pd.DataFrame) -> pd.DataFrame:
@@ -156,13 +188,22 @@ def main():
             print(f"[skip] {path} が無い (e-Stat statInfId={stat_id} をDLして配置)")
             continue
         print(f"parsing {path.name} ({name}) ...")
-        df = parse_table(path)
+        df, layers = parse_table(path)
         key_desc = {c: df[c].nunique() for c in df.columns if not c.startswith("s") and c != "population_k"}
         print(f"  rows={len(df)}  keys={key_desc}")
         validate(df, name)
         out = OUT_DIR / f"{name}.csv"
         df.to_csv(out, index=False)
         print(f"  -> {out}")
+        if layers is None:
+            print("  サンプルサイズ列が無い表なので層表は出さない")
+            continue
+        out_layers = OUT_DIR / f"{name}_layers.csv"
+        layers.to_csv(out_layers, index=False)
+        n = layers["sample_size"].dropna()
+        print(f"  層 {len(layers)} 行  sample_size: 有効 {len(n)} 件 "
+              f"min={n.min():.0f} max={n.max():.0f}")
+        print(f"  -> {out_layers}")
 
 
 if __name__ == "__main__":

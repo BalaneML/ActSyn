@@ -104,6 +104,9 @@ sl: Any = _load("simple_stage2_loss", HERE / "stage2_loss.py")
 ft: Any = _load("simple_stage2_finetune", HERE / "stage2_finetune.py")
 se: Any = _load("simple_stage2_select", HERE / "stage2_select.py")
 lg: Any = _load("simple_stage2_lgo", HERE / "stage2_lgo.py")
+cw: Any = _load("crosswalk_atus_stula",
+                REPO_ROOT / "src" / "common" / "preprocess" / "stula"
+                / "crosswalk_atus_stula.py")
 DEVICE = "cpu"          # テストは決定性重視で CPU 固定
 T_SHORT = 12            # 全1000ステップは重いので、逆過程の往復は短い T で見る
 
@@ -907,6 +910,91 @@ def test_rate_mse_split() -> None:
     print("test_rate_mse_split: OK")
 
 
+def test_teacher_floor() -> None:
+    """(16) 教師自身の標本誤差による床（設計書 §9.4 / 実装項目 16）。
+
+    `A*` は有限標本からの推定値なので、モデルが真の率を完全に当てても採点は
+    `|p_true − A*|` のぶん残る。その下限を出せているかを 4 点で確かめる。
+    """
+    tgt = st.load_stula_targets()
+    var = tgt["group_rates_var"]
+    assert var is not None, \
+        ("group_rates_var が None。層表が無い。"
+         "python src/common/preprocess/stula/parse_timeband.py を流すこと")
+    assert var.shape == (st.D_GROUPS, st.NUM_COMMON, st.NUM_SLOTS)
+
+    # (1) ★分散の積み上げを独立な経路で再計算して突き合わせる。
+    #     load_stula_targets は np.add.at で一気に積むので、群を 1 つ取り出して
+    #     素直なループで組み直し、同じ値になることを見る
+    df = pd.read_csv(st.STULA_DIR / f"{st.DEFAULT_TABLE}.csv")
+    df = df[df["region"] == "00_全国"]
+    com = cw.stula_to_common(df)
+    n15 = st.load_layer_sizes()
+    assert n15 is not None
+    pop_by = {}
+    pop_src = df[df["activity"].str.startswith("00_")]
+    for _, r in pop_src.iterrows():
+        a = str(r["age_class"])[:2]
+        if a.isdigit() and a != "00":
+            pop_by[(str(r["gender"]), str(r["employment"]), int(a))] = float(r["population_k"])
+
+    g_lab, e_lab, e_code, a7 = "1_男", "2_無業者", 0, 1     # 30代前半の無業男性＝標本が最小級
+    d = st.d_index(0, a7, e_code)
+    a15s = [k for k, v in st.AGE15_TO_7.items() if v == a7]
+    c_idx, s_idx = 0, 40
+    c_name = [c.name for c in cw.Common][c_idx]
+    num = 0.0
+    W = sum(pop_by[(g_lab, e_lab, a)] for a in a15s)
+    for a in a15s:
+        row = com[(com["gender"] == g_lab) & (com["employment"] == e_lab)
+                  & (com["age_class"].str[:2] == f"{a:02d}") & (com["common"] == c_name)]
+        pr = float(row[f"s{s_idx}"].iloc[0]) / 100.0
+        w, n = pop_by[(g_lab, e_lab, a)], n15[0, a, e_code]
+        num += (w / W) ** 2 * pr * (1.0 - pr) / n
+    assert abs(var[d, c_idx, s_idx] - num) < 1e-15, \
+        f"分散の積み上げが独立計算と合わない: {var[d, c_idx, s_idx]:.6e} vs {num:.6e}"
+    print(f"  (1) 群{d} の Var を独立経路で再計算し一致 ({num:.3e}): OK")
+
+    # (2) n を 4 倍にすれば分散は 1/4 になる（p(1-p)/n の形であることの確認）
+    floor = st.teacher_floor(tgt, st.mask_12act())
+    scaled = dict(tgt, group_rates_var=var * 0.25)
+    f4 = st.teacher_floor(scaled, st.mask_12act())
+    assert abs(f4["rate_mse"] - floor["rate_mse"] / 4.0) < 1e-18, "mse が n に反比例しない"
+    assert abs(f4["rate_mae"] - floor["rate_mae"] / 2.0) < 1e-12, "mae が √n に反比例しない"
+    print(f"  (2) n 4倍 -> mse 1/4 ({f4['rate_mse']:.3e}) / mae 1/2: OK")
+
+    # (3) ★dev の床は rate の床より小さい。人口平均を引くと教師の誤差のうち
+    #     全群に共通な成分が相殺されるため。モンテカルロで式を裏取りする
+    assert floor["dev_mse"] < floor["rate_mse"], \
+        f"dev の床が rate の床以上: {floor['dev_mse']:.3e} >= {floor['rate_mse']:.3e}"
+    rng = np.random.default_rng(0)
+    grp = tgt["group_rates_tbl"]
+    m = ~np.isnan(grp) & st.mask_12act()[None, :, None]
+    pi = np.asarray(tgt["pop"]).reshape(-1)
+    Wd = st.nan_renorm_pop_weights(grp, pi / pi.sum())
+    sd = np.sqrt(np.where(np.isnan(var), 0.0, var))
+    acc = []
+    for _ in range(200):
+        e = rng.normal(0.0, sd)                     # 教師の標本誤差 (28,12,96)
+        dev_e = e - np.nansum(e * Wd, axis=0)[None, :, :]
+        acc.append(float((dev_e[m] ** 2).mean()))
+    mc = float(np.mean(acc))
+    assert abs(mc - floor["dev_mse"]) < 0.05 * floor["dev_mse"], \
+        f"dev の床が MC と合わない: 式 {floor['dev_mse']:.4e} vs MC {mc:.4e}"
+    print(f"  (3) dev の床 式 {floor['dev_mse']:.4e} ≒ MC {mc:.4e} "
+          f"(rate {floor['rate_mse']:.4e} より小): OK")
+
+    # (4) 層表が無い環境でも load_stula_targets は動き、床だけが使えなくなる
+    try:
+        st.teacher_floor(dict(tgt, group_rates_var=None), st.mask_12act())
+    except ValueError as exc:
+        assert "parse_timeband" in str(exc), "直し方を示していない例外文"
+    else:
+        raise AssertionError("group_rates_var=None でも例外にならない")
+    print("  (4) 層表が無ければ ValueError（直し方つき）: OK")
+    print("test_teacher_floor: OK")
+
+
 def test_checkpoint_selection() -> None:
     """(sel) 事後選択が §9.8 の出所列を持ち、LGO で in-teacher と held-out を分けること。
 
@@ -1605,6 +1693,7 @@ def main() -> None:
     test_teacher_mask_and_holdout()
     test_eval_against_subset()
     test_rate_mse_split()
+    test_teacher_floor()
     test_checkpoint_selection()
     test_zeroshot_baseline()
     test_lgo_folds()
