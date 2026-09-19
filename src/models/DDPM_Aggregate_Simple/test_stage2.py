@@ -104,6 +104,7 @@ sl: Any = _load("simple_stage2_loss", HERE / "stage2_loss.py")
 ft: Any = _load("simple_stage2_finetune", HERE / "stage2_finetune.py")
 se: Any = _load("simple_stage2_select", HERE / "stage2_select.py")
 lg: Any = _load("simple_stage2_lgo", HERE / "stage2_lgo.py")
+sp: Any = _load("simple_stage2_published", HERE / "stage2_published.py")
 cw: Any = _load("crosswalk_atus_stula",
                 REPO_ROOT / "src" / "common" / "preprocess" / "stula"
                 / "crosswalk_atus_stula.py")
@@ -995,6 +996,88 @@ def test_teacher_floor() -> None:
     print("test_teacher_floor: OK")
 
 
+def test_published_participation() -> None:
+    """(17) 生活時間編との突合（設計書 §9.7）。**非教師**の公表統計である。
+
+    教師（時間帯編の時刻別行動者率）は Stage 2 の損失そのものなので循環している。
+    日次行動者率は教師が縛らない量で、日本の公表値に照らせる唯一の非循環な軸である。
+    """
+    pub = sp.load_participation()
+    part20 = pub["part20"]
+    assert part20.shape == (st.D_GROUPS, sp.N_STULA_ACT)
+    assert not np.isnan(part20).any(), "28 群に非公表セルがある"
+    assert (part20 >= 0.0).all() and (part20 <= 1.0).all(), "率が [0,1] の外"
+
+    # (1) ★別表どうしの整合。時間帯編の層表（5歳15区分）と生活時間編（10歳7区分）は
+    #     別のファイルだが、同じ標本から作られているので実回答者数の合計は一致するはず
+    n15 = st.load_layer_sizes()
+    assert n15 is not None, "層表が無い。parse_timeband.py を流すこと"
+    a15s = [a for a in range(1, 16)]
+    tb_total = sum(n15[g, a, e] for g in range(st.N_G) for a in a15s for e in range(st.N_E))
+    tu_total = float(pub["n_layer"].sum())
+    assert abs(tb_total - tu_total) < 0.5, \
+        f"時間帯編と生活時間編で実回答者数の合計が違う: {tb_total:.0f} vs {tu_total:.0f}"
+    print(f"  (1) 時間帯編の層表と実回答者数が一致 ({tu_total:.0f} 人): OK")
+
+    # (2) 1 対 1 の 7 活動は lo == hi（厳密）、和集合の 5 活動は lo <= hi
+    lo, hi = sp.common12_bounds(part20)
+    ex, un = list(sp.EXACT_COMMON), list(sp.UNION_COMMON)
+    assert len(ex) == 7 and len(un) == 5, f"1対1 {len(ex)} / 和集合 {len(un)}"
+    assert np.allclose(lo[:, ex], hi[:, ex]), "1 対 1 の活動で上下限が割れている"
+    assert (lo[:, un] <= hi[:, un] + 1e-12).all(), "和集合で lo > hi"
+    print(f"  (2) 1対1 {len(ex)} 活動は lo==hi、和集合 {len(un)} 活動は lo<=hi: OK")
+
+    # (3) ★上下限の定義を独立に再計算して突き合わせる
+    d, c = 3, int(cw.Common.LEISURE_SOCIAL)
+    codes = sp.COMMON_TO_STULA[c]
+    block = part20[d, [int(x) - 1 for x in codes]]
+    assert abs(lo[d, c] - block.max()) < 1e-15, "下限が max と違う"
+    assert abs(hi[d, c] - min(1.0, block.sum())) < 1e-15, "上限が min(1, Σ) と違う"
+    print(f"  (3) LEISURE_SOCIAL({','.join(codes)}) の区間 "
+          f"[{lo[d, c]:.4f}, {hi[d, c]:.4f}] を独立計算と照合: OK")
+
+    # (4) ★単純和は日次行動者率には誤り。区間に幅があること自体がその証拠である
+    #     （幅 = Σ_c P_c − max_c P_c ＞ 0 ＝ 重複を二重に数える量の上限）
+    width = (hi[:, un] - lo[:, un])
+    assert width.max() > 0.05, \
+        "和集合の区間に幅が無い。stula_to_common の単純和との差が出ないはずがない"
+    print(f"  (4) 和集合の区間幅 最大 {width.max():.3f} "
+          f"＝単純和では突き合わせられない量: OK")
+
+    # (5) 生成側。既知のプールで participation_from_pool を検算する
+    pool = np.zeros((st.D_GROUPS, 4, sm.NUM_SLOTS), dtype=np.int64)   # 全員 SLEEP(0)
+    pool[:, 0, :10] = int(cw.Common.WORK)                             # 4 人に 1 人が WORK
+    got = sp.participation_from_pool(pool)
+    assert abs(got[0, int(cw.Common.SLEEP_PERSONAL)] - 1.0) < 1e-12
+    assert abs(got[0, int(cw.Common.WORK)] - 0.25) < 1e-12, \
+        f"WORK の日次参加率が 0.25 でない: {got[0, int(cw.Common.WORK)]}"
+    assert abs(got[0, int(cw.Common.MEALS)]) < 1e-12
+    print("  (5) participation_from_pool: SLEEP=1.00 / WORK=0.25 / MEALS=0.00: OK")
+
+    # (6) 公表値そのものを入力すれば、厳密 7 は誤差 0、和集合 5 は区間内
+    res = sp.eval_participation(lo, pub)
+    assert res["exact_mae"] < 1e-15 and res["exact_max_abs"] < 1e-15, \
+        f"公表値を入れても誤差が出る: {res['exact_mae']:.3e}"
+    assert res["union_outside_rate"] == 0.0, "下限そのものが区間の外と判定された"
+    assert res["exact_n"] == st.D_GROUPS * 7 and res["union_n"] == st.D_GROUPS * 5
+    print(f"  (6) 公表値を入力 -> exact_mae={res['exact_mae']:.1e} / "
+          f"union_outside_rate={res['union_outside_rate']:.2f}: OK")
+
+    # (7) 区間の外に出したら検出される。
+    #     ★下へずらす。上へは動かせない活動があるため: SLEEP_PERSONAL や
+    #       LEISURE_SOCIAL は上限が min(1, Σ) の 1.0 で飽和しており、
+    #       hi + δ を 1.0 で切ると hi と同じ値になって「区間内」に戻ってしまう
+    bad = lo.copy()
+    bad[:, un] = np.maximum(0.0, lo[:, un] - 0.3)
+    res_bad = sp.eval_participation(bad, pub)
+    assert res_bad["union_outside_rate"] > 0.9, \
+        f"区間外を検出できていない: {res_bad['union_outside_rate']:.2f}"
+    print(f"  (7) 区間外へずらすと union_outside_rate="
+          f"{res_bad['union_outside_rate']:.2f} / max_gap="
+          f"{res_bad['union_max_gap']:.3f}: OK")
+    print("test_published_participation: OK")
+
+
 def test_checkpoint_selection() -> None:
     """(sel) 事後選択が §9.8 の出所列を持ち、LGO で in-teacher と held-out を分けること。
 
@@ -1694,6 +1777,7 @@ def main() -> None:
     test_eval_against_subset()
     test_rate_mse_split()
     test_teacher_floor()
+    test_published_participation()
     test_checkpoint_selection()
     test_zeroshot_baseline()
     test_lgo_folds()
