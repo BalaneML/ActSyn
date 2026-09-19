@@ -80,6 +80,8 @@ fe: Any = _load("select_feasibility", REPO_ROOT / "src" / "eval" / "feasibility.
 cd: Any = _load("select_conditioning", REPO_ROOT / "src" / "eval" / "conditioning.py")
 sp: Any = _load("select_schedule_plausibility",
                 REPO_ROOT / "src" / "eval" / "schedule_plausibility.py")
+# 非教師の公表統計（生活時間編・平均時刻編）。§9.7 / 実装項目 17
+pb: Any = _load("select_stage2_published", HERE / "stage2_published.py")
 
 OUT_CSV = REPO_ROOT / "data" / "processed" / "aggregates" / "stage2_checkpoint_selection.csv"
 DEFAULT_N = 2000
@@ -170,6 +172,63 @@ GUARDRAIL_META: dict[str, tuple[str, str]] = {
     "exact_copy_rate":        ("memorization", "none"),
     "n_ref_per_side":         ("memorization", "none"),
 }
+
+
+# 軸2 のうち**日本の公表値**と比べる行（§9.7 / 実装項目 17）。
+# ★`reference = stula_published` として `atus` の行と分ける。同じ「行動者率」という語が
+#   時刻別（教師・循環）と日次（公表・非循環）の両方を指すので、列で分けないと読めない。
+# ★weight_basis は `stula_pop`。日本の公表値と比べる行なので日本の人口で重み付けする
+#   （§9.7）。`atus_comp` で比べると群構成の差が行動の差に化ける。
+PUBLISHED_META: dict[str, tuple[str, str]] = {
+    # 日次行動者率（§9.7 の測る量 1）。1 対 1 の 7 活動と区間の 5 活動を分けて持つ
+    "exact_mae":            ("daily_participation", "stula_pop"),
+    "exact_max_abs":        ("daily_participation", "stula_pop"),
+    "exact_n":              ("daily_participation", "none"),
+    "union_outside_rate":   ("daily_participation", "stula_pop"),
+    "union_max_gap":        ("daily_participation", "stula_pop"),
+    "union_n":              ("daily_participation", "none"),
+    # 派生時刻（§9.7 の測る量 2）。就寝は 0〜36 時の軸
+    "wake_mae":             ("derived_clock", "stula_pop"),
+    "wake_bias":            ("derived_clock", "stula_pop"),
+    "wake_max_abs":         ("derived_clock", "stula_pop"),
+    "wake_undef_gap":       ("derived_clock", "stula_pop"),
+    "wake_n_groups":        ("derived_clock", "none"),
+    "bed_mae":              ("derived_clock", "stula_pop"),
+    "bed_bias":             ("derived_clock", "stula_pop"),
+    "bed_max_abs":          ("derived_clock", "stula_pop"),
+    "bed_undef_gap":        ("derived_clock", "stula_pop"),
+    "bed_n_groups":         ("derived_clock", "none"),
+}
+
+
+def published_metrics(pool: np.ndarray) -> dict[str, float]:
+    """生成プールを日本の公表値へ突き合わせる（§9.7）。
+
+    Note:
+        ★公表 CSV が無ければ空を返す。これらは評価の付加情報であって学習には要らず、
+          配っていない計算機でも `stage2_select` が通る必要がある（LGO の eval は
+          SQUID で走る）。黙って消えると気づけないので stderr に出す。
+        ★教師とは無関係な量なので、教師群と held-out 群で分けない。全 28 群が
+          そのまま非循環である（§9.2）。
+
+    Args:
+        pool: 群別サンプルプール, dtype=int64, (D, M, 96)。値は common12 ラベル
+
+    Returns:
+        指標の dict。公表 CSV が無ければ空
+    """
+    out: dict[str, float] = {}
+    try:
+        pub = pb.load_participation()
+        out.update(pb.eval_participation(pb.participation_from_pool(pool), pub))
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"WARNING: 日次行動者率の突合を飛ばす: {exc}", file=sys.stderr)
+    try:
+        mt = pb.load_mean_times()
+        out.update(pb.eval_derived_times(pb.derived_times_from_pool(pool), mt))
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"WARNING: 派生時刻の突合を飛ばす: {exc}", file=sys.stderr)
+    return out
 
 
 def meta_of(metric: str) -> tuple[str, str]:
@@ -493,6 +552,16 @@ def evaluate_model(model: Any, tgt: dict, sched_real: np.ndarray,
                      "value": float(value),
                      "vs_zeroshot": float(guard.get(f"{metric}_vs_zeroshot",
                                                     float("nan")))})
+
+    # --- 軸2 の続き: 日本の公表値との突合（§9.7）。reference で atus の行と分ける ---
+    # ★vs_zeroshot は入れない。zero-shot の実測は step=0 の行として同じ CSV に並ぶので、
+    #   そちらと比べる（妥当性・多様性・暗記と同じ扱い）。
+    for metric, value in published_metrics(pool).items():
+        statistic, weight_basis = PUBLISHED_META[metric]
+        rows.append({**base, "eval_kind": "all", "reference": "stula_published",
+                     "statistic": statistic, "mask": "12act",
+                     "weight_basis": weight_basis, "metric": metric,
+                     "value": float(value), "vs_zeroshot": float("nan")})
     return rows
 
 
@@ -500,6 +569,10 @@ def evaluate_model(model: Any, tgt: dict, sched_real: np.ndarray,
 SUMMARY_AXIS1 = ("rate_mse_split", "rate_mae", "dev_rmse")
 SUMMARY_AXIS2 = ("switch_mean", "travel_single_rate", "bigram_jsd",
                  "pairwise_hamming_std", "var_ratio_median", "dcr_gap")
+# 日本の公表値との差（§9.7）。★`bed_bias` を先頭に置く。米 ATUS と日本の就寝は
+# 28 群すべてで同じ向きに 0.81 時ずれており（§9.7.1）、この軸で最も判定力が高い。
+SUMMARY_AXIS3 = ("bed_bias", "bed_mae", "wake_bias", "wake_mae",
+                 "exact_mae", "union_outside_rate")
 
 
 def summarize(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -528,6 +601,29 @@ def summarize(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
            .reindex(columns=[m for m in SUMMARY_AXIS2])
            if len(ax2_src) else pd.DataFrame())
     return ax1, ax2
+
+
+def summarize_published(df: pd.DataFrame) -> pd.DataFrame:
+    """日本の公表値との差の要約表（§9.7）。
+
+    Note:
+        ★`summarize` とは別の関数にしてある。あちらは軸1（循環）と軸2（実データ基準）
+          の 2 枚を返す契約で、呼び出し側とテストがその形に依存している。
+        ★`reference` で絞る。指標名だけで拾うと、将来 `atus` 側に同名の指標が
+          増えたときに黙って混ざる。
+
+    Args:
+        df: evaluate_ckpt が返した行の DataFrame（1 指標 1 行の縦持ち）
+
+    Returns:
+        index=step、columns=SUMMARY_AXIS3 の表。該当行が無ければ空
+    """
+    src = df[(df["reference"] == "stula_published")
+             & (df["metric"].isin(SUMMARY_AXIS3))]
+    if not len(src):
+        return pd.DataFrame()
+    return (src.pivot_table(index="step", columns="metric", values="value")
+            .reindex(columns=[m for m in SUMMARY_AXIS3]))
 
 
 def run(ckpt_dir: Path, n: int = DEFAULT_N, out_csv: Path = OUT_CSV,
@@ -581,6 +677,21 @@ def run(ckpt_dir: Path, n: int = DEFAULT_N, out_csv: Path = OUT_CSV,
     print(ax1_tbl.round(6).to_string())
     print("\n--- 軸2 ガードレール（非循環）---")
     print(ax2_tbl.round(5).to_string())
+
+    ax3_tbl = summarize_published(df)
+    if len(ax3_tbl):
+        print("\n--- 軸2 日本の公表値との差（非循環・§9.7）"
+              " 単位は時 / 率 ---")
+        print(ax3_tbl.round(4).to_string())
+        print("  ★bed_bias が主。米 ATUS は日本より 0.81 時 早寝で、"
+              "28 群すべて同じ向きである（§9.7.1）。"
+              "\n    0 へ近づけば日本の就寝時刻へ転移したことになる。"
+              "step=0 の行が出発点。")
+    else:
+        print("\n--- 軸2 日本の公表値との差: 行なし ---"
+              "\n  data/processed/stula の timeuse_participation.csv /"
+              " meantime_*.csv が無い。"
+              "\n  parse_timeuse.py と parse_mean_time.py を流すこと（§9.7）")
 
     print("\n★軸1 は teacher_groups=28 のとき循環している（学習目的そのもの）。"
           "\n  非循環の証拠は --holdout-groups で群を抜いた held-out 行から取る。"

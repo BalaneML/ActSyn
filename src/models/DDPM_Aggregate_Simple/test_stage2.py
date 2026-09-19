@@ -1185,6 +1185,10 @@ def test_checkpoint_selection() -> None:
         assert r["mask"] in ("11act", "12act")
         assert r["eval_kind"] in ("in-teacher", "held-out", "all")
         assert r["weight_basis"] in ("stula_pop", "atus_comp", "none")
+        # ★reference は 3 値で閉じている。teacher=循環、atus=実データ基準、
+        #   stula_published=日本の公表値。増やすときは読み手の側も直すこと
+        assert r["reference"] in ("teacher", "atus", "stula_published"), \
+            f"未知の reference: {r['reference']}"
     print("  (1) (sel) 全行が §9.8 の出所列（statistic / weight_basis を含む）を持つ: OK")
 
     # 軸1（循環）と軸2（非循環）が statistic で機械的に分かれること
@@ -1238,6 +1242,38 @@ def test_checkpoint_selection() -> None:
         assert math.isfinite(r["vs_zeroshot"]) == has_base, \
             f"{r['metric']}: vs_zeroshot の有無が基準の有無と合っていない"
     print("  (6) vs_zeroshot は zero-shot 実測がある指標にだけ入る: OK")
+
+    # ★軸2 のうち日本の公表値と比べる行（§9.7 / 実装項目 17）。
+    #   `atus` の行とは reference で分かれる。同じ「行動者率」という語が
+    #   時刻別（教師・循環）と日次（公表・非循環）の両方を指すので、列で分けないと読めない
+    ax3 = [r for r in rows if r["reference"] == "stula_published"]
+    assert ax3, ("公表値の行が 1 つも出ていない。"
+                 "data/processed/stula の timeuse_participation.csv / "
+                 "meantime_*.csv を作ること（parse_timeuse.py / parse_mean_time.py）")
+    got3 = {r["metric"] for r in ax3}
+    assert got3 == set(se.PUBLISHED_META), \
+        f"PUBLISHED_META とずれている: 不足={set(se.PUBLISHED_META) - got3} 余分={got3 - set(se.PUBLISHED_META)}"
+    stats3: dict[str, set[str]] = {}
+    for r in ax3:
+        stats3.setdefault(r["statistic"], set()).add(r["metric"])
+        assert r["eval_kind"] == "all", \
+            "公表値は教師と無関係なので群を分けない（全 28 群が非循環）"
+        assert math.isnan(r["vs_zeroshot"]), \
+            "公表値の行に vs_zeroshot は入れない（step=0 の行と比べる）"
+    assert set(stats3) == {"daily_participation", "derived_clock"}, stats3
+    assert {"exact_mae", "union_outside_rate"} <= stats3["daily_participation"]
+    assert {"bed_bias", "wake_mae", "bed_undef_gap"} <= stats3["derived_clock"]
+    assert all(r["weight_basis"] == "stula_pop" for r in ax3
+               if not r["metric"].startswith(("exact_n", "union_n"))
+               and not r["metric"].endswith("_n_groups")), \
+        "日本の公表値と比べる行は stula_pop で重み付けする（§9.7）"
+    print(f"  (7) 公表値の行 {len(ax3)} 件: " + " / ".join(
+        f"{k}={len(v)}" for k, v in sorted(stats3.items())) + ": OK")
+
+    # (8) 3 つの reference が排他かつ全行を覆う
+    assert len(ax1) + len(ax2) + len(ax3) == len(rows), "reference で覆えない行がある"
+    print(f"  (8) reference が排他: teacher={len(ax1)} / atus={len(ax2)} / "
+          f"stula_published={len(ax3)} = 全 {len(rows)} 行: OK")
 
     # 実装項目 15 の rate_mse_split が軸1 に載る
     assert any(r["metric"] == "rate_mse_split" for r in ax1), "rate_mse_split が軸1 に無い"
