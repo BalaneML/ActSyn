@@ -104,6 +104,7 @@ sl: Any = _load("simple_stage2_loss", HERE / "stage2_loss.py")
 ft: Any = _load("simple_stage2_finetune", HERE / "stage2_finetune.py")
 se: Any = _load("simple_stage2_select", HERE / "stage2_select.py")
 lg: Any = _load("simple_stage2_lgo", HERE / "stage2_lgo.py")
+sp: Any = _load("simple_stage2_published", HERE / "stage2_published.py")
 cw: Any = _load("crosswalk_atus_stula",
                 REPO_ROOT / "src" / "common" / "preprocess" / "stula"
                 / "crosswalk_atus_stula.py")
@@ -995,6 +996,163 @@ def test_teacher_floor() -> None:
     print("test_teacher_floor: OK")
 
 
+def test_published_participation() -> None:
+    """(17) 生活時間編との突合（設計書 §9.7）。**非教師**の公表統計である。
+
+    教師（時間帯編の時刻別行動者率）は Stage 2 の損失そのものなので循環している。
+    日次行動者率は教師が縛らない量で、日本の公表値に照らせる唯一の非循環な軸である。
+    """
+    pub = sp.load_participation()
+    part20 = pub["part20"]
+    assert part20.shape == (st.D_GROUPS, sp.N_STULA_ACT)
+    assert not np.isnan(part20).any(), "28 群に非公表セルがある"
+    assert (part20 >= 0.0).all() and (part20 <= 1.0).all(), "率が [0,1] の外"
+
+    # (1) ★別表どうしの整合。時間帯編の層表（5歳15区分）と生活時間編（10歳7区分）は
+    #     別のファイルだが、同じ標本から作られているので実回答者数の合計は一致するはず
+    n15 = st.load_layer_sizes()
+    assert n15 is not None, "層表が無い。parse_timeband.py を流すこと"
+    a15s = [a for a in range(1, 16)]
+    tb_total = sum(n15[g, a, e] for g in range(st.N_G) for a in a15s for e in range(st.N_E))
+    tu_total = float(pub["n_layer"].sum())
+    assert abs(tb_total - tu_total) < 0.5, \
+        f"時間帯編と生活時間編で実回答者数の合計が違う: {tb_total:.0f} vs {tu_total:.0f}"
+    print(f"  (1) 時間帯編の層表と実回答者数が一致 ({tu_total:.0f} 人): OK")
+
+    # (2) 1 対 1 の 7 活動は lo == hi（厳密）、和集合の 5 活動は lo <= hi
+    lo, hi = sp.common12_bounds(part20)
+    ex, un = list(sp.EXACT_COMMON), list(sp.UNION_COMMON)
+    assert len(ex) == 7 and len(un) == 5, f"1対1 {len(ex)} / 和集合 {len(un)}"
+    assert np.allclose(lo[:, ex], hi[:, ex]), "1 対 1 の活動で上下限が割れている"
+    assert (lo[:, un] <= hi[:, un] + 1e-12).all(), "和集合で lo > hi"
+    print(f"  (2) 1対1 {len(ex)} 活動は lo==hi、和集合 {len(un)} 活動は lo<=hi: OK")
+
+    # (3) ★上下限の定義を独立に再計算して突き合わせる
+    d, c = 3, int(cw.Common.LEISURE_SOCIAL)
+    codes = sp.COMMON_TO_STULA[c]
+    block = part20[d, [int(x) - 1 for x in codes]]
+    assert abs(lo[d, c] - block.max()) < 1e-15, "下限が max と違う"
+    assert abs(hi[d, c] - min(1.0, block.sum())) < 1e-15, "上限が min(1, Σ) と違う"
+    print(f"  (3) LEISURE_SOCIAL({','.join(codes)}) の区間 "
+          f"[{lo[d, c]:.4f}, {hi[d, c]:.4f}] を独立計算と照合: OK")
+
+    # (4) ★単純和は日次行動者率には誤り。区間に幅があること自体がその証拠である
+    #     （幅 = Σ_c P_c − max_c P_c ＞ 0 ＝ 重複を二重に数える量の上限）
+    width = (hi[:, un] - lo[:, un])
+    assert width.max() > 0.05, \
+        "和集合の区間に幅が無い。stula_to_common の単純和との差が出ないはずがない"
+    print(f"  (4) 和集合の区間幅 最大 {width.max():.3f} "
+          f"＝単純和では突き合わせられない量: OK")
+
+    # (5) 生成側。既知のプールで participation_from_pool を検算する
+    pool = np.zeros((st.D_GROUPS, 4, sm.NUM_SLOTS), dtype=np.int64)   # 全員 SLEEP(0)
+    pool[:, 0, :10] = int(cw.Common.WORK)                             # 4 人に 1 人が WORK
+    got = sp.participation_from_pool(pool)
+    assert abs(got[0, int(cw.Common.SLEEP_PERSONAL)] - 1.0) < 1e-12
+    assert abs(got[0, int(cw.Common.WORK)] - 0.25) < 1e-12, \
+        f"WORK の日次参加率が 0.25 でない: {got[0, int(cw.Common.WORK)]}"
+    assert abs(got[0, int(cw.Common.MEALS)]) < 1e-12
+    print("  (5) participation_from_pool: SLEEP=1.00 / WORK=0.25 / MEALS=0.00: OK")
+
+    # (6) 公表値そのものを入力すれば、厳密 7 は誤差 0、和集合 5 は区間内
+    res = sp.eval_participation(lo, pub)
+    assert res["exact_mae"] < 1e-15 and res["exact_max_abs"] < 1e-15, \
+        f"公表値を入れても誤差が出る: {res['exact_mae']:.3e}"
+    assert res["union_outside_rate"] == 0.0, "下限そのものが区間の外と判定された"
+    assert res["exact_n"] == st.D_GROUPS * 7 and res["union_n"] == st.D_GROUPS * 5
+    print(f"  (6) 公表値を入力 -> exact_mae={res['exact_mae']:.1e} / "
+          f"union_outside_rate={res['union_outside_rate']:.2f}: OK")
+
+    # (7) 区間の外に出したら検出される。
+    #     ★下へずらす。上へは動かせない活動があるため: SLEEP_PERSONAL や
+    #       LEISURE_SOCIAL は上限が min(1, Σ) の 1.0 で飽和しており、
+    #       hi + δ を 1.0 で切ると hi と同じ値になって「区間内」に戻ってしまう
+    bad = lo.copy()
+    bad[:, un] = np.maximum(0.0, lo[:, un] - 0.3)
+    res_bad = sp.eval_participation(bad, pub)
+    assert res_bad["union_outside_rate"] > 0.9, \
+        f"区間外を検出できていない: {res_bad['union_outside_rate']:.2f}"
+    print(f"  (7) 区間外へずらすと union_outside_rate="
+          f"{res_bad['union_outside_rate']:.2f} / max_gap="
+          f"{res_bad['union_max_gap']:.3f}: OK")
+    print("test_published_participation: OK")
+
+
+def test_published_mean_times() -> None:
+    """(17) 平均時刻編との突合（設計書 §9.7 の測る量 2）。
+
+    起床・就寝は教師（時刻別行動者率）が縛らない量で、規則も公表統計のものである。
+    ここで固定するのは**軸の取り方と畳み方**で、どちらも間違えても例外が出ない。
+    """
+    mt = sp.load_mean_times()
+    assert mt["wake_hour"].shape == (st.D_GROUPS,)
+    assert not np.isnan(mt["wake_hour"]).any() and not np.isnan(mt["bed_hour"]).any()
+
+    # (1) 起床は 0-12 時、就寝は 0-36 時の軸に載ること。
+    #     ★就寝に 24 を超える群が実在する（深夜 0 時台の就寝）。ここが 24 未満に
+    #       収まっていたら、どこかで 24 時間の折り返しが起きている
+    assert (mt["wake_hour"] >= 0).all() and (mt["wake_hour"] < 12).all()
+    assert (mt["bed_hour"] >= 17).all() and (mt["bed_hour"] < 36).all()
+    assert (mt["bed_hour"] > 24.0).any(), \
+        "就寝に 24 時超の群が無い。0〜36 時の軸が 24 時で折り返されている"
+    print(f"  (1) 起床 {mt['wake_hour'].min():.2f}〜{mt['wake_hour'].max():.2f} 時 / "
+          f"就寝 {mt['bed_hour'].min():.2f}〜{mt['bed_hour'].max():.2f} 時"
+          f"（24 時超が {int((mt['bed_hour'] > 24).sum())} 群）: OK")
+
+    # (2) ★5歳15区分 -> 7区分 の畳み方が「行動者数での加重平均」であること。
+    #     人口加重にすると、時刻が定まらない人の多い層の重みが過大になる
+    df = pd.read_csv(st.STULA_DIR / "meantime_wake.csv")
+    sub = df[(df["daytype"] == sp.MT_DAYTYPE_WEEKDAY)
+             & (df["region"] == sp.MT_REGION_JAPAN)
+             & (df["life_stage"] == sp.LIFE_STAGE_TOTAL)
+             & (df["gender"] == "1_男") & (df["employment"] == "1_有業者")
+             & (df["age_class"].isin(["13_75～79歳", "14_80～84歳", "15_85歳以上"]))]
+    assert len(sub) == 3, f"75歳以上を構成する 3 区分が揃わない: {len(sub)}"
+    actors = sub["population_k"].to_numpy(float) * sub["actor_rate"].to_numpy(float) / 100.0
+    want = float((actors * sub["mean_time_hour"].to_numpy(float)).sum() / actors.sum())
+    d = st.d_index(0, 6, 1)                       # 男 / 75歳以上 / 有業
+    assert abs(mt["wake_hour"][d] - want) < 1e-12, \
+        f"行動者数加重の畳み込みと合わない: {mt['wake_hour'][d]:.6f} vs {want:.6f}"
+    print(f"  (2) 男・75歳以上・有業 の起床 {want:.4f} 時を "
+          f"行動者数加重で独立再計算し一致: OK")
+
+    # (3) 公表値そのものを生成側に入れたら差は 0
+    gen = {"wake_hour": mt["wake_hour"].copy(), "bed_hour": mt["bed_hour"].copy(),
+           "wake_undef_rate": 1.0 - mt["wake_actor_rate"],
+           "bed_undef_rate": 1.0 - mt["bed_actor_rate"]}
+    r = sp.eval_derived_times(gen, mt)
+    for k in ("wake_mae", "wake_bias", "bed_mae", "bed_bias",
+              "wake_undef_gap", "bed_undef_gap"):
+        assert abs(r[k]) < 1e-12, f"公表値を入れても {k}={r[k]:.3e}"
+    assert r["wake_n_groups"] == st.D_GROUPS and r["bed_n_groups"] == st.D_GROUPS
+    print("  (3) 公表値を入力 -> 全指標が 0: OK")
+
+    # (4) ★軸の値を取り違えたら気づけること。平均時刻編は "1_平日" で、
+    #     生活時間編の "2_平日" を渡すと 0 行になる
+    try:
+        sp.load_mean_times(daytype=sp.DAYTYPE_WEEKDAY)     # "2_平日"
+    except ValueError as exc:
+        assert "軸の値" in str(exc), f"原因を示していない例外文: {exc}"
+    else:
+        raise AssertionError("生活時間編の曜日コードを渡しても通ってしまう")
+    print(f"  (4) 生活時間編の曜日コード '{sp.DAYTYPE_WEEKDAY}' を渡すと "
+          f"ValueError（平均時刻編は '{sp.MT_DAYTYPE_WEEKDAY}'）: OK")
+
+    # (5) 生成プール経路。全員 23:00-07:00 の睡眠なら全群 7.0 / 23.0 になる
+    pool = np.full((st.D_GROUPS, 4, sm.NUM_SLOTS), int(cw.Common.LEISURE_SOCIAL),
+                   dtype=np.int64)
+    pool[:, :, 76:] = int(cw.Common.SLEEP_PERSONAL)
+    pool[:, :, :12] = int(cw.Common.SLEEP_PERSONAL)
+    g2 = sp.derived_times_from_pool(pool)
+    assert np.allclose(g2["wake_hour"], 7.0) and np.allclose(g2["bed_hour"], 23.0)
+    assert np.allclose(g2["wake_undef_rate"], 0.0)
+    r2 = sp.eval_derived_times(g2, mt)
+    assert r2["bed_bias"] < 0, "23:00 就寝は日本の公表値より早いはず"
+    print(f"  (5) 全員 23:00-07:00 のプール -> 起床 7.0 / 就寝 23.0、"
+          f"公表比 bed_bias={r2['bed_bias']:+.3f} 時: OK")
+    print("test_published_mean_times: OK")
+
+
 def test_checkpoint_selection() -> None:
     """(sel) 事後選択が §9.8 の出所列を持ち、LGO で in-teacher と held-out を分けること。
 
@@ -1027,6 +1185,10 @@ def test_checkpoint_selection() -> None:
         assert r["mask"] in ("11act", "12act")
         assert r["eval_kind"] in ("in-teacher", "held-out", "all")
         assert r["weight_basis"] in ("stula_pop", "atus_comp", "none")
+        # ★reference は 3 値で閉じている。teacher=循環、atus=実データ基準、
+        #   stula_published=日本の公表値。増やすときは読み手の側も直すこと
+        assert r["reference"] in ("teacher", "atus", "stula_published"), \
+            f"未知の reference: {r['reference']}"
     print("  (1) (sel) 全行が §9.8 の出所列（statistic / weight_basis を含む）を持つ: OK")
 
     # 軸1（循環）と軸2（非循環）が statistic で機械的に分かれること
@@ -1080,6 +1242,38 @@ def test_checkpoint_selection() -> None:
         assert math.isfinite(r["vs_zeroshot"]) == has_base, \
             f"{r['metric']}: vs_zeroshot の有無が基準の有無と合っていない"
     print("  (6) vs_zeroshot は zero-shot 実測がある指標にだけ入る: OK")
+
+    # ★軸2 のうち日本の公表値と比べる行（§9.7 / 実装項目 17）。
+    #   `atus` の行とは reference で分かれる。同じ「行動者率」という語が
+    #   時刻別（教師・循環）と日次（公表・非循環）の両方を指すので、列で分けないと読めない
+    ax3 = [r for r in rows if r["reference"] == "stula_published"]
+    assert ax3, ("公表値の行が 1 つも出ていない。"
+                 "data/processed/stula の timeuse_participation.csv / "
+                 "meantime_*.csv を作ること（parse_timeuse.py / parse_mean_time.py）")
+    got3 = {r["metric"] for r in ax3}
+    assert got3 == set(se.PUBLISHED_META), \
+        f"PUBLISHED_META とずれている: 不足={set(se.PUBLISHED_META) - got3} 余分={got3 - set(se.PUBLISHED_META)}"
+    stats3: dict[str, set[str]] = {}
+    for r in ax3:
+        stats3.setdefault(r["statistic"], set()).add(r["metric"])
+        assert r["eval_kind"] == "all", \
+            "公表値は教師と無関係なので群を分けない（全 28 群が非循環）"
+        assert math.isnan(r["vs_zeroshot"]), \
+            "公表値の行に vs_zeroshot は入れない（step=0 の行と比べる）"
+    assert set(stats3) == {"daily_participation", "derived_clock"}, stats3
+    assert {"exact_mae", "union_outside_rate"} <= stats3["daily_participation"]
+    assert {"bed_bias", "wake_mae", "bed_undef_gap"} <= stats3["derived_clock"]
+    assert all(r["weight_basis"] == "stula_pop" for r in ax3
+               if not r["metric"].startswith(("exact_n", "union_n"))
+               and not r["metric"].endswith("_n_groups")), \
+        "日本の公表値と比べる行は stula_pop で重み付けする（§9.7）"
+    print(f"  (7) 公表値の行 {len(ax3)} 件: " + " / ".join(
+        f"{k}={len(v)}" for k, v in sorted(stats3.items())) + ": OK")
+
+    # (8) 3 つの reference が排他かつ全行を覆う
+    assert len(ax1) + len(ax2) + len(ax3) == len(rows), "reference で覆えない行がある"
+    print(f"  (8) reference が排他: teacher={len(ax1)} / atus={len(ax2)} / "
+          f"stula_published={len(ax3)} = 全 {len(rows)} 行: OK")
 
     # 実装項目 15 の rate_mse_split が軸1 に載る
     assert any(r["metric"] == "rate_mse_split" for r in ax1), "rate_mse_split が軸1 に無い"
@@ -1694,6 +1888,8 @@ def main() -> None:
     test_eval_against_subset()
     test_rate_mse_split()
     test_teacher_floor()
+    test_published_participation()
+    test_published_mean_times()
     test_checkpoint_selection()
     test_zeroshot_baseline()
     test_lgo_folds()
