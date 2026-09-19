@@ -69,17 +69,31 @@ def _load(name: str, path: Path):
 
 
 st: Any = _load("simple_stage2_targets", HERE / "stage2_targets.py")
+# 起床・就寝の規則は src/eval 側の実装が唯一のものである（§9.7）
+sdt: Any = _load("stula_derived_times",
+                 REPO_ROOT / "src" / "eval" / "stula_derived_times.py")
 
 STULA_DIR = REPO_ROOT / "data" / "processed" / "stula"
 DEFAULT_TABLE = "timeuse_participation"
 N_STULA_ACT = 20
 NUM_SLOTS = 96
 
-# 第70-3表の軸の値。時間帯編（`stage2_targets`）と符号が同じなのは男女と就業だけで、
-# 年齢は**この表が既に 10 歳 7 区分**である点が違う（時間帯編は 5 歳 15 区分）。
+# 第70-3表（生活時間編）の軸の値。時間帯編（`stage2_targets`）と符号が同じなのは
+# 男女と就業だけで、年齢は**この表が既に 10 歳 7 区分**である点が違う（時間帯編は 5 歳 15 区分）。
 DAYTYPE_WEEKDAY = "2_平日"
 REGION_JAPAN = "00_全国"
 HEALTH_TOTAL = "0_総数"
+
+# ★平均時刻編は**軸の値の書き方が違う**。ここを共用にしてはいけない。
+#   生活時間編 : 曜日 `2_平日`（`1_週全体` が先にある）/ 地域 `00_全国`
+#   平均時刻編 : 曜日 `1_平日`（週全体が無い）  / 地域 `0_全国`（ゼロ 1 桁）
+#   取り違えても例外は出ず、フィルタが 0 行になって「28 群が揃わない」で初めて気づく。
+MT_DAYTYPE_WEEKDAY = "1_平日"
+MT_REGION_JAPAN = "0_全国"
+LIFE_STAGE_TOTAL = "0_総数"
+MEANTIME_TABLES = {"wake": "meantime_wake", "bed": "meantime_bed"}
+# 平均時刻の妥当な範囲（時）。起床は 0〜12 時、就寝は 0〜36 時の軸に載る
+MEANTIME_RANGE = {"wake": (0.0, 12.0), "bed": (17.0, 36.0)}
 GENDER_CODE = {"1_男": 0, "2_女": 1}
 EMPLOY_CODE = {"1_有業者": 1, "2_無業者": 0}     # stage2_targets と同じ向き（有業=1）
 # ★モデルの 7 区分とそのまま 1 対 1 で合う。畳み込みも人口加重も要らない（§9.7）
@@ -252,3 +266,160 @@ def eval_participation(part_gen: np.ndarray, pub: dict) -> dict:
     out["union_max_gap"] = float(np.nanmax(gap))
     out["union_n"] = int(m_un.sum())
     return out
+
+
+# ============================================================
+# 派生時刻（起床・就寝）— 平均時刻編との突合（§9.7 の測る量 2）
+# ============================================================
+def load_mean_times(daytype: str = MT_DAYTYPE_WEEKDAY) -> dict:
+    """平均時刻編の起床・就寝を 28 群へ読む。
+
+    Note:
+        ★年齢は 5 歳 15 区分なので 7 区分へ畳む。畳み方は**行動者数での加重平均**で、
+          人口加重ではない。公表の平均時刻は「時刻が定まった人」の平均なので、
+          層の平均を束ねる重みも行動者数（＝推定人口 × 行動者率）でなければ一致しない。
+        ★`行動者率` も 28 群へ畳んで返す。これは「起床・就寝の時刻が定まった人の割合」で、
+          生成側の不詳率と比べる相手である。実測は 97〜100% 程度あり、生成側で
+          不詳が多ければ平均が合っていても睡眠の作りが壊れていることになる。
+        ★ライフステージは `0_総数` で周辺化する。モデルが条件に持たない軸である。
+
+    Args:
+        daytype: 曜日の値, default=MT_DAYTYPE_WEEKDAY（"1_平日"）。
+            ★生活時間編の `2_平日` とは書き方が違う
+
+    Returns:
+        dict。wake_hour / bed_hour (28,) 平均時刻（時、就寝は 0〜36 時の軸）、
+        wake_actor_rate / bed_actor_rate (28,) 時刻が定まった割合 [0,1]、
+        pop (28,) 推定人口（千人）、daytype
+
+    Raises:
+        FileNotFoundError: csv が無い場合（`parse_mean_time.py` を流すこと）
+        ValueError: 60 層（2性 × 2就業 × 5歳15区分）が揃わない場合、または
+            平均時刻が想定の範囲を外れる場合
+    """
+    out: dict[str, Any] = {"daytype": daytype}
+    pop_out = np.zeros(st.D_GROUPS)
+    for kind, name in MEANTIME_TABLES.items():
+        path = STULA_DIR / f"{name}.csv"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"{path} が無い。"
+                "python src/common/preprocess/stula/parse_mean_time.py を流すこと")
+        df = pd.read_csv(path)
+        sub = cast(pd.DataFrame, df[(df["daytype"] == daytype)
+                                   & (df["region"] == MT_REGION_JAPAN)
+                                   & (df["life_stage"] == LIFE_STAGE_TOTAL)
+                                   & (df["gender"].isin(GENDER_CODE))
+                                   & (df["employment"].isin(EMPLOY_CODE))]).copy()
+        sub["a15"] = cast("pd.Series", sub["age_class"]).str[:2].map(
+            lambda c: int(c) if str(c).isdigit() and str(c) != "00" else np.nan)
+        sub = cast(pd.DataFrame, sub.dropna(subset=["a15"]))
+        n_need = st.N_G * st.N_E * 15
+        if len(sub) != n_need:
+            raise ValueError(
+                f"{name}: 層が {len(sub)} 行で {n_need} 行に足りない"
+                f"（daytype={daytype} / region={MT_REGION_JAPAN}）\n"
+                f"       軸の値の書き方が表と食い違っていないか確認すること")
+
+        g_i = cast("pd.Series", sub["gender"]).map(GENDER_CODE).to_numpy(dtype=np.int64)
+        e_i = cast("pd.Series", sub["employment"]).map(EMPLOY_CODE).to_numpy(dtype=np.int64)
+        a7_i = np.array([st.AGE15_TO_7[int(a)] for a in sub["a15"].to_numpy()],
+                        dtype=np.int64)
+        d_i = np.array([st.d_index(int(g), int(a), int(e))
+                        for g, a, e in zip(g_i, a7_i, e_i)], dtype=np.int64)
+
+        pop15 = sub[["population_k"]].to_numpy(dtype=np.float64).ravel()
+        rate15 = sub[["actor_rate"]].to_numpy(dtype=np.float64).ravel() / 100.0
+        mean15 = sub[["mean_time_hour"]].to_numpy(dtype=np.float64).ravel()
+        actors = pop15 * rate15
+        # 行動者数で加重して 7 区分へ畳む。非公表（NaN）の層は分子・分母の両方から外す
+        pub = ~np.isnan(mean15)
+        num = np.zeros(st.D_GROUPS)
+        den = np.zeros(st.D_GROUPS)
+        pop_sum = np.zeros(st.D_GROUPS)
+        act_sum = np.zeros(st.D_GROUPS)
+        np.add.at(num, d_i, np.where(pub, actors * mean15, 0.0))
+        np.add.at(den, d_i, np.where(pub, actors, 0.0))
+        np.add.at(pop_sum, d_i, pop15)
+        np.add.at(act_sum, d_i, actors)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            hour = np.where(den > 0, num / den, np.nan)
+            out[f"{kind}_actor_rate"] = np.where(pop_sum > 0, act_sum / pop_sum, np.nan)
+        lo, hi = MEANTIME_RANGE[kind]
+        bad = ~np.isnan(hour) & ((hour < lo) | (hour >= hi))
+        if bad.any():
+            raise ValueError(
+                f"{name}: 畳んだ平均時刻が {lo}〜{hi} 時の外に {int(bad.sum())} 群ある")
+        out[f"{kind}_hour"] = hour
+        pop_out = pop_sum
+    out["pop"] = pop_out
+    return out
+
+
+def derived_times_from_pool(pool: npt.NDArray[np.int64]) -> dict:
+    """生成プール -> 群ごとの起床・就寝の平均時刻と不詳率。
+
+    Note:
+        ★規則の実装は `src/eval/stula_derived_times.py` ただ一つである。ここで
+          条件を書き直すと、同じ規則の答えが 2 つになる。
+
+    Args:
+        pool: 群別サンプルプール, dtype=int64, (D, M, NUM_SLOTS)。値は common12 ラベル
+
+    Returns:
+        dict。wake_hour / bed_hour (D,) 平均時刻（時）、
+        wake_undef_rate / bed_undef_rate (D,) 不詳の割合 [0,1]
+    """
+    arr = np.asarray(pool)
+    d = arr.shape[0]
+    out = {k: np.full(d, np.nan) for k in
+           ("wake_hour", "bed_hour", "wake_undef_rate", "bed_undef_rate")}
+    for i in range(d):
+        s = sdt.derived_time_summary(arr[i])
+        out["wake_hour"][i] = s["wake_mean"]
+        out["bed_hour"][i] = s["bed_mean"]
+        out["wake_undef_rate"][i] = s["wake_undef_rate"]
+        out["bed_undef_rate"][i] = s["bed_undef_rate"]
+    return out
+
+
+def eval_derived_times(gen: dict, pub_mt: dict) -> dict:
+    """生成の派生時刻を公表値へ突き合わせる。
+
+    Note:
+        ★重みは `weight_basis = stula_pop`（§9.7）。日本の公表値と比べる行なので、
+          群を日本の公表人口で重み付けする。
+        ★平均時刻の誤差と不詳率の差を**両方**返す。平均だけ合っていても、不詳
+          （規則を満たす夜間睡眠が無い個票）が実測より多ければ睡眠の作りは壊れている。
+        ★就寝は 0〜36 時の軸どうしで引く。片方だけ 24 時で折り返していると
+          深夜の就寝で 24 時間ぶんの差が出るので、符号ではなく大きさで気づく。
+
+    Args:
+        gen: `derived_times_from_pool` の戻り値
+        pub_mt: `load_mean_times` の戻り値
+
+    Returns:
+        指標の dict。wake_mae / wake_max_abs / wake_bias / bed_mae / bed_max_abs /
+        bed_bias（いずれも時、bias は 生成 − 公表 の人口加重平均）と、
+        wake_undef_gap / bed_undef_gap（生成の不詳率 − 公表の不詳率、人口加重）
+    """
+    pop = np.asarray(pub_mt["pop"], dtype=np.float64)
+    w = pop / pop.sum()
+    res: dict[str, float] = {}
+    for kind in ("wake", "bed"):
+        g = np.asarray(gen[f"{kind}_hour"], dtype=np.float64)
+        q = np.asarray(pub_mt[f"{kind}_hour"], dtype=np.float64)
+        m = ~np.isnan(g) & ~np.isnan(q)
+        ww = w[m] / w[m].sum()
+        diff = g[m] - q[m]
+        res[f"{kind}_mae"] = float((ww * np.abs(diff)).sum())
+        res[f"{kind}_max_abs"] = float(np.abs(diff).max()) if m.any() else float("nan")
+        res[f"{kind}_bias"] = float((ww * diff).sum())
+        # 公表の「不詳率」は 1 − 行動者率
+        gu = np.asarray(gen[f"{kind}_undef_rate"], dtype=np.float64)
+        qu = 1.0 - np.asarray(pub_mt[f"{kind}_actor_rate"], dtype=np.float64)
+        mu = ~np.isnan(gu) & ~np.isnan(qu)
+        wu = w[mu] / w[mu].sum()
+        res[f"{kind}_undef_gap"] = float((wu * (gu[mu] - qu[mu])).sum())
+        res[f"{kind}_n_groups"] = int(m.sum())
+    return res

@@ -1078,6 +1078,81 @@ def test_published_participation() -> None:
     print("test_published_participation: OK")
 
 
+def test_published_mean_times() -> None:
+    """(17) 平均時刻編との突合（設計書 §9.7 の測る量 2）。
+
+    起床・就寝は教師（時刻別行動者率）が縛らない量で、規則も公表統計のものである。
+    ここで固定するのは**軸の取り方と畳み方**で、どちらも間違えても例外が出ない。
+    """
+    mt = sp.load_mean_times()
+    assert mt["wake_hour"].shape == (st.D_GROUPS,)
+    assert not np.isnan(mt["wake_hour"]).any() and not np.isnan(mt["bed_hour"]).any()
+
+    # (1) 起床は 0-12 時、就寝は 0-36 時の軸に載ること。
+    #     ★就寝に 24 を超える群が実在する（深夜 0 時台の就寝）。ここが 24 未満に
+    #       収まっていたら、どこかで 24 時間の折り返しが起きている
+    assert (mt["wake_hour"] >= 0).all() and (mt["wake_hour"] < 12).all()
+    assert (mt["bed_hour"] >= 17).all() and (mt["bed_hour"] < 36).all()
+    assert (mt["bed_hour"] > 24.0).any(), \
+        "就寝に 24 時超の群が無い。0〜36 時の軸が 24 時で折り返されている"
+    print(f"  (1) 起床 {mt['wake_hour'].min():.2f}〜{mt['wake_hour'].max():.2f} 時 / "
+          f"就寝 {mt['bed_hour'].min():.2f}〜{mt['bed_hour'].max():.2f} 時"
+          f"（24 時超が {int((mt['bed_hour'] > 24).sum())} 群）: OK")
+
+    # (2) ★5歳15区分 -> 7区分 の畳み方が「行動者数での加重平均」であること。
+    #     人口加重にすると、時刻が定まらない人の多い層の重みが過大になる
+    df = pd.read_csv(st.STULA_DIR / "meantime_wake.csv")
+    sub = df[(df["daytype"] == sp.MT_DAYTYPE_WEEKDAY)
+             & (df["region"] == sp.MT_REGION_JAPAN)
+             & (df["life_stage"] == sp.LIFE_STAGE_TOTAL)
+             & (df["gender"] == "1_男") & (df["employment"] == "1_有業者")
+             & (df["age_class"].isin(["13_75～79歳", "14_80～84歳", "15_85歳以上"]))]
+    assert len(sub) == 3, f"75歳以上を構成する 3 区分が揃わない: {len(sub)}"
+    actors = sub["population_k"].to_numpy(float) * sub["actor_rate"].to_numpy(float) / 100.0
+    want = float((actors * sub["mean_time_hour"].to_numpy(float)).sum() / actors.sum())
+    d = st.d_index(0, 6, 1)                       # 男 / 75歳以上 / 有業
+    assert abs(mt["wake_hour"][d] - want) < 1e-12, \
+        f"行動者数加重の畳み込みと合わない: {mt['wake_hour'][d]:.6f} vs {want:.6f}"
+    print(f"  (2) 男・75歳以上・有業 の起床 {want:.4f} 時を "
+          f"行動者数加重で独立再計算し一致: OK")
+
+    # (3) 公表値そのものを生成側に入れたら差は 0
+    gen = {"wake_hour": mt["wake_hour"].copy(), "bed_hour": mt["bed_hour"].copy(),
+           "wake_undef_rate": 1.0 - mt["wake_actor_rate"],
+           "bed_undef_rate": 1.0 - mt["bed_actor_rate"]}
+    r = sp.eval_derived_times(gen, mt)
+    for k in ("wake_mae", "wake_bias", "bed_mae", "bed_bias",
+              "wake_undef_gap", "bed_undef_gap"):
+        assert abs(r[k]) < 1e-12, f"公表値を入れても {k}={r[k]:.3e}"
+    assert r["wake_n_groups"] == st.D_GROUPS and r["bed_n_groups"] == st.D_GROUPS
+    print("  (3) 公表値を入力 -> 全指標が 0: OK")
+
+    # (4) ★軸の値を取り違えたら気づけること。平均時刻編は "1_平日" で、
+    #     生活時間編の "2_平日" を渡すと 0 行になる
+    try:
+        sp.load_mean_times(daytype=sp.DAYTYPE_WEEKDAY)     # "2_平日"
+    except ValueError as exc:
+        assert "軸の値" in str(exc), f"原因を示していない例外文: {exc}"
+    else:
+        raise AssertionError("生活時間編の曜日コードを渡しても通ってしまう")
+    print(f"  (4) 生活時間編の曜日コード '{sp.DAYTYPE_WEEKDAY}' を渡すと "
+          f"ValueError（平均時刻編は '{sp.MT_DAYTYPE_WEEKDAY}'）: OK")
+
+    # (5) 生成プール経路。全員 23:00-07:00 の睡眠なら全群 7.0 / 23.0 になる
+    pool = np.full((st.D_GROUPS, 4, sm.NUM_SLOTS), int(cw.Common.LEISURE_SOCIAL),
+                   dtype=np.int64)
+    pool[:, :, 76:] = int(cw.Common.SLEEP_PERSONAL)
+    pool[:, :, :12] = int(cw.Common.SLEEP_PERSONAL)
+    g2 = sp.derived_times_from_pool(pool)
+    assert np.allclose(g2["wake_hour"], 7.0) and np.allclose(g2["bed_hour"], 23.0)
+    assert np.allclose(g2["wake_undef_rate"], 0.0)
+    r2 = sp.eval_derived_times(g2, mt)
+    assert r2["bed_bias"] < 0, "23:00 就寝は日本の公表値より早いはず"
+    print(f"  (5) 全員 23:00-07:00 のプール -> 起床 7.0 / 就寝 23.0、"
+          f"公表比 bed_bias={r2['bed_bias']:+.3f} 時: OK")
+    print("test_published_mean_times: OK")
+
+
 def test_checkpoint_selection() -> None:
     """(sel) 事後選択が §9.8 の出所列を持ち、LGO で in-teacher と held-out を分けること。
 
@@ -1778,6 +1853,7 @@ def main() -> None:
     test_rate_mse_split()
     test_teacher_floor()
     test_published_participation()
+    test_published_mean_times()
     test_checkpoint_selection()
     test_zeroshot_baseline()
     test_lgo_folds()
