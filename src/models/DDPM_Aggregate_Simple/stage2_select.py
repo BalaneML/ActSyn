@@ -456,6 +456,94 @@ def evaluate_zeroshot(stage1_ckpt: Path, tgt: dict, sched_real: np.ndarray,
                           teacher_mask, base, pool_seed)
 
 
+def make_pool(model: Any, n: int, pool_seed: int = DEFAULT_POOL_SEED
+              ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """モデルから群別プールを作り、時刻別行動者率とその前半・後半を返す。
+
+    evaluate_model と、教師を抜いた基準線を測る stage2_lgo.zeroshot_fold_rows の
+    共通部分。**同じ関数を通すことが要点**で、経路が分かれると乱数列や二分の
+    仕方がずれ、基準線と評価値の差がモデルの差でなくなる。
+
+    Args:
+        model: 生成に使うモデル
+        n: 群あたりの生成本数 M。偶数であること
+        pool_seed: プール生成の乱数種, default=DEFAULT_POOL_SEED
+
+    Returns:
+        (pool, rates, rates_a, rates_b)。pool は (D, M, 96) の common12 ラベル、
+        rates は (D, 12*96) の時刻別行動者率、rates_a / rates_b は群内で
+        前半 M/2 本・後半 M/2 本から作った同形の率
+
+    Raises:
+        ValueError: n が奇数（rate_mse_split が群内で二分できない）
+
+    Note:
+        ★torch.manual_seed は生成の直前に置く。呼び出し側の ck.load_ckpt は
+        学習時の RNG を復元する副作用を持つので、先に置くと上書きされる。
+    """
+    # ★生成の前に落とす。1 モデルの生成は 28群 × n 本で数十秒かかるので、
+    #   払ってから弾くと掃引の本数ぶん無駄になる
+    if n % 2 != 0:
+        raise ValueError(f"split-batch 不偏推定には n が偶数である必要がある: {n}")
+
+    # ★経路でモードが変わらないようにする。sm.load_pretrained は eval() を呼ぶが
+    #   sm.UNet1D() は train のままなので、揃えておかないと将来 dropout を足した
+    #   ときに zero-shot 基準線とだけ値がずれる
+    model.eval()
+
+    # 全 ckpt を同じ乱数列で生成する（common random numbers）
+    torch.manual_seed(pool_seed)
+    pool = sm.group_pool(model, n, verbose=False)                  # (28, n, 96)
+    rates = sm.pool_to_rates(pool)                                 # (28, 12*96) act-major
+    # ★split-batch 不偏推定の材料（§9.4）。群の内側で前半・後半に割るので、
+    #   2つの平均は独立で、かつ群をまたがない。群をまたいで割ると別の群の平均に
+    #   なり、交差項が bias² を推定しなくなる（stage2_loss.group_rates_split と同じ理屈）
+    half = n // 2
+    rates_a = sm.pool_to_rates(pool[:, :half])                     # (28, 12*96)
+    rates_b = sm.pool_to_rates(pool[:, half:])                     # (28, 12*96)
+    return pool, rates, rates_a, rates_b
+
+
+def teacher_fit_rows(rates: np.ndarray, rates_a: np.ndarray, rates_b: np.ndarray,
+                     tgt: dict, teacher_mask: np.ndarray, base: dict) -> list[dict]:
+    """軸1（教師適合）の行を作る。in-teacher と held-out を分けて測る。
+
+    ★採点の定義をここ一箇所に閉じ込める。Stage 2 の世代・zero-shot 基準線・
+      LGO の基準線がすべてこの関数を通るので、「held-out での改善」が
+      定義の違いで出てしまう余地が無い。
+
+    Args:
+        rates: 生成の時刻別行動者率, (D, 12*96)
+        rates_a: 群内前半から作った率, (D, 12*96)
+        rates_b: 群内後半から作った率, (D, 12*96)
+        tgt: load_stula_targets の戻り値。28群ぶんの教師 A* と人口
+        teacher_mask: 教師に使った群が True, dtype=bool, (28,)
+        base: 全行に付ける識別列（ckpt / step / holdout など）
+
+    Returns:
+        軸1 の行 list[dict]。28群すべてが教師なら held-out 行は出ない
+    """
+    rows: list[dict] = []
+    for mask_c, mask_name in ((st.mask_12act(), "12act"), (st.mask_11act(), "11act")):
+        # 教師群と held-out 群を分けて測る。28群すべてが教師なら held-out 行は出ない
+        for kind, sel in (("in-teacher", teacher_mask), ("held-out", ~teacher_mask)):
+            if not sel.any():
+                continue
+            sub_tgt = {"group_rates_tbl": tgt["group_rates_tbl"][sel],
+                       "pop": tgt["pop"].reshape(sm.D_GROUPS)[sel]}
+            # ★採点の定義は stage2_targets.eval_against ただ一つ。群数は教師テンソルから
+            #   読むので、教師群と held-out 群を同じ関数で測れる
+            scores = st.eval_against(rates[sel], sub_tgt, mask_c,
+                                     (rates_a[sel], rates_b[sel]))
+            scores.pop("mask")          # mask は行の列として明示的に持たせる
+            for metric, value in scores.items():
+                rows.append({**base, "eval_kind": kind, "reference": "teacher",
+                             "statistic": "slot_rate", "mask": mask_name,
+                             "weight_basis": "stula_pop", "metric": metric,
+                             "value": float(value), "vs_zeroshot": float("nan")})
+    return rows
+
+
 def evaluate_model(model: Any, tgt: dict, sched_real: np.ndarray,
                    d_real: np.ndarray, w_real: np.ndarray, n: int,
                    teacher_mask: np.ndarray, base: dict,
@@ -488,55 +576,18 @@ def evaluate_model(model: Any, tgt: dict, sched_real: np.ndarray,
         ck.load_ckpt は学習時の RNG を復元する副作用を持つので、先に置くと
         上書きされて ckpt ごとに別の乱数列になる。
     """
-    # ★生成の前に落とす。1 モデルの生成は 28群 × n 本で数十秒かかるので、
-    #   払ってから弾くと掃引の本数ぶん無駄になる
-    if n % 2 != 0:
-        raise ValueError(f"split-batch 不偏推定には n が偶数である必要がある: {n}")
-
-    # ★経路でモードが変わらないようにする。sm.load_pretrained は eval() を呼ぶが
-    #   sm.UNet1D() は train のままなので、揃えておかないと将来 dropout を足した
-    #   ときに zero-shot 基準線とだけ値がずれる
-    model.eval()
-
-    # 全 ckpt を同じ乱数列で生成する（common random numbers）
-    torch.manual_seed(pool_seed)
-    pool = sm.group_pool(model, n, verbose=False)                  # (28, n, 96)
+    pool, rates, rates_a, rates_b = make_pool(model, n, pool_seed)
     gen = pool.reshape(-1, sm.NUM_SLOTS)
     gen_d = np.repeat(np.arange(sm.D_GROUPS), n)
 
-    rates = sm.pool_to_rates(pool)                                 # (28, 12*96) act-major
-    # ★split-batch 不偏推定の材料（§9.4）。群の内側で前半・後半に割るので、
-    #   2つの平均は独立で、かつ群をまたがない。群をまたいで割ると別の群の平均に
-    #   なり、交差項が bias² を推定しなくなる（stage2_loss.group_rates_split と同じ理屈）
-    half = n // 2
-    rates_a = sm.pool_to_rates(pool[:, :half])                     # (28, 12*96)
-    rates_b = sm.pool_to_rates(pool[:, half:])                     # (28, 12*96)
     guard = guardrails(gen, gen_d, sched_real, d_real, w_real, seed=pool_seed)
     # ★暗記チェックは zero-shot 基準を持たない（ZERO_SHOT_GUARDRAILS に入れていない）。
     #   Stage 1 の実測が無いので比を出すと出所不明の数字になる。生の値で並べ、
     #   ckpt 間で dcr_gap が上がっていくかどうかを見る
     guard.update(memorization_guardrail(gen, sched_real, seed=pool_seed))
 
-    rows: list[dict] = []
-
     # --- 軸1: 教師適合。statistic=slot_rate は教師と同じ統計量＝循環している ---
-    for mask_c, mask_name in ((st.mask_12act(), "12act"), (st.mask_11act(), "11act")):
-        # 教師群と held-out 群を分けて測る。28群すべてが教師なら held-out 行は出ない
-        for kind, sel in (("in-teacher", teacher_mask), ("held-out", ~teacher_mask)):
-            if not sel.any():
-                continue
-            sub_tgt = {"group_rates_tbl": tgt["group_rates_tbl"][sel],
-                       "pop": tgt["pop"].reshape(sm.D_GROUPS)[sel]}
-            # ★採点の定義は stage2_targets.eval_against ただ一つ。群数は教師テンソルから
-            #   読むので、教師群と held-out 群を同じ関数で測れる
-            scores = st.eval_against(rates[sel], sub_tgt, mask_c,
-                                     (rates_a[sel], rates_b[sel]))
-            scores.pop("mask")          # mask は行の列として明示的に持たせる
-            for metric, value in scores.items():
-                rows.append({**base, "eval_kind": kind, "reference": "teacher",
-                             "statistic": "slot_rate", "mask": mask_name,
-                             "weight_basis": "stula_pop", "metric": metric,
-                             "value": float(value), "vs_zeroshot": float("nan")})
+    rows = teacher_fit_rows(rates, rates_a, rates_b, tgt, teacher_mask, base)
 
     # --- 軸2: ガードレール。教師が縛らない量＝非循環 ---
     # ★群で分けずにプール全体で測るので eval_kind は "all"、mask は 12act 固定。

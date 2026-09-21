@@ -1338,6 +1338,87 @@ def test_zeroshot_baseline() -> None:
     print("test_zeroshot_baseline: OK")
 
 
+def test_lgo_zeroshot_baseline() -> None:
+    """(zsf) fold ごとの zero-shot 基準線が、fold 側の採点と同じ値になること。
+
+    ★何を守るテストか。`evaluate_zeroshot` は teacher_mask を全 True に固定するので
+      held-out 行を出さない。そのままだと「held-out で改善した」の起点が step=25 に
+      なり、25 ステップぶんの改善が見えなくなる。`zeroshot_fold_rows` はこの穴を
+      埋めるものなので、**fold 側と同じ定義・同じ乱数で測れていること**が要件である。
+      ここがずれると、基準線との差がモデルの差でなく経路の差になる。
+
+    ★プールを 1 回だけ作って 7 通りに採点する設計も同時に固定する。fold は
+      「どの群を held-out と呼ぶか」を決めるだけで、zero-shot のモデルは fold に
+      依存しない。依存してしまう実装に変わったらここで落ちる。
+    """
+    model = _model()
+    tgt = st.load_stula_targets()
+    cond_idx, sched_real, w_real, _ = sm.load_data()
+    d_real = sm.cond_to_d(cond_idx)
+    folds = lg.stratified_folds(tgt["pop"])
+
+    with tempfile.TemporaryDirectory() as tmp, _short_T():
+        d = Path(tmp)
+        s1_path = d / "ddpm_simple_pretrain_common12_weekday_test.pt"
+        torch.save({"model": model.state_dict()}, s1_path)
+
+        df = lg.zeroshot_fold_rows(s1_path, tgt, folds, n=2, pool_seed=999,
+                                   device=DEVICE)
+
+        # 比較対象: fold 0 を evaluate_model へ直接通した場合
+        m2 = sm.load_pretrained(s1_path).to(DEVICE)
+        teacher_mask = np.ones(sm.D_GROUPS, dtype=bool)
+        for g in folds[0]:
+            teacher_mask[g] = False
+        direct = se.evaluate_model(m2, tgt, sched_real, d_real, w_real, 2,
+                                   teacher_mask, {"ckpt": s1_path.name, "step": 0},
+                                   pool_seed=999)
+
+    # (1) 7 fold すべてに held-out 行があり、28 群をちょうど 1 回ずつ覆う
+    assert set(df["fold"]) == set(range(7)), f"fold が 7 つでない: {set(df['fold'])}"
+    held = df[df["eval_kind"] == "held-out"]
+    assert not held.empty, "held-out 行が無い（evaluate_zeroshot と同じ穴が空いている）"
+    seen: list[int] = []
+    for i in range(7):
+        row = held[held["fold"] == i].iloc[0]
+        seen.extend(row["holdout"])
+    assert sorted(seen) == list(range(28)), \
+        f"28 群をちょうど 1 回ずつ覆っていない: {sorted(seen)}"
+    print("  (1) (zsf) 7 fold すべてに held-out 行、28 群を 1 回ずつ: OK")
+
+    # (2) step=0 / teacher_groups=24 であること
+    assert set(df["step"]) == {0}
+    assert set(df["teacher_groups"]) == {24}, \
+        f"教師群が 24 でない: {set(df['teacher_groups'])}"
+    print("  (2) (zsf) step=0 / teacher_groups=24: OK")
+
+    # (3) ★fold 側の採点と完全に一致すること。ここが本体
+    def _key(r) -> tuple:
+        return (r["eval_kind"], r["mask"], r["metric"])
+    mine = {_key(r): float(r["value"])
+            for _, r in df[df["fold"] == 0].iterrows()}
+    theirs = {_key(r): float(r["value"]) for r in direct
+              if r["reference"] == "teacher"}
+    assert set(mine) == set(theirs), \
+        f"行の集合が違う: {set(mine) ^ set(theirs)}"
+    worst = max(abs(mine[k] - theirs[k]) for k in mine)
+    assert worst == 0.0, \
+        f"zeroshot_fold_rows と evaluate_model で値が違う: max|Δ|={worst:.3e}"
+    print(f"  (3) (zsf) evaluate_model と全 {len(mine)} 指標がビット一致: OK")
+
+    # (4) プールは 1 回だけ。fold をまたいでも同じ群の in-teacher 値は変わらない
+    #     （fold 0 と fold 1 の両方で教師側に入る群だけを比べる）
+    a = df[(df["fold"] == 0) & (df["eval_kind"] == "held-out")
+           & (df["mask"] == "12act") & (df["metric"] == "rate_mse_split")]
+    b = df[(df["fold"] == 1) & (df["eval_kind"] == "held-out")
+           & (df["mask"] == "12act") & (df["metric"] == "rate_mse_split")]
+    assert len(a) == 1 and len(b) == 1
+    assert float(a.iloc[0]["value"]) != float(b.iloc[0]["value"]), \
+        "fold が違えば held-out 群が違うので値も違うはず（分割が効いていない）"
+    print("  (4) (zsf) fold ごとに held-out 群が違い、値も分かれている: OK")
+    print("test_lgo_zeroshot_baseline: OK")
+
+
 def test_lgo_folds() -> None:
     """(lgo) 28 群が人口シェアで層化された 4群 × 7 fold の分割になること。
 
@@ -1844,16 +1925,29 @@ def test_select_common_random_numbers() -> None:
       乱数差か区別できなくなる（n=2000 のセル当たり MC 標準偏差は最大 0.0112、
       rate_mae の水準 0.0288 と同じ桁）。
     """
-    # ★順序は2つの関数にまたがる。evaluate_ckpt が ck.load_ckpt で RNG を壊し、
-    #   その後に呼ぶ evaluate_model が生成の直前で seed を置き直す
+    # ★順序は3つの関数にまたがる。evaluate_ckpt が ck.load_ckpt で RNG を壊し、
+    #   evaluate_model が make_pool を呼び、make_pool が生成の直前で seed を置き直す
     ck_src = inspect.getsource(se.evaluate_ckpt)
     assert ck_src.index("ck.load_ckpt") < ck_src.index("evaluate_model("), \
         "evaluate_ckpt が load_ckpt より先に evaluate_model を呼んでいる"
     model_src = inspect.getsource(se.evaluate_model)
-    assert model_src.index("torch.manual_seed(pool_seed)") < model_src.index("sm.group_pool"), \
-        "torch.manual_seed が group_pool の前に無い"
-    print("  (1) (crn) load_ckpt -> evaluate_model -> manual_seed(pool_seed) "
-          "-> group_pool の順: OK")
+    assert "make_pool(" in model_src, \
+        "evaluate_model が make_pool を通っていない（生成経路が分岐している）"
+    pool_src = inspect.getsource(se.make_pool)
+    assert pool_src.index("torch.manual_seed(pool_seed)") < pool_src.index("sm.group_pool"), \
+        "make_pool で torch.manual_seed が group_pool の前に無い"
+    print("  (1) (crn) load_ckpt -> evaluate_model -> make_pool -> "
+          "manual_seed(pool_seed) -> group_pool の順: OK")
+
+    # ★LGO の zero-shot 基準線も同じ make_pool / teacher_fit_rows を通ること。
+    #   ここが分岐すると「held-out で改善した」の起点だけが別定義・別乱数になり、
+    #   改善量がモデルの差でなくなる（これを防ぐために切り出した関数である）
+    lgo_src = inspect.getsource(lg.zeroshot_fold_rows)
+    assert "make_pool(" in lgo_src and "teacher_fit_rows(" in lgo_src, \
+        "zeroshot_fold_rows が make_pool / teacher_fit_rows を通っていない"
+    assert "sm.group_pool" not in lgo_src and "torch.manual_seed" not in lgo_src, \
+        "zeroshot_fold_rows が生成を自前で書いている（make_pool と二重定義になる）"
+    print("  (1b) (crn) LGO の基準線も make_pool / teacher_fit_rows を通る: OK")
 
     # 出所の列として CSV に残ること
     assert '"pool_seed": pool_seed' in ck_src
@@ -1865,6 +1959,14 @@ def test_select_common_random_numbers() -> None:
     assert "sm.load_pretrained" in zs_src and "evaluate_model(" in zs_src, \
         "evaluate_zeroshot が evaluate_model を通っていない"
     print("  (3) zero-shot 基準線も同じ evaluate_model を通る: OK")
+
+    # ★軸1 の採点式が 1 箇所であること。eval_against を呼ぶのは teacher_fit_rows
+    #   だけで、evaluate_model は自前で採点しない
+    fit_src = inspect.getsource(se.teacher_fit_rows)
+    assert "st.eval_against(" in fit_src, "teacher_fit_rows が eval_against を呼んでいない"
+    assert "st.eval_against(" not in model_src, \
+        "evaluate_model が自前で採点している（teacher_fit_rows と二重定義になる）"
+    print("  (4) 軸1 の採点は teacher_fit_rows ただ一箇所: OK")
     print("test_select_common_random_numbers: OK")
 
 
@@ -1892,6 +1994,7 @@ def main() -> None:
     test_published_mean_times()
     test_checkpoint_selection()
     test_zeroshot_baseline()
+    test_lgo_zeroshot_baseline()
     test_lgo_folds()
     test_lgo_collect()
     test_naive_accumulation_is_wrong()
