@@ -251,6 +251,63 @@ def heldout_distribution(held: pd.DataFrame,
     return cast(pd.DataFrame, agg.reindex([m for m in metrics if m in agg.index]))
 
 
+def zeroshot_fold_rows(stage1_ckpt: Path, tgt: dict, folds: list[list[int]],
+                       n: int = 1000, pool_seed: int = 12345,
+                       device: str | None = None) -> pd.DataFrame:
+    """微調整前の重みを、fold ごとの held-out 群で測って step=0 の基準線にする。
+
+    ★なぜ別に測る必要があるか。`stage2_select` が CSV の先頭に入れる zero-shot 行は
+      `holdout=[]` で評価されるので **held-out 行が出ない**（`evaluate_zeroshot` が
+      teacher_mask を全 True に固定しているため）。その結果、held-out での改善を
+      読む起点が step=25 になる。step=25 は既に 25 ステップ微調整済みで、しかも
+      in-teacher 側では step0 -> 25 でわずかに悪化する山がある。起点をそこに置くと
+      「zero-shot から改善した」とは言えない。
+
+    ★プールは 1 回だけ作って 7 通りに採点する。zero-shot のモデルは fold に依存せず、
+      fold は「どの群を held-out と呼ぶか」を決めるだけだからである。実測でも、
+      独立に走った 3 本の fold ジョブの step=0 行 134 指標がすべて完全一致している
+      （同じ Stage 1 重み・同じ pool_seed）。したがって生成は 7 分の 1 で足りる。
+
+    Args:
+        stage1_ckpt: 微調整前の Stage 1 重み
+        tgt: load_stula_targets の戻り値
+        folds: stratified_folds の戻り値。fold ごとの held-out 群
+        n: 群あたりの生成本数。fold の評価と揃えること, default=1000
+        pool_seed: プール生成の乱数種。fold の評価と揃えること, default=12345
+        device: モデルを載せるデバイス。None なら model.DEVICE
+
+    Returns:
+        fold ごとの held-out / in-teacher 行を縦に積んだ DataFrame。列は
+        stage2_select が書く CSV と同じなので、そのまま突き合わせられる
+    """
+    # ★torch を使うのはこの関数だけ。--floors / --collect は numpy と pandas しか
+    #   要らないので、モジュール先頭では読まない（フロントエンドで動かせなくなる）。
+    sel: Any = _load("lgo_stage2_select", HERE / "stage2_select.py")
+    sm: Any = _load("lgo_simple_model", HERE / "model.py")
+
+    dev = device or sm.DEVICE
+    model = sm.load_pretrained(stage1_ckpt).to(dev)
+    print(f"zero-shot 基準線: {stage1_ckpt.name} で 28群 × {n} 本を生成 "
+          f"(pool_seed={pool_seed}) ...")
+    _, rates, rates_a, rates_b = sel.make_pool(model, n, pool_seed)
+
+    frames: list[pd.DataFrame] = []
+    for i, f in enumerate(folds):
+        teacher_mask = np.ones(sm.D_GROUPS, dtype=bool)
+        for d in f:
+            teacher_mask[d] = False
+        base = {"ckpt": stage1_ckpt.name, "step": 0,
+                "teacher_groups": int(teacher_mask.sum()),
+                "n_per_group": n, "pool_seed": pool_seed,
+                "holdout": list(f), "stage1_ckpt": stage1_ckpt.name,
+                "lam": float("nan"), "fold": i}
+        # ★採点は stage2_select.teacher_fit_rows ただ一つ。fold 側の評価と同じ関数を
+        #   通すので、基準線と評価値が別定義になる余地が無い
+        frames.append(pd.DataFrame(
+            sel.teacher_fit_rows(rates, rates_a, rates_b, tgt, teacher_mask, base)))
+    return pd.concat(frames, ignore_index=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Stage 2 の LGO（4群 × 7 fold）ドライバ")
@@ -263,6 +320,19 @@ def main() -> None:
                     help="fold ごとの結果 CSV。held-out 行を束ねて分布を出す")
     ap.add_argument("--floors", action="store_true",
                     help="fold ごとの教師の床を出す。LGO の 7 個を読む物差しになる")
+    ap.add_argument("--zeroshot-baseline", type=Path, default=None,
+                    help="微調整前の Stage 1 重み。fold ごとの held-out 群で測り、"
+                        "step=0 の基準線 CSV を書く。これが無いと held-out の改善を "
+                        "step=25 起点でしか言えない")
+    ap.add_argument("--n", type=int, default=1000,
+                    help="--zeroshot-baseline の群あたり生成本数。fold の評価と"
+                        "揃えること, default=1000")
+    ap.add_argument("--pool-seed", type=int, default=12345,
+                    help="--zeroshot-baseline の乱数種。fold の評価と揃えること,"
+                        " default=12345")
+    ap.add_argument("--out-csv", type=Path, default=None,
+                    help="--zeroshot-baseline の出力先。既定は "
+                        "data/processed/aggregates/stage2_lgo_zeroshot_baseline.csv")
     args = ap.parse_args()
 
     if args.collect:
@@ -292,6 +362,23 @@ def main() -> None:
               f"(比 {fl['rate_mse'].max() / fl['rate_mse'].min():.2f}倍)")
         print("★fold 間の差がこの床より小さければ、モデルの当たり外れではなく"
               "\n  教師の標本誤差の揺らぎである。fold ごとに床が違う点に注意する。")
+        return
+
+    if args.zeroshot_baseline is not None:
+        out = (args.out_csv or REPO_ROOT / "data" / "processed" / "aggregates"
+               / "stage2_lgo_zeroshot_baseline.csv")
+        df = zeroshot_fold_rows(args.zeroshot_baseline, tgt, folds,
+                                n=args.n, pool_seed=args.pool_seed)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out, index=False)
+        print(f"\n書き出し: {out}  ({len(df)} 行)")
+        held = df[(df.eval_kind == "held-out") & (df["mask"] == "12act")
+                  & (df.metric.isin(["rate_mse_split", "dev_rmse"]))]
+        piv = held.pivot_table(index="fold", columns="metric", values="value")
+        print("\n--- fold ごとの held-out 基準線（zero-shot, 12act）---")
+        print(piv.to_string(float_format="{:.4e}".format))
+        print("\n★これが step=0 の起点である。fold の CSV の held-out 行"
+              "（step>=25）をこの行と比べること。")
         return
 
     if args.print_folds:
