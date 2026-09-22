@@ -38,6 +38,33 @@ if [ "${1:-}" = "--dry-run" ]; then
     DRY=1
 fi
 
+# --- ★jobs/_common.sh の既定を 2 つ上書きする -------------------------------
+#
+# (1) WANDB_MODE。_common.sh:49 は `offline` を輸出する。計算ノードが外部へ出られない
+#     ため学習ジョブにはそれが正しいが、**このスクリプトはフロントエンドで動く送信側**
+#     である。offline のままだと wandb.init(resume="must") がオンラインの run を
+#     開かずに**新しいオフライン run を掘る**。エラーにならず、成功したように見えて
+#     何も送られない（2026-09-22 に実機で踏んだ）。
+export WANDB_MODE=online
+#
+# (2) artifact の作業場所。wandb は送信前にファイルを**複製**して退避する。既定の
+#     退避先は $HOME の下で、SQUID の home は 10GB 固定・拡張不可である。21MB の
+#     ckpt を 7 本コピーした時点で `OSError: [Errno 122] Disk quota exceeded` になる。
+#     XDG_CACHE_HOME を work に向けるだけでは足りない（wandb は専用の変数を見る）。
+export WANDB_CACHE_DIR="${WORK}/.cache/wandb"
+export WANDB_DATA_DIR="${WORK}/.cache/wandb/staging"
+export WANDB_ARTIFACT_DIR="${WORK}/.cache/wandb/artifacts"
+export WANDB_CONFIG_DIR="${WORK}/.config/wandb"
+mkdir -p "${WANDB_CACHE_DIR}" "${WANDB_DATA_DIR}" "${WANDB_ARTIFACT_DIR}" \
+         "${WANDB_CONFIG_DIR}"
+# ★コンテナへも確実に渡す。Singularity はホストの環境を引き継ぐが、
+#   ここを取り違えると (1) と同じく「静かに何もしない」に戻る。
+export SINGULARITYENV_WANDB_MODE="${WANDB_MODE}"
+export SINGULARITYENV_WANDB_CACHE_DIR="${WANDB_CACHE_DIR}"
+export SINGULARITYENV_WANDB_DATA_DIR="${WANDB_DATA_DIR}"
+export SINGULARITYENV_WANDB_ARTIFACT_DIR="${WANDB_ARTIFACT_DIR}"
+export SINGULARITYENV_WANDB_CONFIG_DIR="${WANDB_CONFIG_DIR}"
+
 # fold と wandb run id の対応。★python 側の FOLDS と同じ値でなければならない。
 # ここは同期する run を選ぶためだけに使う（添付の対応付けは python 側が持つ）。
 RUN_IDS="me2bbley 37vkv5gu xkqwnbn9 ro0kgfnz woe7z8a3 tlnl6va8 sml7viek"
@@ -52,6 +79,22 @@ fi
 
 if [ ! -f "${SIF}" ]; then
     echo "ERROR: コンテナが無い: ${SIF}" >&2
+    exit 1
+fi
+
+# --- 事前チェック 1b: home の残量 -------------------------------------------
+# ★退避先は work に向けたが、wandb / singularity が $HOME に書く経路は他にも残る。
+#   home が既に上限に張り付いていると、途中の別の書き込みで落ちる。
+HOME_USED_GB="$(du -sm "${HOME}" 2>/dev/null | cut -f1)"
+HOME_USED_GB=$(( ${HOME_USED_GB:-0} / 1024 ))
+echo "home の使用量: 約 ${HOME_USED_GB} GB / 上限 10 GB"
+if [ "${HOME_USED_GB}" -ge 10 ]; then
+    echo "ERROR: home が上限に達している。送信を始める前に減らすこと。" >&2
+    echo "       内訳:" >&2
+    du -sh "${HOME}"/* "${HOME}"/.[a-z]* 2>/dev/null | sort -rh | head -5 >&2
+    echo "       ★singularity のイメージキャッシュ（~/.singularity/cache）が" >&2
+    echo "         大きいことが多い。jobs/_common.sh が SINGULARITY_CACHEDIR を" >&2
+    echo "         work へ向けているので、古いキャッシュは消してよい。" >&2
     exit 1
 fi
 

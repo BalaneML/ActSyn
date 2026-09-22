@@ -78,6 +78,31 @@ BASELINE_JOB = "1334854"
 BASELINE_CSV = "stage2_lgo_zeroshot_baseline.csv"
 
 
+def check_online() -> None:
+    """オフラインモードのまま送信しようとしていないかを検査する。
+
+    Note:
+        ★`jobs/_common.sh:49` が `WANDB_MODE=offline` を輸出している。計算ノードは
+          外部ネットワークへ出られないので学習ジョブにはそれが正しいが、送信側で
+          これが残っていると `wandb.init(resume="must")` が**オンラインの run を
+          開かずに新しいオフライン run を掘る**。例外は出ず、ログ上は成功したように
+          見えて 1 バイトも送られない（2026-09-22 に実機で踏んだ）。
+        ★`resume="must"` でも防げない。オフラインでは resume の検査そのものが
+          行われないためである。
+
+    Raises:
+        SystemExit: WANDB_MODE が online 以外の場合
+    """
+    mode = os.environ.get("WANDB_MODE", "online")
+    if mode != "online":
+        raise SystemExit(
+            f"ERROR: WANDB_MODE={mode!r} のままでは送信されない。\n"
+            f"       オフラインだと resume='must' が効かず、新しいオフライン run が\n"
+            f"       掘られて成功したように見える。\n"
+            f"       jobs/upload_lgo_wandb.sh 経由で実行すること"
+            f"（WANDB_MODE=online を立てる）")
+
+
 def work_dir() -> Path:
     """SQUID の work 領域を返す。
 
@@ -248,8 +273,11 @@ def main() -> None:
                     help="送信せず、何をどの run へ送るかだけ印字する")
     args = ap.parse_args()
 
+    if not args.dry_run:
+        check_online()
     work = work_dir()
     print(f"work    : {work}")
+    print(f"mode    : WANDB_MODE={os.environ.get('WANDB_MODE', '(未設定=online)')}")
     print(f"repo    : {REPO_ROOT}")
     print(f"project : {WANDB_PROJECT}")
     print(f"λ={LAM}  添付する世代 = step{SEL_STEP}\n")
