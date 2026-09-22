@@ -35,6 +35,7 @@ Stage 2 の LGO（leave-groups-out）ドライバ（Stage2_design.md §9.4 / 実
 """
 import argparse
 import ast
+import math
 import importlib.util
 import sys
 from pathlib import Path
@@ -251,6 +252,104 @@ def heldout_distribution(held: pd.DataFrame,
     return cast(pd.DataFrame, agg.reindex([m for m in metrics if m in agg.index]))
 
 
+SIGN_TEST_METRIC = "rate_mse_split"
+
+
+def heldout_vs_baseline(fold_csvs: list[Path], baseline_csv: Path,
+                        floors: pd.DataFrame, step: int) -> pd.DataFrame:
+    """held-out の値を zero-shot 基準線と突き合わせ、fold ごとに 1 行で返す。
+
+    **`--collect` の分布とは目的が違う。**あちらは全 step を混ぜた分布を出す。
+    こちらは **step を 1 つに固定して基準線からの変化**を出す。報告に使うのは
+    こちらである。
+
+    Note:
+        ★step は外から渡す。**held-out の値を見て step を選んではいけない。**
+          選んだ瞬間に held-out が「使っていないデータ」でなくなり、非循環性の
+          主張が成り立たなくなる。λ 掃引（28 群すべてが教師）で先に決めた値を
+          そのまま渡すこと。
+        ★`dev` は MSE で比べる。`dev_rmse` の差を床（`dev_rmse` 列）と直接
+          比べると、平方根を挟んだぶん尺度が合わない。
+        ★基準線が要る理由。fold の CSV に入っている step=0 の行は holdout=[] で
+          評価されており held-out 行を持たない。基準線が無いと起点が step=25 に
+          なるが、step=25 は既に 25 更新ぶん動いた後であり、しかも warm-up の谷が
+          ある（実測で zero-shot より最大 +18.7% 悪い）。
+
+    Args:
+        fold_csvs: fold ごとの stage2_select 出力 CSV
+        baseline_csv: zeroshot_fold_rows が書いた基準線 CSV
+        floors: fold_floors の戻り値
+        step: 評価する世代。掃引で事前に決めた値
+
+    Returns:
+        fold ごとに 1 行の DataFrame。基準線・当該 step の値・変化率・
+        改善量が床の何倍か
+
+    Raises:
+        ValueError: 基準線に無い fold の CSV が渡された場合
+    """
+    base = pd.read_csv(baseline_csv)
+    bh = base[(base["eval_kind"] == "held-out") & (base["mask"] == "12act")]
+    bp = cast(pd.DataFrame,
+              bh.pivot_table(index="fold", columns="metric", values="value"))
+    bp["dev_mse"] = bp["dev_rmse"] ** 2
+    fl = floors.set_index("fold")
+
+    rows = []
+    for path in sorted(fold_csvs):
+        df = pd.read_csv(path)
+        held = cast(pd.DataFrame,
+                    df[(df["eval_kind"] == "held-out") & (df["mask"] == "12act")])
+        if held.empty:
+            raise ValueError(
+                f"held-out 行が無い: {path}\n"
+                f"       28 群すべてを教師にした結果（λ 掃引のもの）ではないか。"
+                f"--holdout-groups で群を抜いて学習した fold の CSV を渡すこと")
+        groups = sorted(int(d) for d in ast.literal_eval(str(held["holdout"].iloc[0])))
+        # ★fold 番号は holdout 群の一致で決める。ファイル名から数字を拾うと、
+        #   名前を付け替えたときに黙って別の fold の床と突き合わせてしまう
+        hit = [int(i) for i in fl.index
+               if sorted(int(x) for x in str(fl.loc[i, "groups"]).split(",")) == groups]
+        if not hit:
+            raise ValueError(f"{path.name} の holdout {groups} に対応する fold が無い")
+        i = hit[0]
+        p = cast(pd.DataFrame,
+                 held.pivot_table(index="step", columns="metric", values="value"))
+        p["dev_mse"] = p["dev_rmse"] ** 2
+        zr, zd = float(bp.loc[i, "rate_mse_split"]), float(bp.loc[i, "dev_mse"])
+        sr, sd = float(p.loc[step, "rate_mse_split"]), float(p.loc[step, "dev_mse"])
+        s25 = float(p.loc[25, "rate_mse_split"]) if 25 in p.index else float("nan")
+        rows.append({
+            "fold": i, "groups": ",".join(str(d) for d in groups),
+            "rate_zs": zr, "rate_step": sr, "rate_pct": (sr / zr - 1) * 100,
+            "rate_gain_floor": (zr - sr) / float(fl.loc[i, "rate_mse"]),
+            "dev_zs": zd, "dev_step": sd, "dev_pct": (sd / zd - 1) * 100,
+            "dev_gain_floor": (zd - sd) / float(fl.loc[i, "dev_mse"]),
+            "warmup_pct": (s25 / zr - 1) * 100,
+        })
+    return pd.DataFrame(rows).sort_values("fold").reset_index(drop=True)
+
+
+def sign_test_p(n_better: int, n: int) -> float:
+    """符号検定の両側 p 値。
+
+    Note:
+        ★fold は 28 群の分割なので、held-out 群は fold 間で重ならない。値の
+          大小は独立と見なせる。ただし**同じ 1 本の学習曲線から採った値ではない**
+          ことが前提で、fold ごとに別の学習を回しているからこれが成り立つ。
+
+    Args:
+        n_better: 改善した fold の数
+        n: fold の総数
+
+    Returns:
+        両側 p 値（帰無仮説は「改善・悪化が五分」）
+    """
+    k = max(n_better, n - n_better)
+    tail = sum(math.comb(n, i) for i in range(k, n + 1))
+    return min(2.0 * tail / 2 ** n, 1.0)
+
+
 def zeroshot_fold_rows(stage1_ckpt: Path, tgt: dict, folds: list[list[int]],
                        n: int = 1000, pool_seed: int = 12345,
                        device: str | None = None) -> pd.DataFrame:
@@ -333,6 +432,15 @@ def main() -> None:
     ap.add_argument("--out-csv", type=Path, default=None,
                     help="--zeroshot-baseline の出力先。既定は "
                         "data/processed/aggregates/stage2_lgo_zeroshot_baseline.csv")
+    ap.add_argument("--report", type=Path, nargs="+", default=None,
+                    help="fold ごとの結果 CSV。zero-shot 基準線と突き合わせ、"
+                        "報告用の表を出す（--baseline と --step も使う）")
+    ap.add_argument("--baseline", type=Path, default=None,
+                    help="--report が使う基準線 CSV。既定は "
+                        "data/processed/aggregates/stage2_lgo_zeroshot_baseline.csv")
+    ap.add_argument("--step", type=int, default=200,
+                    help="--report が読む世代。★λ 掃引で事前に決めた値を渡すこと。"
+                        "held-out の値を見て選び直すと非循環性が失われる, default=200")
     args = ap.parse_args()
 
     if args.collect:
@@ -348,6 +456,43 @@ def main() -> None:
     tgt = st.load_stula_targets()
     folds = stratified_folds(tgt["pop"], args.n_folds)
     shares = fold_shares(tgt["pop"], folds)
+
+    if args.report:
+        bl = (args.baseline or REPO_ROOT / "data" / "processed" / "aggregates"
+              / "stage2_lgo_zeroshot_baseline.csv")
+        if not bl.exists():
+            raise SystemExit(
+                f"ERROR: 基準線 CSV が無い: {bl}\n"
+                f"       先に --zeroshot-baseline で作ること（GPU 約 10 分）。"
+                f"これが無いと held-out の起点が step=25 になり、"
+                f"warm-up の谷が改善に混ざる")
+        fl = fold_floors(tgt, folds)
+        rep = heldout_vs_baseline(list(args.report), bl, fl, args.step)
+        n_r = int((rep["rate_pct"] < 0).sum())
+        n_d = int((rep["dev_pct"] < 0).sum())
+
+        print(f"=== 軸1 held-out @ step={args.step}"
+              f"（教師に一度も使っていない群、zero-shot 起点）===")
+        shown = cast(pd.DataFrame,
+                     rep[["fold", "groups", "rate_zs", "rate_step", "rate_pct",
+                          "rate_gain_floor", "dev_pct", "dev_gain_floor"]])
+        print(shown.to_string(
+            index=False,
+            formatters={"rate_zs": "{:.4e}".format, "rate_step": "{:.4e}".format,
+                        "rate_pct": "{:+.1f}%".format, "dev_pct": "{:+.1f}%".format,
+                        "rate_gain_floor": "{:.1f}x".format,
+                        "dev_gain_floor": "{:.1f}x".format}))
+        n = len(rep)
+        print(f"\n{SIGN_TEST_METRIC}: {n_r}/{n} fold で改善  "
+              f"中央値 {rep['rate_pct'].median():+.1f}%  "
+              f"符号検定 p = {sign_test_p(n_r, n):.4f}")
+        print(f"dev_mse       : {n_d}/{n} fold で改善  "
+              f"中央値 {rep['dev_pct'].median():+.1f}%")
+        print(f"\n★warm-up の谷（step=25 の zero-shot 比）: "
+              f"{rep['warmup_pct'].min():+.1f}〜{rep['warmup_pct'].max():+.1f}%")
+        print("  起点を step=25 に置くと、この谷からの回復が改善に混ざる。"
+              "\n  基準線 CSV があるのはこれを避けるためである。")
+        return
 
     if args.floors:
         fl = fold_floors(tgt, folds)
