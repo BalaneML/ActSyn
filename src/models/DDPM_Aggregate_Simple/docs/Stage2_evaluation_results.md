@@ -287,14 +287,32 @@ project `domain-transfer-ddpm-agg`、job_type `stage2`。
 | 2 | `xkqwnbn9` | 6 | `sml7viek` |
 | 3 | `ro0kgfnz` | | |
 
-**★2026-09-22 時点で同期は未完了である。** SQUID の home が上限 10GB に対し 12GB で、
-wandb が送信前に行うファイル複製が `Errno 122 Disk quota exceeded` で落ちる
-（`~/.singularity/cache/blob` が 12GB を占める）。home を空けた後に次を実行する。
+同期と成果物の添付は **2026-09-22 に完了している**（合計 154.3 MB）。
+
+| artifact | 中身 | 1 fold あたり |
+|---|---|---|
+| `stage2_lgo_fold{i}_model` | `stage2_step200.pt` | 21.3 MB |
+| `stage2_lgo_fold{i}_log` | 学習・評価のジョブログ | 数十 KB |
+| `stage2_lgo_fold{i}_dataset` | 事後選択の結果 CSV | 0.7 MB |
+
+zero-shot 基準線のログと CSV は fold に属さない全 fold 共通の 1 本なので、
+fold0 の run にまとめてある。
+
+**7 本の ckpt はすべて手元の実体と md5 が一致することを確認済み**である
+（artifact manifest の digest とローカルの base64 md5 を突き合わせた）。
+サイズ一致より強い検証で、25 GPU 時間の成果物がそのまま保全されている。
+
+再実行する場合:
 
 ```bash
 bash jobs/upload_lgo_wandb.sh --dry-run   # 送信内容の確認
 bash jobs/upload_lgo_wandb.sh             # 同期 + artifact 添付
 ```
+
+★このスクリプトは `jobs/_common.sh` の既定を 2 つ上書きする。`WANDB_MODE`
+（`offline` のままだと**静かに何も送らない**）と、wandb が送信前にファイルを複製する
+退避先（既定は `$HOME` で、SQUID の home は 10GB 固定・拡張不可）である。
+どちらもスクリプト冒頭に理由を書いてある。
 
 ### 結果 CSV
 
