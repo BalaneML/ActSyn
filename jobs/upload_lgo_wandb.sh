@@ -82,20 +82,26 @@ if [ ! -f "${SIF}" ]; then
     exit 1
 fi
 
-# --- 事前チェック 1b: home の残量 -------------------------------------------
-# ★退避先は work に向けたが、wandb / singularity が $HOME に書く経路は他にも残る。
-#   home が既に上限に張り付いていると、途中の別の書き込みで落ちる。
-HOME_USED_GB="$(du -sm "${HOME}" 2>/dev/null | cut -f1)"
-HOME_USED_GB=$(( ${HOME_USED_GB:-0} / 1024 ))
-echo "home の使用量: 約 ${HOME_USED_GB} GB / 上限 10 GB"
-if [ "${HOME_USED_GB}" -ge 10 ]; then
-    echo "ERROR: home が上限に達している。送信を始める前に減らすこと。" >&2
-    echo "       内訳:" >&2
-    du -sh "${HOME}"/* "${HOME}"/.[a-z]* 2>/dev/null | sort -rh | head -5 >&2
-    echo "       ★singularity のイメージキャッシュ（~/.singularity/cache）が" >&2
-    echo "         大きいことが多い。jobs/_common.sh が SINGULARITY_CACHEDIR を" >&2
-    echo "         work へ向けているので、古いキャッシュは消してよい。" >&2
+# --- 事前チェック 1b: 退避先が本当に work にあるか ---------------------------
+# ★home の残量ではなく**退避先そのもの**を確かめる。最初に踏んだのは
+#   「home が満杯」ではなく「退避先が home だった」ことによる失敗である
+#   （2026-09-22、`OSError: [Errno 122]`）。上の WANDB_DATA_DIR を向け直した後は、
+#   home が上限に張り付いていても 21MB の ckpt を退避できることを実機で確認した。
+#   したがって home の使用量は**止める理由にはならない**。警告に留める。
+if ! touch "${WANDB_DATA_DIR}/.writetest" 2>/dev/null; then
+    echo "ERROR: 退避先に書けない: ${WANDB_DATA_DIR}" >&2
+    echo "       ここが work の下でないと、21MB の ckpt 7 本を複製する時点で" >&2
+    echo "       home の 10GB 上限に当たる（拡張不可）。" >&2
     exit 1
+fi
+rm -f "${WANDB_DATA_DIR}/.writetest"
+echo "退避先: ${WANDB_DATA_DIR}（work 配下・書き込み可）"
+
+HOME_USED_GB=$(( $(du -sm "${HOME}" 2>/dev/null | cut -f1 || echo 0) / 1024 ))
+if [ "${HOME_USED_GB}" -ge 10 ]; then
+    echo "WARNING: home が上限 10GB に達している（約 ${HOME_USED_GB} GB）。" >&2
+    echo "         退避先は work なので送信自体は通るが、いずれ別の場所で詰まる。" >&2
+    du -sh "${HOME}"/* "${HOME}"/.[a-z]* 2>/dev/null | sort -rh | head -3 >&2
 fi
 
 # --- 事前チェック 2: オフライン run が 7 本そろっているか ---------------------
