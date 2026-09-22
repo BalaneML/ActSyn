@@ -301,7 +301,10 @@ def heldout_vs_baseline(fold_csvs: list[Path], baseline_csv: Path,
         held = cast(pd.DataFrame,
                     df[(df["eval_kind"] == "held-out") & (df["mask"] == "12act")])
         if held.empty:
-            raise ValueError(f"held-out 行が無い: {path}")
+            raise ValueError(
+                f"held-out 行が無い: {path}\n"
+                f"       28 群すべてを教師にした結果（λ 掃引のもの）ではないか。"
+                f"--holdout-groups で群を抜いて学習した fold の CSV を渡すこと")
         groups = sorted(int(d) for d in ast.literal_eval(str(held["holdout"].iloc[0])))
         # ★fold 番号は holdout 群の一致で決める。ファイル名から数字を拾うと、
         #   名前を付け替えたときに黙って別の fold の床と突き合わせてしまう
