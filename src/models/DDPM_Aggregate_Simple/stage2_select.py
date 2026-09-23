@@ -754,6 +754,60 @@ def run(ckpt_dir: Path, n: int = DEFAULT_N, out_csv: Path = OUT_CSV,
     return df
 
 
+def dump_rates(ckpt: Path, out_npz: Path, n: int = DEFAULT_N,
+               pool_seed: int = DEFAULT_POOL_SEED,
+               device: str | None = None) -> dict[str, Any]:
+    """1 チェックポイントの生成プールと時刻別行動者率を .npz へ保存する。
+
+    **指標ではなく素材を残すための関数である。**`run` が書く CSV はスカラーの指標
+    だけなので、後から別の重み付け（人口加重など）や別の統計量で測り直したくなると
+    生成をやり直すしかない。プールを一度落としておけば、以後は CPU だけで済む。
+
+    Note:
+        ★`make_pool` を通す。`run` と同じ経路・同じ乱数なので、ここで落とした
+          `rates` から計算した指標は CSV の値と一致する。別経路で生成すると
+          common random numbers が崩れ、CSV と突き合わせられなくなる。
+        ★`pool` は int8 で保存する。common12 は 0..11 なので情報は落ちない。
+          int64 のままだと 28×1000×96 で 21.5 MB になるところが 2.7 MB で済む。
+        ★Stage 1 の重みも読める。`step` キーの有無で Stage 2 の世代と区別する
+          （`stage2_checkpoint.save_ckpt` は step / config を必ず入れる）。
+
+    Args:
+        ckpt: Stage 2 の世代（stage2_step*.pt）か Stage 1 の重み
+        out_npz: 保存先。親ディレクトリが無ければ作る
+        n: 群あたりの生成本数 M。偶数であること, default=DEFAULT_N
+        pool_seed: プール生成の乱数種, default=DEFAULT_POOL_SEED
+        device: モデルを載せるデバイス。None なら model.DEVICE, default=None
+
+    Returns:
+        保存した内容の要約 dict。`step` / `holdout` / `n` / `pool_seed` / `shape`
+    """
+    dev = device or sm.DEVICE
+    raw = torch.load(ckpt, map_location=dev, weights_only=False)
+    model = sm.UNet1D().to(dev)
+    model.load_state_dict(raw["model"])
+    step = int(raw.get("step", 0))
+    config: dict[str, Any] = dict(raw.get("config", {}))
+    holdout = [int(d) for d in config.get("holdout", [])]
+
+    pool, rates, rates_a, rates_b = make_pool(model, n, pool_seed)
+
+    out_npz.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        out_npz,
+        pool=pool.astype(np.int8),
+        rates=rates, rates_a=rates_a, rates_b=rates_b,
+        holdout=np.asarray(holdout, dtype=np.int64),
+        meta=np.asarray([step, n, pool_seed], dtype=np.int64),
+        ckpt=np.asarray(ckpt.name))
+    info = {"step": step, "holdout": holdout, "n": n, "pool_seed": pool_seed,
+            "shape": list(pool.shape), "out": str(out_npz),
+            "bytes": out_npz.stat().st_size}
+    print(f"[dump] {ckpt.name} step={step} holdout={holdout} "
+          f"n={n} seed={pool_seed} -> {out_npz} ({info['bytes'] / 1e6:.1f} MB)")
+    return info
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Stage 2 の事後チェックポイント選択（教師適合 × ガードレール）")
@@ -770,7 +824,18 @@ def main() -> None:
                         "同じ n・同じ pool_seed で測って先頭に入れる。妥当性12 と "
                         "多様性6 は ZERO_SHOT_GUARDRAILS に定数が無いので、"
                         "これが無いと悪化したかを判定できない（§9.5）")
+    ap.add_argument("--dump-rates", type=Path, default=None, metavar="CKPT",
+                    help="指標を測らず、この ckpt の生成プールと時刻別行動者率を "
+                        "--dump-out の .npz へ保存する。後から別の重み付けで測り直す "
+                        "ための素材（stage2_curves.py --rates が読む）")
+    ap.add_argument("--dump-out", type=Path, default=None,
+                    help="--dump-rates の保存先 .npz。既定は outputs/generated/<ckpt名>_rates.npz")
     args = ap.parse_args()
+    if args.dump_rates is not None:
+        out = args.dump_out or (REPO_ROOT / "outputs" / "generated"
+                                / f"{args.dump_rates.stem}_rates.npz")
+        dump_rates(args.dump_rates, out, args.n, args.pool_seed)
+        return
     run(args.ckpt_dir, args.n, args.out_csv, pool_seed=args.pool_seed,
         stage1_ckpt=args.stage1_ckpt)
 
