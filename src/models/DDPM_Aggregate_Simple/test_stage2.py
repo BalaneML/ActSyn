@@ -1747,6 +1747,53 @@ def test_grad_norms() -> None:
     print("test_grad_norms: OK")
 
 
+def test_clock_param_group() -> None:
+    """(ck) 時計つきの Stage 1 では clock 群が 4 つ目の層別 LR 群として立つこと。
+
+    ★時計なしモデルは従来の 3 群のまま（test_layered_lr が固定）。時計つきでは
+      clock_proj だけが clock 群に入り、conv へ混ざらないこと、grad_norms が
+      agg_gnorm_clock を出すこと、群名を持たない optimizer を黙って読まないことを固定する。
+    """
+    torch.manual_seed(0)
+    model = _wake_up(sm.UNet1D(clock=True).to(DEVICE)).eval()
+    opt = ft.build_optimizer(model, lr_clock=3e-4)
+    names = [g["name"] for g in opt.param_groups]
+    assert names == ["cond", "emb", ft.CLOCK_GROUP_NAME, "conv"], names
+    lr_by_name = {g["name"]: g["lr"] for g in opt.param_groups}
+    assert lr_by_name[ft.CLOCK_GROUP_NAME] == 3e-4 and lr_by_name["cond"] == ft.LR_COND
+
+    groups = ft.split_param_groups(model)
+    pname = {id(p): n for n, p in model.named_parameters()}
+    assert all(".clock_proj." in pname[id(p)] for p in groups[ft.CLOCK_GROUP_NAME])
+    assert not any(".clock_proj." in pname[id(p)] for p in groups["conv"]), \
+        "clock_proj が conv 群へ混入している"
+    n_clock = sum(p.numel() for p in groups[ft.CLOCK_GROUP_NAME])
+    assert n_clock == 10_944, f"clock_proj のパラメータ数が想定と違う: {n_clock}"
+    # 時計以外の 3 群は時計なしモデルと同じ大きさ
+    base_groups = ft.split_param_groups(_model())
+    for k in ft.PARAM_GROUP_NAMES:
+        assert sum(p.numel() for p in groups[k]) == sum(p.numel() for p in base_groups[k]), k
+
+    # 零初期化の clock_proj にも勾配は届く（∂h/∂W = 上流勾配 × φ）
+    model(torch.randn(2, sm.IN_CH, sm.NUM_SLOTS), torch.zeros(2, dtype=torch.long),
+          _cond(2)).square().mean().backward()
+    got = ft.grad_norms(opt, "agg")
+    assert set(got) == {f"agg_gnorm_{k}" for k in ["cond", "emb", ft.CLOCK_GROUP_NAME, "conv"]}
+    assert got[f"agg_gnorm_{ft.CLOCK_GROUP_NAME}"] > 0, got
+
+    # 群名を持たない optimizer は黙って読まない
+    bare = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    try:
+        ft.grad_norms(bare, "agg")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("群名の無い optimizer を grad_norms が受け付けた")
+    print(f"  (1) (ck) clock 群 {n_clock:,} params・LR 3e-4・agg_gnorm_clock "
+          f"{got[f'agg_gnorm_{ft.CLOCK_GROUP_NAME}']:.3e}: OK")
+    print("test_clock_param_group: OK")
+
+
 def test_x0_diagnostics() -> None:
     """(x0) clamp の飽和と straight-through の鋭さが観測できること。
 
@@ -2002,6 +2049,7 @@ def main() -> None:
     test_two_pass_memory_scaling()
     test_resolve_chunk()
     test_grad_norms()
+    test_clock_param_group()
     test_x0_diagnostics()
     test_val_epsilon_mse()
     test_memorization_guardrail()

@@ -40,9 +40,13 @@ Stage 2 の学習ループ
         --holdout-groups d1,d2,...  LGO。損失から外す群（生成と評価は常に全28群）
         --resume         ckpt-dir の最新チェックポイントから再開。
                          torch / numpy 両方の RNG と λ を引き継ぐ
+        --lr-cond / --lr-emb / --lr-conv / --lr-clock  層別学習率（既定は LR_* 定数）。
+                         --lr-clock は時計つきの Stage 1（model.py --clock）のときだけ効く
 
 学習ログで最初に見る量:
     agg_gnorm_cond / _emb / _conv  集計側だけで θ に載った勾配の L2 ノルム（層別 LR の3群）
+    agg_gnorm_clock                時計つきの Stage 1 のときだけ。0 に張り付くなら
+                                   集計勾配は時計（スロットごとに違う値の経路）を使っていない
         ★L_agg・rate_mae・g_* は straight-through と clamp より上流の量なので、
           代理勾配が潰れて θ が全く動いていなくても正常値を出す
     total_gnorm_*                  リハーサル項を足した後のノルム。
@@ -113,6 +117,13 @@ DEFAULT_VAL_EVERY = 10
 LR_COND = 1e-4               # 群だけに効く純粋な条件パラメータ 4,680 (0.27%)
 LR_EMB  = 2e-5               # emb_proj 312,512 (17.8%)。時刻と条件の共有注入路
 LR_CONV = 1e-5               # conv/attention/GroupNorm 1,441,932 (82.0%)
+# 時計つきの Stage 1（model.py の --clock）のときだけ作る群。clock_proj 10,944 (0.62%)。
+# ★cond と同じ 1e-4 にする。時計は群によらず全員に共通の「何時に」を表す唯一の経路で、
+#   日本の昼食が 12:00 に揃う・7:00 に朝食をとるといった全群共通の時刻構造はここを通る。
+#   時計なしの λ=0.003 では周期 8h 以下の残差が 2% 台しか埋まらなかった（stage2_curves の
+#   band_closure_table）。cond と同じく小さく低次元の経路なので、速く動かしても
+#   拡散ステップ応答（emb）や畳み込み（conv）を壊しにくい
+LR_CLOCK = 1e-4
 MEMORY_BUDGET = 6600         # §4.5 K×chunk <= 約6,600（A100 40GB）
 
 # λ=auto を決めるのに使う更新数。
@@ -132,6 +143,9 @@ CKPT_DIR = REPO_ROOT / "outputs" / "checkpoints" / "stage2"
 #   群による違いも通すが、同時に拡散ステップ応答そのものでもある。
 COND_PATH_KEYS = ("cond_embeds", "cond_proj", "null_emb")
 EMB_PATH_KEYS = ("emb_proj",)
+# ★CLOCK_PATH_KEYS は時計つきモデルにだけある。時刻（1 日のうちの何時か）ごとに違う値を
+#   足す経路で、群によらない。無いモデルでは clock 群を作らない（従来の 3 群のまま）
+CLOCK_PATH_KEYS = ("clock_proj",)
 
 
 # ============================================================
@@ -166,31 +180,42 @@ def stratified_holdout(pop: np.ndarray, k: int, seed: int = 0) -> list[int]:
 # 学習
 # ============================================================
 PARAM_GROUP_NAMES = ("cond", "emb", "conv")
+CLOCK_GROUP_NAME = "clock"
 
 
 def split_param_groups(model: torch.nn.Module) -> dict[str, list[torch.nn.Parameter]]:
-    """パラメータを層別学習率の3群へ分ける, 群名は PARAM_GROUP_NAMES と同じ順
+    """パラメータを層別学習率の群へ分ける。時計なしは3群、時計つきは4群
 
     Note:
-        ★名前の断片で判定する。上から cond -> emb -> conv の順に当てるので、
-        COND_PATH_KEYS と EMB_PATH_KEYS が重なっていない必要がある。
-        ★build_optimizer と grad_norms の唯一の出所。片方だけ並びを変えると、
-        例外は出ずに「conv のノルムを cond として報告する」壊れ方をする。
+        ★名前の断片で判定する。上から cond -> emb -> clock -> conv の順に当てるので、
+        COND_PATH_KEYS / EMB_PATH_KEYS / CLOCK_PATH_KEYS が重なっていない必要がある。
+        ★戻り値の dict の並びが build_optimizer の param_groups の並びになる。
+        時計なしモデルでは cond / emb / conv（PARAM_GROUP_NAMES と同じ）、
+        時計つきモデルでは cond / emb / clock / conv。
+        ★clock 群だけは空でもよい（時計なしモデル）。空なら dict から除く。
 
     Args:
         model: UNet1D
 
     Returns:
-        {群名: パラメータの list}。キーは PARAM_GROUP_NAMES と同じ3つ
+        {群名: パラメータの list}
+
+    Raises:
+        ValueError: cond / emb / conv のいずれかが空になった場合
     """
-    groups: dict[str, list[torch.nn.Parameter]] = {k: [] for k in PARAM_GROUP_NAMES}
+    groups: dict[str, list[torch.nn.Parameter]] = {
+        "cond": [], "emb": [], CLOCK_GROUP_NAME: [], "conv": []}
     for name, p in model.named_parameters():
         if any(k in name for k in COND_PATH_KEYS):
             groups["cond"].append(p)
         elif any(k in name for k in EMB_PATH_KEYS):
             groups["emb"].append(p)
+        elif any(k in name for k in CLOCK_PATH_KEYS):
+            groups[CLOCK_GROUP_NAME].append(p)
         else:
             groups["conv"].append(p)
+    if not groups[CLOCK_GROUP_NAME]:
+        del groups[CLOCK_GROUP_NAME]
     empty = [k for k, v in groups.items() if not v]
     if empty:
         raise ValueError(f"層別 LR の分割に失敗した。空の群: {empty}")
@@ -199,33 +224,39 @@ def split_param_groups(model: torch.nn.Module) -> dict[str, list[torch.nn.Parame
 
 def build_optimizer(model: torch.nn.Module, lr_cond: float = LR_COND,
                     lr_emb: float = LR_EMB,
-                    lr_conv: float = LR_CONV) -> torch.optim.Optimizer:
-    """層別学習率つき AdamW, param_groups は PARAM_GROUP_NAMES の順に3群
+                    lr_conv: float = LR_CONV,
+                    lr_clock: float = LR_CLOCK) -> torch.optim.Optimizer:
+    """層別学習率つき AdamW, param_groups は split_param_groups の並びで、各群に "name" を持つ
 
     Note:
         UNet1D 1,759,124 params の内訳:
             cond     4,680 ( 0.27%) = cond_embeds 72 + cond_proj 4,352 + null_emb 256
             emb    312,512 (17.77%) = emb_proj ×11
             conv 1,441,932 (81.97%) = 畳み込み + attention + GroupNorm
+        時計つき（--clock）は clock 10,944 (0.62%) = clock_proj ×11 が加わる。
 
         ★cond だけが「群ごとに違う値」を持つ。日米差の 64.2%（二乗和）は
         dev 成分（群ごとの描き分け）なので、そこを動かせるのはこの 4,680 だけである。
         ★emb は時刻埋め込みと条件埋め込みの **和** を注入する共有経路なので、
         速く動かすと拡散ステップ応答そのものが変わる。cond と conv の中間に置く。
+        ★clock だけが「スロットごとに違う値」を持つ。全群共通の時刻構造を動かす経路。
+        ★param_groups[i]["name"] に群名を入れる。grad_norms はこの名前で群を読むので、
+          並びを組み替えても「conv のノルムを cond として報告する」壊れ方をしない。
 
     Args:
         model: Stage1 の重みを読んだUNet1D
         lr_cond: 群専用の条件パラメータの学習率, default=LR_COND=1e-4
         lr_emb: emb_proj（時刻・条件の共有注入路）の学習率, default=LR_EMB=2e-5
         lr_conv: conv/attention の学習率, default=LR_CONV=1e-5
+        lr_clock: clock_proj（時計）の学習率。時計なしモデルでは使わない, default=LR_CLOCK=1e-4
 
     Returns:
-        param group を PARAM_GROUP_NAMES の順に持つ AdamW, weight_decay=0.0
+        AdamW, weight_decay=0.0
     """
     groups = split_param_groups(model)
-    lrs = {"cond": lr_cond, "emb": lr_emb, "conv": lr_conv}
+    lrs = {"cond": lr_cond, "emb": lr_emb, CLOCK_GROUP_NAME: lr_clock, "conv": lr_conv}
     return torch.optim.AdamW(
-        [{"params": groups[k], "lr": lrs[k]} for k in PARAM_GROUP_NAMES],
+        [{"params": params, "lr": lrs[name], "name": name} for name, params in groups.items()],
         weight_decay=0.0)
 
 
@@ -499,22 +530,29 @@ def grad_norms(optimizer: torch.optim.Optimizer, prefix: str) -> dict[str, float
         L_agg も rate_mae も g_diagnostics も straight-through と clamp より上流なので、
         代理勾配が潰れて θ が全く動いていなくても全て正常値を出す。
         3〜13時間の予算を空回りで使い切る事故は、この値が 0 に張り付くことでしか見えない。
-        ★群の並びは build_optimizer が作った順（PARAM_GROUP_NAMES）に依存する。
-        param_groups を組み替えるなら split_param_groups と一緒に直すこと。
+        ★群名は build_optimizer が param_groups[i]["name"] に入れた値を読む（並び順に依存しない）。
+        ★時計つきモデルでは <prefix>_gnorm_clock が加わる。agg_gnorm_clock が 0 に張り付くなら、
+          集計勾配は時計の経路を使っていない。
 
     Args:
-        optimizer: build_optimizer が作った AdamW。param_groups は
-            PARAM_GROUP_NAMES = ("cond", "emb", "conv") の順の3群
+        optimizer: build_optimizer が作った AdamW。各 param_group が "name" キーを持つ
         prefix: 出力キーの接頭辞。集計側だけの勾配なら "agg"、両項を足した後なら "total"
 
     Returns:
         統計量の dict[str, float]
             <prefix>_gnorm_cond: 群専用の条件パラメータ（cond_embeds / cond_proj / null_emb）
             <prefix>_gnorm_emb: emb_proj（時刻・条件の共有注入路）
+            <prefix>_gnorm_clock: clock_proj（時計）。時計つきモデルのときだけ
             <prefix>_gnorm_conv: conv・attention・GroupNorm
+
+    Raises:
+        KeyError: param_group に "name" が無い場合（build_optimizer 以外で作った optimizer）
     """
     out: dict[str, float] = {}
-    for name, group in zip(PARAM_GROUP_NAMES, optimizer.param_groups):
+    for group in optimizer.param_groups:
+        if "name" not in group:
+            raise KeyError("param_group に 'name' が無い。build_optimizer で作った optimizer を渡すこと")
+        name = group["name"]
         sq = sum(float(p.grad.detach().pow(2).sum())
                  for p in group["params"] if p.grad is not None)
         out[f"{prefix}_gnorm_{name}"] = math.sqrt(sq)
@@ -537,8 +575,16 @@ def run(steps: int = DEFAULT_STEPS,
         resume: bool = False,
         seed: int = 42,
         use_wandb: bool = True,
-        device: str | None = None) -> torch.nn.Module:
-    """Stage 2 を固定ステップ回す, 返すのは最終ステップのモデル"""
+        device: str | None = None,
+        lr_cond: float = LR_COND,
+        lr_emb: float = LR_EMB,
+        lr_conv: float = LR_CONV,
+        lr_clock: float = LR_CLOCK) -> torch.nn.Module:
+    """Stage 2 を固定ステップ回す, 返すのは最終ステップのモデル
+
+    lr_cond / lr_emb / lr_conv / lr_clock は build_optimizer の層別学習率。
+    lr_clock は時計つきの Stage 1（model.py の --clock）のときだけ使う。
+    """
     dev = device or sm.DEVICE
     check_shapes(K, d_sub, n)
     chunk = resolve_chunk(K, d_sub, n, chunk)
@@ -560,7 +606,9 @@ def run(steps: int = DEFAULT_STEPS,
     # ---- モデル ----
     model = sm.load_pretrained(stage1_ckpt).to(dev)
     diffusion = sm.Diffusion(device=dev)
-    optimizer = build_optimizer(model)
+    optimizer = build_optimizer(model, lr_cond=lr_cond, lr_emb=lr_emb,
+                                lr_conv=lr_conv, lr_clock=lr_clock)
+    stage1_clock = bool(getattr(model, "clock", False))
 
     # ---- ATUS リハーサル用のイテレータ ----
     cond_idx, sched, weight, _ = sm.load_data()
@@ -602,7 +650,10 @@ def run(steps: int = DEFAULT_STEPS,
         "d_sub": d_sub, "n": n, "K": K, "eps": eps, "loss": loss_kind,
         "chunk": chunk, "holdout": holdout or [], "seed": seed,
         "stage1_ckpt": stage1_ckpt.name,
-        "lr_cond": LR_COND, "lr_emb": LR_EMB, "lr_conv": LR_CONV,
+        "lr_cond": lr_cond, "lr_emb": lr_emb, "lr_conv": lr_conv,
+        # ★時計なしの Stage 1 では lr_clock を使わないので NaN で残す（CSV 列を揃えるため）
+        "stage1_clock": stage1_clock,
+        "lr_clock": lr_clock if stage1_clock else float("nan"),
         "guidance_scale": sm.GUIDANCE_SCALE,
     }
 
@@ -617,7 +668,8 @@ def run(steps: int = DEFAULT_STEPS,
     print(f"[stage2] steps={steps} d_sub={d_sub} n={n} K={K} eps={eps} loss={loss_kind} "
             f"chunk={chunk} ({n_pass}パス) teacher_groups={len(teacher_groups)}/28 device={dev}")
     print(f"[stage2] stage1={stage1_ckpt.name} guidance={sm.GUIDANCE_SCALE} "
-            f"lr cond={LR_COND:g} emb={LR_EMB:g} conv={LR_CONV:g} "
+            f"lr cond={lr_cond:g} emb={lr_emb:g} conv={lr_conv:g} "
+            f"clock={f'{lr_clock:g}' if stage1_clock else '（時計なし）'} "
             f"val_every={val_every}")
 
     for step in range(start_step + 1, steps + 1):
@@ -694,11 +746,12 @@ def run(steps: int = DEFAULT_STEPS,
             wandb_run.log(log)
         if step % 10 == 0 or step == start_step + 1:
             val_txt = (f"  val={log['L_atus_val']:.6f}" if "L_atus_val" in log else "")
+            # 群の並びは param_groups と同じ（時計つきなら cond/emb/clock/conv）
+            gnorm_txt = "/".join(f"{log[f'agg_gnorm_{g['name']}']:.1e}"
+                                 for g in optimizer.param_groups)
             print(f"  step {step:4d}/{steps}  L_agg={log['L_agg']:+.6f}  "
                     f"L_atus={log['L_atus']:.6f}{val_txt}  rate_mae={log['rate_mae']:.5f}  "
-                    f"OTHER_X={log['other_x_share']:.4f}  |g_agg|="
-                    f"{log['agg_gnorm_cond']:.1e}/{log['agg_gnorm_emb']:.1e}/"
-                    f"{log['agg_gnorm_conv']:.1e}  "
+                    f"OTHER_X={log['other_x_share']:.4f}  |g_agg|={gnorm_txt}  "
                     f"floor={log['x0_floor_frac']:.3f}  {log['sec']:.1f}s")
 
         if step % save_every == 0 or step == steps:
@@ -742,7 +795,17 @@ def main() -> None:
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--smoke", action="store_true",
                     help="生成を短くして数更新だけ回す動作確認")
+    ap.add_argument("--lr-cond", type=float, default=LR_COND,
+                    help="群専用の条件パラメータ（cond_embeds / cond_proj / null_emb）の学習率")
+    ap.add_argument("--lr-emb", type=float, default=LR_EMB,
+                    help="emb_proj（拡散ステップと条件の共有注入路）の学習率")
+    ap.add_argument("--lr-conv", type=float, default=LR_CONV,
+                    help="conv / attention / GroupNorm の学習率")
+    ap.add_argument("--lr-clock", type=float, default=LR_CLOCK,
+                    help="clock_proj（時計）の学習率。時計つきの Stage 1 のときだけ使う")
     args = ap.parse_args()
+    lrs = {"lr_cond": args.lr_cond, "lr_emb": args.lr_emb,
+           "lr_conv": args.lr_conv, "lr_clock": args.lr_clock}
 
     holdout: list[int] = []
     if args.holdout_groups.startswith("auto:"):
@@ -770,7 +833,8 @@ def main() -> None:
             ckpt_dir=args.ckpt_dir / "smoke",
             stage1_ckpt=args.stage1_ckpt,
             seed=args.seed,
-            use_wandb=False)
+            use_wandb=False,
+            **lrs)
         print("stage2 smoke: OK")
         return
 
@@ -789,7 +853,8 @@ def main() -> None:
         stage1_ckpt=args.stage1_ckpt,
         resume=args.resume,
         seed=args.seed,
-        use_wandb=not args.no_wandb)
+        use_wandb=not args.no_wandb,
+        **lrs)
 
 
 if __name__ == "__main__":

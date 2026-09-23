@@ -42,6 +42,13 @@
 #   例: EPS=0.01 jobs/submit.sh -v EPS jobs/train_ddpm_simple_stage2.sh     # 主B（χ²）
 #       RESUME=1 jobs/submit.sh -v RESUME jobs/train_ddpm_simple_stage2.sh  # 途中から再開
 #
+#   時計つきの Stage 1（jobs/train_ddpm_simple_clock.sh の出力）から始める:
+#       STAGE1=outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_clock.pt LAM=0.003 \
+#           jobs/submit.sh -v STAGE1,LAM jobs/train_ddpm_simple_stage2.sh
+#     保存先は自動で stage2_lam0.003_clock になる（時計なしの stage2_lam0.003 を踏まない）。
+#     STAGE1 は ${REPO} 起点の相対パスでなく絶対パスで渡すと確実。
+#     層別学習率は LR_COND / LR_EMB / LR_CONV / LR_CLOCK で上書きできる（-v に並べる）
+#
 # ★LAM について（2026-09-17 の実測。Stage2_implementation.md §6.2）
 #   λ=auto が返す値を X とすると、実測で λ‖g_atus‖/‖g_agg‖ = 22〜51 倍、
 #   さらに cos(g_agg, g_atus) = −0.27 で **2 つの勾配は逆を向いている**。
@@ -75,13 +82,22 @@ RESUME="${RESUME:-0}"
 SAVE_EVERY="${SAVE_EVERY:-25}"
 VAL_EVERY="${VAL_EVERY:-10}"
 
-STAGE1="${REPO}/outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_20260819.pt"
+STAGE1_DEFAULT="${REPO}/outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_20260819.pt"
+STAGE1="${STAGE1:-${STAGE1_DEFAULT}}"
+# ★既定以外の Stage 1 から始めるときは、保存先に Stage 1 の識別子を付ける
+#   （..._weekday_clock.pt なら _clock）。付けないと時計つきの λ=0.003 が時計なしの
+#   stage2_lam0.003 に書き込み、下の「過去の世代を退避」で既存の結果を動かしてしまう
+STAGE1_TAG=""
+if [ "${STAGE1}" != "${STAGE1_DEFAULT}" ]; then
+    STAGE1_TAG="_$(basename "${STAGE1}" .pt | sed 's/^ddpm_simple_pretrain_common12_weekday_*//')"
+    [ "${STAGE1_TAG}" = "_" ] && STAGE1_TAG="_stage1custom"
+fi
 TEACHER="${REPO}/data/processed/stula/timeband_weekday.csv"
 DATA="${REPO}/data/processed/atus2024/atus2024_stula_common12_dataset.csv"
 # ★λ ごとに保存先を分ける。CKPT_DIR を明示すればそちらを使う。
 #   分けないと、複数の λ を同時に投入したときに同じディレクトリへ書き合い、
 #   下の「過去の世代を退避」も互いに踏み合って結果が混ざる。
-CKPT_DIR="${CKPT_DIR:-${REPO}/outputs/checkpoints/stage2_lam${LAM}}"
+CKPT_DIR="${CKPT_DIR:-${REPO}/outputs/checkpoints/stage2_lam${LAM}${STAGE1_TAG}}"
 LOG="${WORK}/logs/simple_stage2_${PBS_JOBID:-manual}.log"
 
 echo "steps=${STEPS} d_sub=${D_SUB} n=${N} K=${K} chunk=${CHUNK} eps=${EPS} loss=${LOSS} lam=${LAM}"
@@ -172,6 +188,11 @@ ARGS=(--steps "${STEPS}" --d-sub "${D_SUB}" --n "${N}" --K "${K}" --chunk "${CHU
       --save-every "${SAVE_EVERY}" --val-every "${VAL_EVERY}"
       --ckpt-dir "${CKPT_DIR}" --stage1-ckpt "${STAGE1}")
 [ -n "${HOLDOUT}" ] && ARGS+=(--holdout-groups "${HOLDOUT}")
+# 層別学習率は指定したときだけ渡す（未指定なら stage2_finetune.py の LR_* 定数）
+[ -n "${LR_COND:-}" ]  && ARGS+=(--lr-cond "${LR_COND}")
+[ -n "${LR_EMB:-}" ]   && ARGS+=(--lr-emb "${LR_EMB}")
+[ -n "${LR_CONV:-}" ]  && ARGS+=(--lr-conv "${LR_CONV}")
+[ -n "${LR_CLOCK:-}" ] && ARGS+=(--lr-clock "${LR_CLOCK}")
 [ "${RESUME}" = "1" ] && ARGS+=(--resume)
 
 SECONDS=0
