@@ -49,6 +49,11 @@ clock_diagnostics.py
     uv run python src/eval/test_clock_diagnostics.py    # 自己テスト
     uv run python src/eval/clock_diagnostics.py         # 本番診断 (DDPM_Aggregate)
     uv run python src/eval/clock_diagnostics.py --model-dir src/models/DDPM_Aggregate_Tang
+
+    # 同じフォルダの別の重みを比べる（時計アブレーション）。重みと生成 CSV は同じ組を渡す
+    uv run python src/eval/clock_diagnostics.py --model-dir src/models/DDPM_Aggregate_Simple \\
+        --ckpt outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_clock.pt \\
+        --gen outputs/generated/ddpm_simple_pretrain_samples_clock.csv --tag clock
 """
 from __future__ import annotations
 
@@ -446,22 +451,32 @@ def _load_generated(path: Path) -> tuple[IntArr, IntArr, str]:
 
 
 def run(n_probe: int = 512, n_shift: int = 256, seed: int = 0,
-        model_dir: Path = DEFAULT_MODEL_DIR) -> dict[str, pd.DataFrame]:
+        model_dir: Path = DEFAULT_MODEL_DIR, ckpt: Path | None = None,
+        gen_path: Path | None = None, tag: str = "") -> dict[str, pd.DataFrame]:
     """実 ATUS 平日 vs 学習済み AggDDPM で B1-B5 を回し、結果を表で返す。
 
     model_dir: 診断対象のモデルフォルダ。既定は DDPM_Aggregate。
         DDPM_Aggregate_Tang を渡せば同じ診断を Tang バックボーンに掛けられる
         （両者は load_pretrained / Diffusion / cond_grid / features / in_channels の
         同じ契約を満たす）。出力 CSV はフォルダ名で分ける。
+    ckpt: B4/B5 に使う重み。None ならモデルフォルダの既定（load_pretrained の既定引数）。
+        同じフォルダの別の重み（DDPM_Aggregate_Simple の _clock 版や日付つきの版）を比べるときに渡す
+    gen_path: B1-B3 に使う生成 CSV。None ならモデルフォルダの GEN_SAVE_PATH。
+        ★ckpt と gen_path は同じ重みの組を渡すこと。片方だけ差し替えると
+          B1-B3 と B4/B5 が別のモデルを測る（例外は出ない）
+    tag: 出力 CSV 名の末尾に付ける識別子。ckpt を差し替えるときに結果を分ける
     """
     import torch
 
     ddpm = load_module("clockdiag_ddpm", model_dir / "model.py")
-    out_csv = OUT_CSV.with_name(f"{OUT_CSV.stem}_{model_dir.name}{OUT_CSV.suffix}")
+    suffix = f"_{model_dir.name}" + (f"_{tag}" if tag else "")
+    out_csv = OUT_CSV.with_name(f"{OUT_CSV.stem}{suffix}{OUT_CSV.suffix}")
     print(f"診断対象: {model_dir.name}/model.py")
-    gen_path = ddpm.GEN_SAVE_PATH
+    gen_file = Path(gen_path if gen_path is not None else ddpm.GEN_SAVE_PATH)
+    print(f"  生成 CSV: {gen_file}")
+    print(f"  重み    : {ckpt if ckpt is not None else '（load_pretrained の既定）'}")
     cond_idx, sched_real, w_real, _ = ddpm.load_data()
-    gen, gen_d, sampler = _load_generated(gen_path)
+    gen, gen_d, sampler = _load_generated(gen_file)
 
     # 生成側は群一様に作られているので、実データの群構成に重みで合わせる
     d_real = ddpm.cond_to_d(cond_idx)
@@ -470,7 +485,7 @@ def run(n_probe: int = 512, n_shift: int = 256, seed: int = 0,
     n_act = ddpm.NUM_ACT
     act_names = ddpm.ACT_NAMES
     print(f"実 ATUS 平日 N={len(sched_real)} / 生成 N={len(gen)} (sampler={sampler}, "
-          f"{gen_path.name})")
+          f"{gen_file.name})")
 
     print("\n=== B1. 時刻別行動者率カーブ（ピーク鈍化）===")
     b1 = curve_comparison(sched_real, gen, n_act, act_names, w_real, w_gen, seed=seed)
@@ -490,7 +505,7 @@ def run(n_probe: int = 512, n_shift: int = 256, seed: int = 0,
           f"{b3d['verdict']}")
     b3 = pd.DataFrame([b3d])
 
-    model = ddpm.load_pretrained()
+    model = ddpm.load_pretrained(ckpt) if ckpt is not None else ddpm.load_pretrained()
     diffusion = ddpm.Diffusion()
     grid = torch.as_tensor(ddpm.cond_grid(), device=ddpm.DEVICE)
 
@@ -527,6 +542,17 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="生成モデルは時刻を知っているかの診断 (B1-B5)")
     ap.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR,
                     help="診断対象のモデルフォルダ (既定: src/models/DDPM_Aggregate)")
+    ap.add_argument("--ckpt", type=Path, default=None,
+                    help="B4/B5 に使う重み (既定: モデルフォルダの load_pretrained の既定)")
+    ap.add_argument("--gen", type=Path, default=None,
+                    help="B1-B3 に使う生成 CSV (既定: モデルフォルダの GEN_SAVE_PATH)。--ckpt と同じ重みの生成を渡す")
+    ap.add_argument("--tag", type=str, default="",
+                    help="出力 CSV 名の末尾に付ける識別子 (例: clock, 20260819)")
     args = ap.parse_args()
-    run(model_dir=args.model_dir if args.model_dir.is_absolute()
-        else (REPO_ROOT / args.model_dir))
+
+    def _abs(p: Path | None) -> Path | None:
+        return None if p is None else (p if p.is_absolute() else REPO_ROOT / p)
+
+    model_dir = _abs(args.model_dir)
+    assert model_dir is not None
+    run(model_dir=model_dir, ckpt=_abs(args.ckpt), gen_path=_abs(args.gen), tag=args.tag)

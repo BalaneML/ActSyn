@@ -14,6 +14,8 @@ model.py
         --epochs N   : 学習エポック数を上書き
         --no-wandb   : wandb ログを無効化
         --smoke      : 形状・整合の確認だけを短時間で回す
+        --kernel K   : 畳み込みの受容野（アブレーション。保存先に _k{K}）
+        --clock      : 全 ResBlock1D に 24 時間の時計を足す（アブレーション。保存先に _clock）
 
 出力:
     outputs/checkpoints/ddpm_simple_pretrain_common12_weekday.pt   Stage1 の重み
@@ -106,6 +108,13 @@ KERNEL_SIZE = 3
 # ★時刻埋め込みの次元。sinusoidal をこの次元で直接作り、MLP を通さずに足す。
 #   条件埋め込み (cond_proj) の出力次元と null_emb の次元もこれに揃う
 TIME_EMB_DIM = 256
+# ★24 時間の時計（--clock のときだけ使う）。スロット s の位相 2πs/96 のフーリエ特徴を
+#   調和次数 k=1..CLOCK_HARMONICS（周期 24h, 12h, 8h, 6h）で作り、各 ResBlock1D へ
+#   スロットごとに違う値のバイアスとして足す。条件は emb_proj で全スロット同じ値として
+#   足されるので、時計が無いと「何時に」を表す経路が無い（clock_diagnostics の B4）。
+#   周期 24h の関数なので左端 04:00 と右端の翌 04:00 がつながる（活動日は環）
+CLOCK_HARMONICS = 4
+CLOCK_DIM = 2 * CLOCK_HARMONICS
 
 # Classifier-Free Guidance
 P_UNCOND       = 0.1
@@ -270,6 +279,31 @@ def timestep_embedding(t: torch.Tensor, dim: int = TIME_EMB_DIM) -> torch.Tensor
     return torch.cat([torch.cos(args), torch.sin(args)], dim=1)  # (B, dim)
 
 
+def clock_features(num_slots: int = NUM_SLOTS,
+                   harmonics: int = CLOCK_HARMONICS) -> torch.Tensor:
+    """時刻スロットを 24 時間周期のフーリエ特徴 φ へ符号化する, -> (2*harmonics, num_slots)
+
+    φ[2(k−1), s] = cos(2πks / num_slots),  φ[2(k−1)+1, s] = sin(2πks / num_slots),  k = 1..harmonics
+
+    Note:
+        1. 拡散ステップの timestep_embedding とは別物。こちらは「1 日のうちの何時か」を表す
+        2. 学習パラメータを持たない固定の特徴。学習するのは ResBlock1D.clock_proj だけ
+        3. k=1 の cos/sin の組だけで 96 スロットすべてが別の点になる（円周上の 96 点）。
+           k=2..4 は 12h・8h・6h 周期で、昼食の 1 時間のような狭い山を線形に作りやすくする
+
+    Args:
+        num_slots: 1 日のスロット数, default=NUM_SLOTS=96
+        harmonics: 調和次数の上限 k, default=CLOCK_HARMONICS=4
+
+    Returns:
+        フーリエ特徴 φ, dtype=float32, (2*harmonics, num_slots)
+    """
+    s = torch.arange(num_slots, dtype=torch.float32)
+    k = torch.arange(1, harmonics + 1, dtype=torch.float32)
+    angle = 2.0 * math.pi * k[:, None] * s[None, :] / num_slots          # (H, S)
+    return torch.stack([torch.cos(angle), torch.sin(angle)], dim=1).reshape(2 * harmonics, num_slots)
+
+
 class ResBlock1D(nn.Module):
     """条件埋め込みを注入する1D残差ブロック (pre-activation ResNet)
 
@@ -277,14 +311,21 @@ class ResBlock1D(nn.Module):
         1. GroupNorm -> SiLU -> Conv1d の pre-activation 構成を2段重ね, 入力を残差加算する
         2. emb を emb_proj で c_out 次元へ落とし、チャネル毎バイアスとして時間軸一様に加算する
         3. 時間長Lは変えない (padding = KERNEL_SIZE // 2)
+        4. clock=True のときだけ、時計 φ を clock_proj で c_out 次元へ落とし、
+           スロットごとに違う値のバイアスとして 2. と同じ位置に加算する
     """
-    def __init__(self, c_in: int, c_out: int, emb_dim: int = TIME_EMB_DIM):
+    # clock=True のときだけ register_buffer で作る。型チェッカに Tensor と伝えるための宣言
+    clock_phi: torch.Tensor
+
+    def __init__(self, c_in: int, c_out: int, emb_dim: int = TIME_EMB_DIM,
+                 clock: bool = False):
         """残差ブロックの層を構築する。
 
         Args:
             c_in: 入力チャネル数, GroupNorm(8, c_in) のため8の倍数
             c_out: 出力チャネル数, 8の倍数, c_in と異なるとき skip は 1x1 conv になる
             emb_dim: 条件埋め込みの次元, default=TIME_EMB_DIM=256
+            clock: 24 時間の時計を足すか, default=False (従来の構造)
         """
         super().__init__()
         k, pad = KERNEL_SIZE, KERNEL_SIZE // 2
@@ -297,6 +338,42 @@ class ResBlock1D(nn.Module):
         self.conv2 = nn.Conv1d(c_out, c_out, k, padding=pad)
 
         self.skip = nn.Identity() if c_in == c_out else nn.Conv1d(c_in, c_out, 1)
+
+        # ★clock=False では nn.Linear を作らないので、乱数の消費も層の初期値も従来と同じ。
+        #   clock=True では nn.Linear の初期化が乱数を消費するため、後続ブロックの初期値は
+        #   時計なしのモデルと一致しない（新しく学習するモデルなので問題にしない）。
+        # ★零初期化。学習前の出力は時計なしの構造と一致する（test_backbone で検証）
+        self.clock_proj: nn.Linear | None = None
+        if clock:
+            self.register_buffer("clock_phi", clock_features(), persistent=False)
+            self.clock_proj = nn.Linear(CLOCK_DIM, c_out)
+            nn.init.zeros_(self.clock_proj.weight)
+            nn.init.zeros_(self.clock_proj.bias)
+
+    def clock_bias(self, length: int) -> torch.Tensor:
+        """時計のバイアスを解像度 length で返す, -> (1, c_out, length)
+
+        Note:
+            ★φ は 96 スロットで作ってあり、stride = 96 // length で間引く。
+              ds1/ds2（stride 2, padding = KERNEL_SIZE // 2）の出力位置 j は入力位置 2j を
+              中心に畳み込むので、48 解像度の j はスロット 2j、24 解像度の j はスロット 4j にあたる。
+
+        Args:
+            length: 特徴の時間長 L。NUM_SLOTS を割り切る値 (96 / 48 / 24)
+
+        Returns:
+            スロットごとのバイアス, dtype=float32, (1, c_out, length)
+
+        Raises:
+            RuntimeError: 時計を持たないブロックで呼んだとき
+            ValueError: length が NUM_SLOTS を割り切らないとき
+        """
+        if self.clock_proj is None:
+            raise RuntimeError("clock=False の ResBlock1D には時計が無い")
+        if NUM_SLOTS % length != 0:
+            raise ValueError(f"時間長 {length} が NUM_SLOTS={NUM_SLOTS} を割り切らない")
+        phi = self.clock_phi[:, ::NUM_SLOTS // length]          # (CLOCK_DIM, L)
+        return self.clock_proj(phi.T).T[None]                    # (1, c_out, L)
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
         """残差ブロック, (B, c_in, L) -> (B, c_out, L)
@@ -311,7 +388,9 @@ class ResBlock1D(nn.Module):
             出力特徴, dtype=float32, (B, c_out, L)。Lは入力と同じ
         """
         h = self.conv1(F.silu(self.norm1(x)))
-        h = h + self.emb_proj(emb)[:, :, None]
+        h = h + self.emb_proj(emb)[:, :, None]           # 全スロットで同じ値
+        if self.clock_proj is not None:
+            h = h + self.clock_bias(h.size(-1))          # スロットごとに違う値
         h = self.conv2(self.dropout(F.silu(self.norm2(h))))
         return h + self.skip(x)
 
@@ -346,9 +425,19 @@ class AttnBlock1D(nn.Module):
 
 class UNet1D(nn.Module):
     """ε予測ネットワーク: (B,12,96) + 拡散ステップt + 条件cond -> (B,12,96)"""
-    def __init__(self):
+    def __init__(self, clock: bool = False):
+        """UNet1D の層を構築する。
+
+        Args:
+            clock: 全 ResBlock1D (11 個) に 24 時間の時計を足すか, default=False (従来の構造)。
+                True でも零初期化なので、学習前の出力は False と一致する
+        """
         super().__init__()
+        self.clock = clock
         c1, c2 = BASE_CH, BASE_CH * 2
+
+        def res_block(c_in: int, c_out: int) -> ResBlock1D:
+            return ResBlock1D(c_in, c_out, clock=clock)
 
         # Condition Embedding
         self.cond_embeds = nn.ModuleList([
@@ -361,32 +450,32 @@ class UNet1D(nn.Module):
 
         # Down h1
         self.in_conv = nn.Conv1d(IN_CH, c1, k, padding=pad)
-        self.d1a, self.d1b = ResBlock1D(c1, c1), ResBlock1D(c1, c1)
+        self.d1a, self.d1b = res_block(c1, c1), res_block(c1, c1)
         self.ds1 = nn.Conv1d(c1, c1, k, stride=2, padding=pad)
 
         # Down h2
-        self.d2a, self.d2b = ResBlock1D(c1, c2), ResBlock1D(c2, c2)
+        self.d2a, self.d2b = res_block(c1, c2), res_block(c2, c2)
         self.attn2 = AttnBlock1D(c2)
         self.ds2 = nn.Conv1d(c2, c2, k, stride=2, padding=pad)
 
         # Down h3
-        self.d3a, self.d3b = ResBlock1D(c2, c2), ResBlock1D(c2, c2)
+        self.d3a, self.d3b = res_block(c2, c2), res_block(c2, c2)
         self.attn3 = AttnBlock1D(c2)
 
         # Bottleneck (middle)
-        self.m1, self.m_attn, self.m2 = ResBlock1D(c2, c2), AttnBlock1D(c2), ResBlock1D(c2, c2)
+        self.m1, self.m_attn, self.m2 = res_block(c2, c2), AttnBlock1D(c2), res_block(c2, c2)
 
         # Up with h3
-        self.u3 = ResBlock1D(c2 + c2, c2)
+        self.u3 = res_block(c2 + c2, c2)
 
         # Up with h2
         self.us2 = nn.Conv1d(c2, c2, k, padding=pad)
-        self.u2 = ResBlock1D(c2 + c2, c2)
+        self.u2 = res_block(c2 + c2, c2)
         self.u2_attn = AttnBlock1D(c2)
 
         # Up with h1
         self.us1 = nn.Conv1d(c2, c1, k, padding=pad)
-        self.u1 = ResBlock1D(c1 + c1, c1)
+        self.u1 = res_block(c1 + c1, c1)
 
         # 最終出力層
         self.out_norm = nn.GroupNorm(8, c1)
@@ -843,7 +932,8 @@ def run_epoch(model: UNet1D, diffusion: Diffusion,loader: DataLoader,
 
 def train(epochs: int = EPOCHS,
             use_wandb: bool = True,
-            save_path: Path | None = MODEL_SAVE_PATH) -> UNet1D:
+            save_path: Path | None = MODEL_SAVE_PATH,
+            clock: bool = False) -> UNet1D:
     """Stage1の学習を実行, val 損失が最良だった重みのモデルを返す
 
     ATUS実個票を教師に, 条件付きノイズ予測器 ε_θ(x_t, t, c)を学習
@@ -852,6 +942,7 @@ def train(epochs: int = EPOCHS,
         epochs: 学習エポック数の上限, default=EPOCHS=1000
         use_wandb: wandbへハイパラと学習曲線を記録するか, default=True
         save_path: チェックポイントの保存先, Noneなら保存しない
+        clock: UNet1D に 24 時間の時計を足すか, default=False
 
     Returns:
         best_stateを復元済みのUNet1D, 必ずしも最終エポックのおもみではない
@@ -877,6 +968,8 @@ def train(epochs: int = EPOCHS,
                 "early_stop_min_delta": EARLY_STOP_MIN_DELTA,
                 "day_filter": DAY_FILTER, "num_act": NUM_ACT, "d_groups": D_GROUPS,
                 "data": DATA_PATH.name,
+                "kernel_size": KERNEL_SIZE,
+                "clock": clock, "clock_harmonics": CLOCK_HARMONICS if clock else 0,
             }
         )
 
@@ -884,7 +977,7 @@ def train(epochs: int = EPOCHS,
     cond_idx, sched, weight, _ = load_data(DATA_PATH)
     train_loader, val_loader = make_loaders(cond_idx, sched, weight)
 
-    model = UNet1D().to(DEVICE)
+    model = UNet1D(clock=clock).to(DEVICE)
     diffusion = Diffusion()
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.0)
     print(f"device={DEVICE}  N={len(sched)}  params={sum(p.numel() for p in model.parameters()):,}")
@@ -925,7 +1018,9 @@ def train(epochs: int = EPOCHS,
 
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"model": model.state_dict()}, save_path)
+        # config は出所の記録。構造の判定には使わない（state_has_clock が重みのキーで決める）
+        torch.save({"model": model.state_dict(),
+                    "config": {"kernel_size": KERNEL_SIZE, "clock": clock}}, save_path)
         print(f"saved model to {save_path}")
     if run is not None:
         run.finish()
@@ -933,13 +1028,48 @@ def train(epochs: int = EPOCHS,
     return model
 
 
+def state_has_clock(state: dict[str, torch.Tensor]) -> bool:
+    """重みの state_dict が時計つきの UNet1D のものかを返す
+
+    Note:
+        ★構造の判定は重みのキーだけで行う。config を持たない古いチェックポイント
+          （20260819 版など）も、Stage 2 の世代も同じ規則で読めるようにするため。
+
+    Args:
+        state: UNet1D の state_dict
+
+    Returns:
+        clock_proj の重みを持てば True
+    """
+    return any(".clock_proj." in k for k in state)
+
+
+def build_unet_for_ckpt(path: Path) -> UNet1D:
+    """チェックポイントの重みに合う構造の UNet1D を組む（重みはまだ読まない）
+
+    stage2_checkpoint.load_ckpt のように「組んだモデルへ後から読む」呼び出し側のための入口。
+    Stage 1 の重みと Stage 2 の世代（stage2_step*.pt）のどちらも受け付ける。
+
+    Args:
+        path: キー "model" に state_dict を持つチェックポイント
+
+    Returns:
+        CPU 上の UNet1D。時計の有無は state_has_clock で決める
+    """
+    # ★weights_only=False。Stage 2 の世代は RNG 状態と config を含む。自分で書いたファイルだけを読む
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    return UNet1D(clock=state_has_clock(ckpt["model"]))
+
+
 def load_pretrained(path: Path = MODEL_SAVE_PATH) -> nn.Module:
     """保存済み Stage1 を読み込む。
 
-    ★EMA が無いので use_ema 引数も無い。チェックポイントのキーは "model" のみ
+    ★EMA が無いので use_ema 引数も無い。重みはキー "model"、出所の記録はキー "config"
+      （20260819 版など古いチェックポイントには config が無い）
+    ★時計の有無は重みのキーから決める（state_has_clock）
     """
     ckpt = torch.load(path, map_location=DEVICE)
-    model = UNet1D().to(DEVICE)
+    model = UNet1D(clock=state_has_clock(ckpt["model"])).to(DEVICE)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model
@@ -1281,26 +1411,34 @@ if __name__ == "__main__":
                     help="畳み込みの受容野。省略すると本編の設定 (3) で"
                          "既定の保存先に書く。明示するとアブレーション扱いになり、"
                          "保存先に _k{K} が付くので本編の成果物とは混ざらない")
+    ap.add_argument("--clock", action="store_true",
+                    help="全 ResBlock1D に 24 時間の時計（clock_proj）を足す。"
+                         "アブレーション扱いで、保存先に _clock が付く")
     args = ap.parse_args()
 
+    suffix = ""
     if args.kernel is not None:
         # ★モデル構築より前に差し替える。UNet1D/ResBlock1D は __init__ で
         #   モジュール変数 KERNEL_SIZE を読むため、ここで決めた値が全層に効く。
         KERNEL_SIZE = args.kernel
         # --kernel を明示した実行は、値が 3 でもアブレーションとして別名に隔離する。
         # スイープ一式を同じ規則で並べられるようにするため。
-        suffix = f"_k{args.kernel}"
+        suffix += f"_k{args.kernel}"
+    if args.clock:
+        suffix += "_clock"
+    if suffix:
         MODEL_SAVE_PATH = MODEL_SAVE_PATH.with_name(
             f"{MODEL_SAVE_PATH.stem}{suffix}{MODEL_SAVE_PATH.suffix}")
         GEN_SAVE_PATH = GEN_SAVE_PATH.with_name(
             f"{GEN_SAVE_PATH.stem}{suffix}{GEN_SAVE_PATH.suffix}")
     print(f"[config] kernel_size={KERNEL_SIZE}")
+    print(f"[config] clock={args.clock}")
     print(f"[config] ckpt={MODEL_SAVE_PATH.name}")
     print(f"[config] gen ={GEN_SAVE_PATH.name}")
 
     smoke_test()
     if args.smoke:
-        model = train(epochs=5, use_wandb=False, save_path=None)
+        model = train(epochs=5, use_wandb=False, save_path=None, clock=args.clock)
         # DDIM が無いので生成は 1000 ステップ固定。群あたり 2 本に絞って回す。
         # 暗記チェックは参照集合に対してプールが小さすぎるので飛ばす
         sanity_check(model, n_per_group=2, save_path=None, with_memorization=False)
@@ -1308,5 +1446,5 @@ if __name__ == "__main__":
         # ★保存先は明示的に渡す。train/sanity_check の既定引数は定義時に
         #   束縛済みで、上の再代入では差し替わらないため。
         model = train(epochs=args.epochs, use_wandb=not args.no_wandb,
-                      save_path=MODEL_SAVE_PATH)
+                      save_path=MODEL_SAVE_PATH, clock=args.clock)
         sanity_check(model, save_path=GEN_SAVE_PATH)

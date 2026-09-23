@@ -12,12 +12,14 @@ DDPM_Aggregate からずれていないか」を検証する:
                      かつ t を変えると出力が実際に変わる（時刻情報が届いている）
     4. 条件付け     : cond_idx を変えると出力が変わる。drop_mask=True の行は
                      cond_idx=None と厳密に一致する（CFG の無条件経路の同一性）
-    5. DDIM / EMA   : ★どちらも存在しない。チェックポイントのキーは "model" のみ
+    5. DDIM / EMA   : ★どちらも存在しない。チェックポイントのキーは "model" と "config" のみ
     6. 中間特徴     : features() が h1/h2/h3 を解像度 96/48/24 で返す
                      （clock_diagnostics が同じ表を出せる条件）
     7. 逆過程       : T を短くした ancestral が最後まで走り、正しい範囲のラベルを返す
     8. 原本との差分 : ★DDPM_Aggregate.UNet1D との違いが time_mlp だけであること。
                      自己完結（コピー）なので、意図しない差分が混入していないかを固定する
+    9. 時計 (--clock) : φ の直交性、零初期化の時点で時計なしと出力が一致すること、
+                     解像度 96/48/24 の位置の対応、保存して読み直したときの構造
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは出力が恒等的に 0 になり
@@ -167,9 +169,13 @@ def test_no_ddim_no_ema():
         for b in banned:
             assert b not in params, f"{fn.__name__} に {b} 引数が残っている"
 
-    # チェックポイントの契約: キーは "model" のみ
+    # チェックポイントの契約: 重みはキー "model"、出所の記録はキー "config"。EMA の重みは持たない
     src = inspect.getsource(sm.train)
-    assert '{"model": model.state_dict()}' in src, "保存するチェックポイントの形が変わっている"
+    assert '{"model": model.state_dict(),' in src, "保存するチェックポイントの形が変わっている"
+    # ★保存する dict のリテラルを丸ごと固定する（EMA の重みなど第3のキーが入ると落ちる）。
+    #   '"ema"' の有無では判定できない。wandb の config に "ema": False があるため
+    assert '"config": {"kernel_size": KERNEL_SIZE, "clock": clock}}' in src, \
+        "チェックポイントの config が変わっている"
     print("  5. DDIM / EMA を持たない: OK")
 
 
@@ -245,6 +251,74 @@ def test_diff_against_baseline():
           f"({n_a:,} -> {n_b:,}, -{n_mlp:,} params): OK")
 
 
+def test_clock():
+    """★--clock の契約（時計つき UNet1D）。
+
+    (a) φ は 8 行 × 96 スロットで、行どうしが直交する（離散フーリエの直交性 φφᵀ = 48·I）
+    (b) 追加されるパラメータは 11 個の clock_proj だけ
+    (c) 零初期化の時点では、時計なしのモデルと出力がビット単位で一致する
+    (d) clock_proj を動かすと出力が変わり、48 解像度のバイアスは 96 解像度を 2 つおきに
+        取ったものと一致する（ds1 の出力位置 j がスロット 2j にあたるという規約）
+    (e) 保存して load_pretrained で読むと、時計つきの構造で組み直される
+    """
+    import tempfile
+
+    # (a) φ の形と直交性
+    phi = sm.clock_features()
+    assert phi.shape == (sm.CLOCK_DIM, sm.NUM_SLOTS)
+    gram = phi @ phi.T
+    assert torch.allclose(gram, torch.eye(sm.CLOCK_DIM) * sm.NUM_SLOTS / 2, atol=1e-4), \
+        "φ の行が直交していない"
+
+    # (b) 増えるパラメータは clock_proj だけ
+    torch.manual_seed(0)
+    base = sm.UNet1D().to(DEVICE).eval()
+    torch.manual_seed(0)
+    clk = sm.UNet1D(clock=True).to(DEVICE).eval()
+    only_clk = set(clk.state_dict()) - set(base.state_dict())
+    assert only_clk and all(".clock_proj." in k for k in only_clk), sorted(only_clk)
+    assert set(base.state_dict()) - set(clk.state_dict()) == set()
+    n_blocks = sum(1 for m in clk.modules() if isinstance(m, sm.ResBlock1D))
+    assert n_blocks == 11 and len(only_clk) == 2 * n_blocks
+    assert not sm.state_has_clock(base.state_dict()) and sm.state_has_clock(clk.state_dict())
+    n_extra = sum(p.numel() for p in clk.parameters()) - sum(p.numel() for p in base.parameters())
+
+    # (c) 零初期化の時点で一致。時計なしの重みを時計つきへ流し込み、clock_proj は零のまま
+    missing, unexpected = clk.load_state_dict(base.state_dict(), strict=False)
+    assert not unexpected and set(missing) == only_clk
+    _wake_up(base)
+    _wake_up(clk)
+    x, t, c = _inputs()
+    with torch.no_grad():
+        y_base, y_clk = base(x, t, c), clk(x, t, c)
+    assert torch.equal(y_base, y_clk), "零初期化の時計つきが時計なしと一致しない"
+
+    # (d) clock_proj を動かすと出力が変わる。解像度間の位置の対応
+    g = torch.Generator().manual_seed(1)
+    with torch.no_grad():
+        for name, p in clk.named_parameters():
+            if ".clock_proj." in name:
+                p.copy_(torch.randn(p.shape, generator=g) * 0.1)
+        y_moved = clk(x, t, c)
+        b96, b48, b24 = clk.d1a.clock_bias(96), clk.d1a.clock_bias(48), clk.d1a.clock_bias(24)
+    assert not torch.equal(y_base, y_moved), "clock_proj を動かしても出力が変わらない"
+    assert b96.shape == (1, sm.BASE_CH, 96) and b48.shape == (1, sm.BASE_CH, 48)
+    assert torch.allclose(b48, b96[:, :, ::2]) and torch.allclose(b24, b96[:, :, ::4])
+
+    # (e) 保存 -> load_pretrained / build_unet_for_ckpt で時計つきの構造に戻る
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "clock.pt"
+        torch.save({"model": clk.state_dict(), "config": {"clock": True}}, path)
+        loaded = sm.load_pretrained(path).to(DEVICE)
+        assert loaded.clock and sm.build_unet_for_ckpt(path).clock
+        with torch.no_grad():
+            assert torch.equal(loaded(x, t, c), y_moved), "読み直した時計つきの出力が変わった"
+        torch.save({"model": base.state_dict()}, path)      # config の無い古い形式
+        assert not sm.load_pretrained(path).clock
+
+    print(f"  9. 時計 (φ 直交・零初期化で一致・解像度の対応・読み直し, +{n_extra:,} params): OK")
+
+
 if __name__ == "__main__":
     print("DDPM_Aggregate_Simple backbone tests")
     test_shapes()
@@ -255,4 +329,5 @@ if __name__ == "__main__":
     test_features()
     test_reverse_process()
     test_diff_against_baseline()
+    test_clock()
     print("test_backbone: OK")

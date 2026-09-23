@@ -398,7 +398,9 @@ def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndar
         ★torch.manual_seed を ck.load_ckpt の **後** に置くこと。load_ckpt は学習時の
         RNG を復元する副作用を持つので、先に seed を置くと上書きされてしまう。
     """
-    model = sm.UNet1D().to(device)
+    # ★構造（時計の有無）はチェックポイントの重みから決める。sm.UNet1D() 固定だと
+    #   時計つきの世代で load_state_dict が Unexpected key で落ちる
+    model = sm.build_unet_for_ckpt(path).to(device)
     step, config = ck.load_ckpt(path, model, map_location=device)
     holdout = list(config.get("holdout", []))
     teacher_mask = np.ones(sm.D_GROUPS, dtype=bool)
@@ -784,7 +786,7 @@ def dump_rates(ckpt: Path, out_npz: Path, n: int = DEFAULT_N,
     """
     dev = device or sm.DEVICE
     raw = torch.load(ckpt, map_location=dev, weights_only=False)
-    model = sm.UNet1D().to(dev)
+    model = sm.UNet1D(clock=sm.state_has_clock(raw["model"])).to(dev)
     model.load_state_dict(raw["model"])
     step = int(raw.get("step", 0))
     config: dict[str, Any] = dict(raw.get("config", {}))
