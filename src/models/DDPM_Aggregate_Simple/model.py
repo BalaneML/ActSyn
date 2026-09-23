@@ -16,6 +16,7 @@ model.py
         --smoke      : 形状・整合の確認だけを短時間で回す
         --kernel K   : 畳み込みの受容野（アブレーション。保存先に _k{K}）
         --clock      : 全 ResBlock1D に 24 時間の時計を足す（アブレーション。保存先に _clock）
+        --seed S     : 学習の乱数の種。分割は変えない（反復実験。保存先に _s{S}）
 
 出力:
     outputs/checkpoints/ddpm_simple_pretrain_common12_weekday.pt   Stage1 の重み
@@ -133,6 +134,9 @@ BATCH_SIZE  = 256
 EPOCHS      = 1000
 LR          = 2e-4  # 0.0002
 VAL_RATIO   = 0.1
+# ★2 つの用途がある。split_indices の学習/評価の分割（常にこの値で固定）と、
+#   学習の乱数（初期値・ミニバッチ・拡散の t と ε）の既定値。--seed が変えるのは後者だけで、
+#   分割は変えない。分割まで変えると Stage 2 の val や暗記チェックの参照集合が別物になる
 SEED        = 42
 USE_WEIGHTED_SAMPLER = True
 WEIGHT_COL  = "TUFINLWGT"
@@ -933,7 +937,8 @@ def run_epoch(model: UNet1D, diffusion: Diffusion,loader: DataLoader,
 def train(epochs: int = EPOCHS,
             use_wandb: bool = True,
             save_path: Path | None = MODEL_SAVE_PATH,
-            clock: bool = False) -> UNet1D:
+            clock: bool = False,
+            seed: int = SEED) -> UNet1D:
     """Stage1の学習を実行, val 損失が最良だった重みのモデルを返す
 
     ATUS実個票を教師に, 条件付きノイズ予測器 ε_θ(x_t, t, c)を学習
@@ -943,6 +948,8 @@ def train(epochs: int = EPOCHS,
         use_wandb: wandbへハイパラと学習曲線を記録するか, default=True
         save_path: チェックポイントの保存先, Noneなら保存しない
         clock: UNet1D に 24 時間の時計を足すか, default=False
+        seed: 学習の乱数の種（初期値・ミニバッチ・t・ε）, default=SEED=42。
+            学習/評価の分割は split_indices が SEED で固定するので、この値では変わらない
 
     Returns:
         best_stateを復元済みのUNet1D, 必ずしも最終エポックのおもみではない
@@ -970,10 +977,11 @@ def train(epochs: int = EPOCHS,
                 "data": DATA_PATH.name,
                 "kernel_size": KERNEL_SIZE,
                 "clock": clock, "clock_harmonics": CLOCK_HARMONICS if clock else 0,
+                "seed": seed,
             }
         )
 
-    torch.manual_seed(SEED)
+    torch.manual_seed(seed)
     cond_idx, sched, weight, _ = load_data(DATA_PATH)
     train_loader, val_loader = make_loaders(cond_idx, sched, weight)
 
@@ -1020,7 +1028,7 @@ def train(epochs: int = EPOCHS,
         save_path.parent.mkdir(parents=True, exist_ok=True)
         # config は出所の記録。構造の判定には使わない（state_has_clock が重みのキーで決める）
         torch.save({"model": model.state_dict(),
-                    "config": {"kernel_size": KERNEL_SIZE, "clock": clock}}, save_path)
+                    "config": {"kernel_size": KERNEL_SIZE, "clock": clock, "seed": seed}}, save_path)
         print(f"saved model to {save_path}")
     if run is not None:
         run.finish()
@@ -1414,7 +1422,11 @@ if __name__ == "__main__":
     ap.add_argument("--clock", action="store_true",
                     help="全 ResBlock1D に 24 時間の時計（clock_proj）を足す。"
                          "アブレーション扱いで、保存先に _clock が付く")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="学習の乱数の種（既定 SEED=42）。学習/評価の分割は変えない。"
+                         "明示すると反復実験扱いで、保存先に _s{seed} が付く")
     args = ap.parse_args()
+    seed = SEED if args.seed is None else args.seed
 
     suffix = ""
     if args.kernel is not None:
@@ -1426,6 +1438,8 @@ if __name__ == "__main__":
         suffix += f"_k{args.kernel}"
     if args.clock:
         suffix += "_clock"
+    if args.seed is not None:
+        suffix += f"_s{args.seed}"
     if suffix:
         MODEL_SAVE_PATH = MODEL_SAVE_PATH.with_name(
             f"{MODEL_SAVE_PATH.stem}{suffix}{MODEL_SAVE_PATH.suffix}")
@@ -1433,12 +1447,13 @@ if __name__ == "__main__":
             f"{GEN_SAVE_PATH.stem}{suffix}{GEN_SAVE_PATH.suffix}")
     print(f"[config] kernel_size={KERNEL_SIZE}")
     print(f"[config] clock={args.clock}")
+    print(f"[config] seed={seed}")
     print(f"[config] ckpt={MODEL_SAVE_PATH.name}")
     print(f"[config] gen ={GEN_SAVE_PATH.name}")
 
     smoke_test()
     if args.smoke:
-        model = train(epochs=5, use_wandb=False, save_path=None, clock=args.clock)
+        model = train(epochs=5, use_wandb=False, save_path=None, clock=args.clock, seed=seed)
         # DDIM が無いので生成は 1000 ステップ固定。群あたり 2 本に絞って回す。
         # 暗記チェックは参照集合に対してプールが小さすぎるので飛ばす
         sanity_check(model, n_per_group=2, save_path=None, with_memorization=False)
@@ -1446,5 +1461,5 @@ if __name__ == "__main__":
         # ★保存先は明示的に渡す。train/sanity_check の既定引数は定義時に
         #   束縛済みで、上の再代入では差し替わらないため。
         model = train(epochs=args.epochs, use_wandb=not args.no_wandb,
-                      save_path=MODEL_SAVE_PATH, clock=args.clock)
+                      save_path=MODEL_SAVE_PATH, clock=args.clock, seed=seed)
         sanity_check(model, save_path=GEN_SAVE_PATH)

@@ -20,6 +20,7 @@ DDPM_Aggregate からずれていないか」を検証する:
                      自己完結（コピー）なので、意図しない差分が混入していないかを固定する
     9. 時計 (--clock) : φ の直交性、零初期化の時点で時計なしと出力が一致すること、
                      解像度 96/48/24 の位置の対応、保存して読み直したときの構造
+   10. 反復 (--seed) : 学習の乱数だけを変え、学習/評価の分割は SEED で固定のまま
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは出力が恒等的に 0 になり
@@ -174,7 +175,7 @@ def test_no_ddim_no_ema():
     assert '{"model": model.state_dict(),' in src, "保存するチェックポイントの形が変わっている"
     # ★保存する dict のリテラルを丸ごと固定する（EMA の重みなど第3のキーが入ると落ちる）。
     #   '"ema"' の有無では判定できない。wandb の config に "ema": False があるため
-    assert '"config": {"kernel_size": KERNEL_SIZE, "clock": clock}}' in src, \
+    assert '"config": {"kernel_size": KERNEL_SIZE, "clock": clock, "seed": seed}}' in src, \
         "チェックポイントの config が変わっている"
     print("  5. DDIM / EMA を持たない: OK")
 
@@ -319,6 +320,23 @@ def test_clock():
     print(f"  9. 時計 (φ 直交・零初期化で一致・解像度の対応・読み直し, +{n_extra:,} params): OK")
 
 
+def test_seed_keeps_split():
+    """--seed は学習の乱数だけを変え、学習/評価の分割（split_indices）は変えないこと。
+
+    ★分割が変わると Stage 2 の val_epsilon_mse と暗記チェックの参照集合が別物になり、
+      反復実験の差が「種の差」でなく「データの差」を含んでしまう。
+    """
+    import inspect
+    before = sm.split_indices(1000)
+    torch.manual_seed(12345)                       # 学習側の乱数をどう動かしても
+    after = sm.split_indices(1000)
+    assert all((x == y).all() for x, y in zip(before, after)), "split_indices が大域の乱数に依存している"
+    src = inspect.getsource(sm.train)
+    assert "torch.manual_seed(seed)" in src and "torch.manual_seed(SEED)" not in src
+    assert "manual_seed(SEED)" in inspect.getsource(sm.split_indices)
+    print("  10. --seed は学習の乱数だけを変え、分割は SEED で固定: OK")
+
+
 if __name__ == "__main__":
     print("DDPM_Aggregate_Simple backbone tests")
     test_shapes()
@@ -330,4 +348,5 @@ if __name__ == "__main__":
     test_reverse_process()
     test_diff_against_baseline()
     test_clock()
+    test_seed_keeps_split()
     print("test_backbone: OK")

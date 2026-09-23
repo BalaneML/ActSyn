@@ -28,6 +28,13 @@
 # 投入手順:
 #   jobs/submit.sh jobs/train_ddpm_simple_clock.sh
 #
+# 学習の種による反復（時計の効果を種のばらつきから切り分ける）:
+#   CLOCK=1 SEED=43 jobs/submit.sh -v CLOCK,SEED jobs/train_ddpm_simple_clock.sh   # 時計つき・種43
+#   CLOCK=0 SEED=43 jobs/submit.sh -v CLOCK,SEED jobs/train_ddpm_simple_clock.sh   # 時計なし・種43
+#   SEED は学習の乱数だけを変え、学習/評価の分割は変えない（model.py の --seed）。
+#   保存先は model.py と同じ規則で _clock / _s{SEED} が付く。SEED 未指定は種42（本編と同じ）。
+#   ★CLOCK=0 かつ SEED 未指定は本編の再学習になり保存先が本編と重なるので、このジョブでは弾く
+#
 # 学習後（手元へ持ち帰ってから。B4/B5 は forward だけなので手元の MPS で数分）:
 #   scp squid:…/outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_clock.pt outputs/checkpoints/
 #   scp squid:…/outputs/generated/ddpm_simple_pretrain_samples_clock.csv outputs/generated/
@@ -46,12 +53,29 @@ cd "${PBS_O_WORKDIR}"
 source jobs/_common.sh
 
 EPOCHS="${EPOCHS:-1000}"
+CLOCK="${CLOCK:-1}"
+SEED="${SEED:-}"
 
-CKPT="${REPO}/outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_clock.pt"
+case "${CLOCK}" in
+    0|1) ;;
+    *) echo "ERROR: CLOCK は 0 か 1（指定値: ${CLOCK}）" >&2; exit 1 ;;
+esac
+if [ "${CLOCK}" = "0" ] && [ -z "${SEED}" ]; then
+    echo "ERROR: CLOCK=0 で SEED 未指定は本編の再学習になる（保存先が本編と重なる）。SEED を指定すること" >&2
+    exit 1
+fi
+
+# model.py の保存先の規則（_clock -> _s{SEED} の順）と同じ名前を組む
+SUFFIX=""
+ARGS=(--epochs "${EPOCHS}")
+if [ "${CLOCK}" = "1" ]; then SUFFIX="${SUFFIX}_clock"; ARGS+=(--clock); fi
+if [ -n "${SEED}" ]; then SUFFIX="${SUFFIX}_s${SEED}"; ARGS+=(--seed "${SEED}"); fi
+
+CKPT="${REPO}/outputs/checkpoints/ddpm_simple_pretrain_common12_weekday${SUFFIX}.pt"
 DATA="${REPO}/data/processed/atus2024/atus2024_stula_common12_dataset.csv"
-LOG="${WORK}/logs/simple_clock_${PBS_JOBID:-manual}.log"
+LOG="${WORK}/logs/simple${SUFFIX}_${PBS_JOBID:-manual}.log"
 
-echo "clock: on"
+echo "clock: ${CLOCK}  seed: ${SEED:-42(既定)}"
 echo "epochs: ${EPOCHS}"
 echo "log:   ${LOG}"
 echo "ckpt:  ${CKPT}"
@@ -82,14 +106,13 @@ fi
     echo "=== job ${PBS_JOBID:-manual}  $(date '+%Y-%m-%d %H:%M:%S') ==="
     echo "commit: $(git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "dirty : $(git status --porcelain 2>/dev/null | wc -l) file(s)"
-    echo "clock=on  epochs=${EPOCHS}"
+    echo "clock=${CLOCK}  seed=${SEED:-42}  epochs=${EPOCHS}"
     nvidia-smi
     echo "==="
 } > "${LOG}" 2>&1
 
 SECONDS=0
-run_gpu python src/models/DDPM_Aggregate_Simple/model.py \
-    --epochs "${EPOCHS}" --clock >> "${LOG}" 2>&1
+run_gpu python src/models/DDPM_Aggregate_Simple/model.py "${ARGS[@]}" >> "${LOG}" 2>&1
 status=$?
 
 echo "elapsed: $((SECONDS / 3600))h $(((SECONDS % 3600) / 60))m"
