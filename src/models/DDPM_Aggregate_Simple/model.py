@@ -17,6 +17,8 @@ model.py
         --kernel K   : 畳み込みの受容野（アブレーション。保存先に _k{K}）
         --clock      : 全 ResBlock1D に 24 時間の時計を足す（アブレーション。保存先に _clock）
         --seed S     : 学習の乱数の種。分割は変えない（反復実験。保存先に _s{S}）
+        --rate-lam L : 行動者率の偏りの項 L_rate の重み（既定 0 = 従来の損失。保存先に _rate{L}）
+        --rate-gamma G : L_rate の重み v(t) の頭打ち（既定 1.0。既定以外は保存先に g{G}）
 
 出力:
     outputs/checkpoints/ddpm_simple_pretrain_common12_weekday.pt   Stage1 の重み
@@ -144,6 +146,15 @@ EARLY_STOP_PATIENCE  = 200
 EARLY_STOP_MIN_DELTA = 1e-4
 GEN_BATCH   = 1024
 
+# ★行動者率の偏りの項 L_rate（Diffusion.rate_loss）。既定 0 で従来の損失と完全一致する。
+#   L_rate = mean_{c,s} m[c,s]²,  m[c,s] = mean_b v(t_b)·(eps_hat_b − eps_b)[c,s]
+#   v(t) = 1/√max(SNR(t), RATE_SNR_GAMMA)。SNR(t) >= RATE_SNR_GAMMA の t では
+#   v·(eps_hat − eps) = −(x̂0 − x0) で x0 空間（行動者率の単位）の残差になり、
+#   それより大きい t では x̂0 への換算係数 1/√SNR（t=999 で 157）を 1/√RATE_SNR_GAMMA で頭打ちにする。
+#   RATE_SNR_GAMMA=1 なら t<=258 を x0 空間の重み 1 で見て、t=500 で 0.29、t=999 で 0.006 に下がる
+RATE_LAM       = 0.0
+RATE_SNR_GAMMA = 1.0
+
 DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
 
 
@@ -232,7 +243,20 @@ def split_indices(n: int) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]
     return perm[n_val:], perm[:n_val]
 
 
-def make_loaders(cond_idx, sched, weight):
+def make_loaders(cond_idx, sched, weight, drop_last: bool = False):
+    """学習用と評価用の DataLoader を作る
+
+    Args:
+        cond_idx: 条件インデックス, dtype=int64, (N, 3)
+        sched: 活動スケジュール (インデックス表現), dtype=int64, (N, 96)
+        weight: 調査ウェイト TUFINLWGT, dtype=float64, (N,)
+        drop_last: 学習用の最後の端数バッチ (3363 = 13×256 + 35 の 35 本) を捨てるか,
+            default=False (従来どおり)。L_rate はバッチ平均の偏りを測るので,
+            35 本のバッチでは雑音が √(256/35) ≈ 2.7 倍になる。rate_lam > 0 のときだけ True にする
+
+    Returns:
+        (train_loader, val_loader)。train は TUFINLWGT 加重の復元抽出, val は非加重・順序固定
+    """
     train_idx, val_idx = split_indices(len(sched))
 
     train_ds = ScheduleDataset(cond_idx[train_idx], sched[train_idx])
@@ -241,9 +265,11 @@ def make_loaders(cond_idx, sched, weight):
     if USE_WEIGHTED_SAMPLER:
         w = torch.as_tensor(weight[train_idx], dtype=torch.double)
         sampler = WeightedRandomSampler(w, num_samples=len(w), replacement=True)  # type: ignore
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler)
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler,
+                                  drop_last=drop_last)
     else:
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                                  drop_last=drop_last)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
     return train_loader, val_loader
 
@@ -633,7 +659,7 @@ def eval_mode(model: nn.Module) -> Iterator[nn.Module]:
 
 class Diffusion:
     """Stage1とStage2を実装"""
-    def __init__(self, device=DEVICE):
+    def __init__(self, device=DEVICE, rate_gamma: float = RATE_SNR_GAMMA):
         """β schedule と, そこから導かれるバッファを事前計算する
 
         Note:
@@ -650,10 +676,18 @@ class Diffusion:
             8. post_coef_xt: 事後平均の x_t 側の係数 (1-ᾱ_{t-1})·√α_t/(1-ᾱ_t)
 
             6〜8 は事後分布 q(x_{t-1}|x_t, x0) の閉形式で, _reverse_step だけが使う
+            9. rate_v: L_rate の重み v(t) = 1/√max(SNR(t), rate_gamma), SNR(t) = ᾱ_t/(1-ᾱ_t)
+               rate_loss だけが使う。乱数を消費しないので, 追加しても他の出力は変わらない
 
         Args:
             device: バッファを置くデバイス, default=DEVICE
+            rate_gamma: v(t) の頭打ち, 正の値, default=RATE_SNR_GAMMA=1.0
+                小さくするほど高ノイズ側の t まで x0 空間の重み 1 で見る
+                (1.0 なら t<=258, 0.1 なら t<=484, 0.01 なら t<=673)。
+                代償に勾配が最大 1/√rate_gamma 倍になる
         """
+        if rate_gamma <= 0.0:
+            raise ValueError(f"rate_gamma は正でなければならない: {rate_gamma}")
         betas = torch.linspace(BETA_START, BETA_END, T_STEPS, device=device)
         alphas = 1.0 - betas
         acp = torch.cumprod(alphas, dim=0)
@@ -667,6 +701,8 @@ class Diffusion:
         self.post_var = betas * (1.0 - acp_prev) / (1.0 - acp)
         self.post_coef_x0 = betas * acp_prev.sqrt() / (1.0 - acp)
         self.post_coef_xt = (1.0 - acp_prev) * alphas.sqrt() / (1.0 - acp)
+        self.rate_gamma = rate_gamma
+        self.rate_v = (acp / (1.0 - acp)).clamp_min(rate_gamma).rsqrt()
 
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
         """x0 から任意のtステップ先の x_t を求める (前向き拡散過程)
@@ -685,10 +721,15 @@ class Diffusion:
         return (self.sqrt_acp[t][:, None, None] * x0
                 + self.sqrt_1m_acp[t][:, None, None] * eps)
 
-    def loss(self, model: UNet1D, sched: torch.Tensor, cond_idx: torch.Tensor) -> torch.Tensor:
-        """Stage1学習の目的関数, 標準的な ε予測MSEに CFGを組み込んだもの
+    def _eps_pair(self, model: UNet1D, sched: torch.Tensor,
+                  cond_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """1バッチに t と ε を引いてノイズを予測する, loss と loss_terms の共通部分
 
         Note:
+            1. 乱数は t -> ε -> drop_mask の順で引く。この順序を変えると,
+               同じ種でも従来の Stage1 と Stage2 のリハーサル項が別の値になる
+            2. drop_mask が True の行 (P_UNCOND=0.1) は条件なしの予測になる。
+               CFG は条件なしの予測も使うので, L_rate もこの行を含めて測る
 
         Args:
             model: UNet1D
@@ -696,7 +737,10 @@ class Diffusion:
             cond_idx: 条件インデックス, dtype=int64, (B, 3)
 
         Returns:
-            バッチ損失, dtype=float32, (スカラ)
+            (eps_hat, eps, t)
+                eps_hat: 予測ノイズ, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)
+                eps: 真のノイズ, dtype=float32, (B, 12, 96)
+                t: 拡散ステップ, dtype=int64, (B,)
         """
         x0 = sched_to_x0(sched)  # (B,96)->(B,12,96)∈{0,1}
         t = torch.randint(0, T_STEPS, (x0.size(0),), device=x0.device)  # t~U{0,T-1}
@@ -706,7 +750,85 @@ class Diffusion:
         drop_mask = torch.rand(x0.size(0), device=x0.device) < P_UNCOND  # CFGの条件dropout
 
         eps_hat = model(x_t, t, cond_idx, drop_mask)
+        return eps_hat, eps, t
+
+    def loss(self, model: UNet1D, sched: torch.Tensor, cond_idx: torch.Tensor) -> torch.Tensor:
+        """Stage1学習の目的関数, 標準的な ε予測MSEに CFGを組み込んだもの
+
+        Note:
+            1. Stage2 のリハーサル項と val の ε-MSE もこの関数を呼ぶ。
+               L_rate は足さない (足すと Stage2 の挙動が変わる)。L_rate は loss_terms で得る
+
+        Args:
+            model: UNet1D
+            sched: 活動スケジュール (インデックス表現), dtype=int64, (B, 96)
+            cond_idx: 条件インデックス, dtype=int64, (B, 3)
+
+        Returns:
+            バッチ損失, dtype=float32, (スカラ)
+        """
+        eps_hat, eps, _ = self._eps_pair(model, sched, cond_idx)
         return F.mse_loss(eps_hat, eps)  # ノイズ間のMSE
+
+    def rate_loss(self, eps_hat: torch.Tensor, eps: torch.Tensor,
+                  t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """時刻別行動者率の偏り L_rate を返す
+
+        L_rate = mean_{c,s} m[c,s]²,  m[c,s] = mean_b u_b[c,s],  u_b = v(t_b)·(eps_hat_b − eps_b)
+        v(t) = rate_v[t] = 1/√max(SNR(t), rate_gamma)
+
+        Note:
+            1. SNR(t) >= rate_gamma の t では u = −(x̂0 − x0) で, x0 空間の残差になる。
+               それより大きい t では x̂0 への換算係数 1/√SNR（t=999 で 157）を頭打ちにする
+            2. 個票ごとの残差はバッチ平均で打ち消され, 全員に共通する偏り
+               (= 時刻別行動者率のずれ) だけが m に残る。学習バッチは TUFINLWGT 加重の
+               復元抽出なので, 単純平均で母集団の行動者率になる
+            3. E[L_rate] = bias² + Var(u)/B。第2項はバッチサイズ由来の床で,
+               その勾配は予測誤差のばらつきを減らす向き (ε-MSE と同じ向き) なので最適解はずれない
+            4. 2つ目の返り値 rate_split は記録専用で, バッチを前半と後半に割った
+               mean(m_A · m_B)。第2項が消えて bias² を直接読める (負にもなりうる)
+            5. t をまたいで符号が逆の偏りは, m の中で打ち消し合って見えない
+
+        Args:
+            eps_hat: 予測ノイズ, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)
+            eps: 真のノイズ, dtype=float32, (B, 12, 96)
+            t: 拡散ステップ, dtype=int64, (B,)
+
+        Returns:
+            (rate, rate_split)
+                rate: L_rate, dtype=float32, スカラー, 勾配グラフを保つ
+                rate_split: split-batch 推定の bias², dtype=float32, スカラー, 勾配なし
+        """
+        u = self.rate_v[t][:, None, None] * (eps_hat - eps)       # (B, 12, 96)
+        rate = u.mean(dim=0).pow(2).mean()
+        with torch.no_grad():
+            half = u.size(0) // 2
+            m_a = u[:half].mean(dim=0)
+            m_b = u[half:2 * half].mean(dim=0)
+            rate_split = (m_a * m_b).mean()
+        return rate, rate_split
+
+    def loss_terms(self, model: UNet1D, sched: torch.Tensor,
+                   cond_idx: torch.Tensor) -> dict[str, torch.Tensor]:
+        """1回の forward から ε-MSE と行動者率の項を返す (Stage1 の学習ループ専用)
+
+        Note:
+            1. loss() と同じ _eps_pair を使うので, 同じ乱数状態なら
+               loss_terms(...)["eps"] は loss(...) と厳密に一致する
+            2. Stage2 は loss() だけを呼ぶので, この関数の影響を受けない
+
+        Args:
+            model: UNet1D
+            sched: 活動スケジュール (インデックス表現), dtype=int64, (B, 96)
+            cond_idx: 条件インデックス, dtype=int64, (B, 3)
+
+        Returns:
+            {"eps": ε-MSE, "rate": L_rate, "rate_split": split-batch 推定の bias²}
+            それぞれ dtype=float32 のスカラー。rate_split だけ勾配を持たない
+        """
+        eps_hat, eps, t = self._eps_pair(model, sched, cond_idx)
+        rate, rate_split = self.rate_loss(eps_hat, eps, t)
+        return {"eps": F.mse_loss(eps_hat, eps), "rate": rate, "rate_split": rate_split}
 
     def _eps(self, model: UNet1D, x: torch.Tensor,
             t_scalar: int, cond_idx: torch.Tensor | None, guidance_scale: float) -> torch.Tensor:
@@ -897,11 +1019,17 @@ def straight_through(x0: torch.Tensor, tau: float=1.0) -> torch.Tensor:
 # ============================================================
 # 6. 学習
 # ============================================================
-def run_epoch(model: UNet1D, diffusion: Diffusion,loader: DataLoader,
-            optimizer: torch.optim.Optimizer | None=None) -> float:
-    """1エポック分の学習または評価を実行し, サンプル加重平均の ε-MSE を返す
+def run_epoch(model: UNet1D, diffusion: Diffusion, loader: DataLoader,
+            optimizer: torch.optim.Optimizer | None = None,
+            rate_lam: float = RATE_LAM) -> dict[str, float]:
+    """1エポック分の学習または評価を実行し, 損失の各項のサンプル加重平均を返す
 
     optimizerを渡せば学習, 渡さなければ評価として動く
+
+    Note:
+        1. 更新に使う損失は total = eps + rate_lam·rate。rate_lam=0 では total = eps で,
+           勾配も乱数の消費も従来の Stage1 と一致する (rate は計算するが逆伝播に入れない)
+        2. val_loader は非加重なので, 評価時の rate / rate_split は監視用。早期終了には使わない
 
     Args:
         model: ノイズ予測器ε_θ
@@ -911,37 +1039,54 @@ def run_epoch(model: UNet1D, diffusion: Diffusion,loader: DataLoader,
             cond_idx: 条件インデックス, dtype=int64, (B, 3)
             sched: 活動スケジュール (インデックス表現), dtype=int64, (B, 96)
         optimizer: 学習時の最適化器, Noneなら評価モード, default=None
+        rate_lam: L_rate の重み λ_rate, default=RATE_LAM=0.0
 
     Returns:
-        エポック平均の ε-MSE, float
+        エポック平均, dict[str, float]
+            eps: ε-MSE
+            rate: L_rate
+            rate_split: split-batch 推定の bias²（記録専用）
+            total: eps + rate_lam·rate
     """
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
-    sum_loss, n_samples = 0.0, 0
+    sums = {"eps": 0.0, "rate": 0.0, "rate_split": 0.0, "total": 0.0}
+    n_samples = 0
     with torch.set_grad_enabled(is_train):
         for cond_idx, sched in loader:
             cond_idx = cond_idx.to(DEVICE)
             sched    = sched.to(DEVICE)
-            loss = diffusion.loss(model, sched, cond_idx)
+            terms = diffusion.loss_terms(model, sched, cond_idx)
+            total = terms["eps"] if rate_lam == 0.0 else terms["eps"] + rate_lam * terms["rate"]
             if is_train:
                 optimizer.zero_grad()
-                loss.backward()
+                total.backward()
                 optimizer.step()
             bs = sched.size(0)
-            sum_loss += loss.item() * bs
+            for key in ("eps", "rate", "rate_split"):
+                sums[key] += terms[key].item() * bs
+            sums["total"] += total.item() * bs
             n_samples += bs
-    return sum_loss / n_samples
+    return {key: val / n_samples for key, val in sums.items()}
 
 
 def train(epochs: int = EPOCHS,
             use_wandb: bool = True,
             save_path: Path | None = MODEL_SAVE_PATH,
             clock: bool = False,
-            seed: int = SEED) -> UNet1D:
+            seed: int = SEED,
+            rate_lam: float = RATE_LAM,
+            rate_gamma: float = RATE_SNR_GAMMA) -> UNet1D:
     """Stage1の学習を実行, val 損失が最良だった重みのモデルを返す
 
     ATUS実個票を教師に, 条件付きノイズ予測器 ε_θ(x_t, t, c)を学習
+
+    Note:
+        1. 早期終了は rate_lam によらず val の ε-MSE で判定する
+           (L_rate の有無で最良 epoch の選び方を変えないため)
+        2. rate_lam > 0 のときだけ学習用の端数バッチを捨てる (make_loaders の drop_last)。
+           1 エポックの更新回数が 14 -> 13 になり, 乱数列も従来とずれる
 
     Args:
         epochs: 学習エポック数の上限, default=EPOCHS=1000
@@ -950,10 +1095,14 @@ def train(epochs: int = EPOCHS,
         clock: UNet1D に 24 時間の時計を足すか, default=False
         seed: 学習の乱数の種（初期値・ミニバッチ・t・ε）, default=SEED=42。
             学習/評価の分割は split_indices が SEED で固定するので、この値では変わらない
+        rate_lam: 行動者率の偏りの項 L_rate の重み, 0 以上, default=RATE_LAM=0.0 (従来の損失)
+        rate_gamma: L_rate の重み v(t) の頭打ち, default=RATE_SNR_GAMMA=1.0
 
     Returns:
         best_stateを復元済みのUNet1D, 必ずしも最終エポックのおもみではない
     """
+    if rate_lam < 0.0:
+        raise ValueError(f"rate_lam は 0 以上でなければならない: {rate_lam}")
     run = None
     if use_wandb:
         import wandb
@@ -978,15 +1127,16 @@ def train(epochs: int = EPOCHS,
                 "kernel_size": KERNEL_SIZE,
                 "clock": clock, "clock_harmonics": CLOCK_HARMONICS if clock else 0,
                 "seed": seed,
+                "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma,
             }
         )
 
     torch.manual_seed(seed)
     cond_idx, sched, weight, _ = load_data(DATA_PATH)
-    train_loader, val_loader = make_loaders(cond_idx, sched, weight)
+    train_loader, val_loader = make_loaders(cond_idx, sched, weight, drop_last=rate_lam > 0.0)
 
     model = UNet1D(clock=clock).to(DEVICE)
-    diffusion = Diffusion()
+    diffusion = Diffusion(rate_gamma=rate_gamma)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.0)
     print(f"device={DEVICE}  N={len(sched)}  params={sum(p.numel() for p in model.parameters()):,}")
 
@@ -995,12 +1145,17 @@ def train(epochs: int = EPOCHS,
     epochs_no_improve = 0
     ep = 0
     for ep in range(1, epochs + 1):
-        tr = run_epoch(model, diffusion, train_loader, optimizer)
-        va = run_epoch(model, diffusion, val_loader)
+        tr_terms = run_epoch(model, diffusion, train_loader, optimizer, rate_lam=rate_lam)
+        va_terms = run_epoch(model, diffusion, val_loader, rate_lam=rate_lam)
+        tr, va = tr_terms["eps"], va_terms["eps"]
         if ep % 25 == 0 or ep == 1:
-            print(f"epoch {ep:4d} | train {tr:.4f} | val {va:.4f}", flush=True)
+            print(f"epoch {ep:4d} | train {tr:.4f} | val {va:.4f} | "
+                  f"rate {tr_terms['rate']:.3e} (split {tr_terms['rate_split']:+.2e})", flush=True)
         if run is not None:
-            run.log({"epoch": ep, "train/loss": tr, "val/loss": va})
+            # train/loss と val/loss は従来どおり ε-MSE（過去の run と同じ量で並べるため）
+            run.log({"epoch": ep, "train/loss": tr, "val/loss": va,
+                     **{f"train/{k}": v for k, v in tr_terms.items()},
+                     **{f"val/{k}": v for k, v in va_terms.items()}})
 
         if va < best_val - EARLY_STOP_MIN_DELTA:
             best_val = va
@@ -1028,7 +1183,8 @@ def train(epochs: int = EPOCHS,
         save_path.parent.mkdir(parents=True, exist_ok=True)
         # config は出所の記録。構造の判定には使わない（state_has_clock が重みのキーで決める）
         torch.save({"model": model.state_dict(),
-                    "config": {"kernel_size": KERNEL_SIZE, "clock": clock, "seed": seed}}, save_path)
+                    "config": {"kernel_size": KERNEL_SIZE, "clock": clock, "seed": seed,
+                               "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma}}, save_path)
         print(f"saved model to {save_path}")
     if run is not None:
         run.finish()
@@ -1425,8 +1581,20 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=None,
                     help="学習の乱数の種（既定 SEED=42）。学習/評価の分割は変えない。"
                          "明示すると反復実験扱いで、保存先に _s{seed} が付く")
+    ap.add_argument("--rate-lam", type=float, default=RATE_LAM,
+                    help="行動者率の偏りの項 L_rate の重み（既定 0 = 従来の損失）。"
+                         "正の値を渡すと保存先に _rate{値} が付く")
+    ap.add_argument("--rate-gamma", type=float, default=RATE_SNR_GAMMA,
+                    help="L_rate の重み v(t)=1/√max(SNR,γ) の頭打ち γ（既定 1.0）。"
+                         "既定以外は保存先に g{値} が付く。--rate-lam > 0 のときだけ意味を持つ")
     args = ap.parse_args()
     seed = SEED if args.seed is None else args.seed
+    if args.rate_lam < 0.0:
+        ap.error(f"--rate-lam は 0 以上: {args.rate_lam}")
+    if args.rate_gamma <= 0.0:
+        ap.error(f"--rate-gamma は正: {args.rate_gamma}")
+    if args.rate_lam == 0.0 and args.rate_gamma != RATE_SNR_GAMMA:
+        ap.error("--rate-gamma は --rate-lam > 0 のときだけ指定できる（λ=0 では効かない）")
 
     suffix = ""
     if args.kernel is not None:
@@ -1438,6 +1606,11 @@ if __name__ == "__main__":
         suffix += f"_k{args.kernel}"
     if args.clock:
         suffix += "_clock"
+    if args.rate_lam > 0.0:
+        # ★jobs/train_ddpm_simple_clock.sh は同じ名前を printf '%g' で組む。書式を揃えること
+        suffix += f"_rate{args.rate_lam:g}"
+        if args.rate_gamma != RATE_SNR_GAMMA:
+            suffix += f"g{args.rate_gamma:g}"
     if args.seed is not None:
         suffix += f"_s{args.seed}"
     if suffix:
@@ -1448,12 +1621,14 @@ if __name__ == "__main__":
     print(f"[config] kernel_size={KERNEL_SIZE}")
     print(f"[config] clock={args.clock}")
     print(f"[config] seed={seed}")
+    print(f"[config] rate_lam={args.rate_lam:g} rate_gamma={args.rate_gamma:g}")
     print(f"[config] ckpt={MODEL_SAVE_PATH.name}")
     print(f"[config] gen ={GEN_SAVE_PATH.name}")
 
     smoke_test()
     if args.smoke:
-        model = train(epochs=5, use_wandb=False, save_path=None, clock=args.clock, seed=seed)
+        model = train(epochs=5, use_wandb=False, save_path=None, clock=args.clock, seed=seed,
+                      rate_lam=args.rate_lam, rate_gamma=args.rate_gamma)
         # DDIM が無いので生成は 1000 ステップ固定。群あたり 2 本に絞って回す。
         # 暗記チェックは参照集合に対してプールが小さすぎるので飛ばす
         sanity_check(model, n_per_group=2, save_path=None, with_memorization=False)
@@ -1461,5 +1636,6 @@ if __name__ == "__main__":
         # ★保存先は明示的に渡す。train/sanity_check の既定引数は定義時に
         #   束縛済みで、上の再代入では差し替わらないため。
         model = train(epochs=args.epochs, use_wandb=not args.no_wandb,
-                      save_path=MODEL_SAVE_PATH, clock=args.clock, seed=seed)
+                      save_path=MODEL_SAVE_PATH, clock=args.clock, seed=seed,
+                      rate_lam=args.rate_lam, rate_gamma=args.rate_gamma)
         sanity_check(model, save_path=GEN_SAVE_PATH)

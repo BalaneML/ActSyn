@@ -21,6 +21,9 @@ DDPM_Aggregate からずれていないか」を検証する:
     9. 時計 (--clock) : φ の直交性、零初期化の時点で時計なしと出力が一致すること、
                      解像度 96/48/24 の位置の対応、保存して読み直したときの構造
    10. 反復 (--seed) : 学習の乱数だけを変え、学習/評価の分割は SEED で固定のまま
+   11. 行動者率の項 (--rate-lam) : ★loss() が従来の式と厳密に一致すること（Stage 2 が呼ぶ）、
+                     rate_lam=0 の 1 更新が従来のループと一致すること、v(t) の境目、
+                     u = −(x̂0 − x0) の換算、eps_hat=eps で 0、Stage 2 が loss_terms を呼ばないこと
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは出力が恒等的に 0 になり
@@ -175,8 +178,9 @@ def test_no_ddim_no_ema():
     assert '{"model": model.state_dict(),' in src, "保存するチェックポイントの形が変わっている"
     # ★保存する dict のリテラルを丸ごと固定する（EMA の重みなど第3のキーが入ると落ちる）。
     #   '"ema"' の有無では判定できない。wandb の config に "ema": False があるため
-    assert '"config": {"kernel_size": KERNEL_SIZE, "clock": clock, "seed": seed}}' in src, \
-        "チェックポイントの config が変わっている"
+    assert ('"config": {"kernel_size": KERNEL_SIZE, "clock": clock, "seed": seed,\n'
+            '                               "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma}}'
+            ) in src, "チェックポイントの config が変わっている"
     print("  5. DDIM / EMA を持たない: OK")
 
 
@@ -337,6 +341,99 @@ def test_seed_keeps_split():
     print("  10. --seed は学習の乱数だけを変え、分割は SEED で固定: OK")
 
 
+def _old_loss(diffusion: Any, model: Any, sched: torch.Tensor,
+              cond_idx: torch.Tensor) -> torch.Tensor:
+    """--rate-lam 導入前の Diffusion.loss を書き写した参照実装（比較専用）。"""
+    x0 = sm.sched_to_x0(sched)
+    t = torch.randint(0, sm.T_STEPS, (x0.size(0),), device=x0.device)
+    eps = torch.randn_like(x0)
+    x_t = diffusion.q_sample(x0, t, eps)
+    drop_mask = torch.rand(x0.size(0), device=x0.device) < sm.P_UNCOND
+    eps_hat = model(x_t, t, cond_idx, drop_mask)
+    return torch.nn.functional.mse_loss(eps_hat, eps)
+
+
+def test_rate_loss():
+    """★行動者率の項 L_rate（Diffusion.rate_loss / loss_terms, --rate-lam）。
+
+    Stage 2 は Diffusion.loss をリハーサル項と val に使い、make_loaders で ATUS を読む。
+    その 2 つの挙動が 1 ビットも変わっていないことを最初に固定する。
+    """
+    import inspect
+    d = sm.Diffusion(device=DEVICE)
+    sched = torch.randint(0, sm.NUM_ACT, (8, sm.NUM_SLOTS), generator=torch.Generator().manual_seed(1))
+    cond = torch.as_tensor(sm.cond_grid()[:8], dtype=torch.long)
+
+    # (a) loss() は従来の式と同じ乱数・同じ値。loss_terms の eps も一致する
+    model = _model(0).train()
+    torch.manual_seed(7)
+    ref = _old_loss(d, model, sched, cond)
+    torch.manual_seed(7)
+    new = d.loss(model, sched, cond)
+    torch.manual_seed(7)
+    terms = d.loss_terms(model, sched, cond)
+    assert torch.equal(ref, new), f"loss() が従来の式とずれた ({float(ref)} vs {float(new)})"
+    assert torch.equal(ref, terms["eps"]), "loss_terms の eps が loss() と一致しない"
+
+    # (b) rate_lam=0 の 1 更新は、従来の学習ループ（loss().backward()）と同じ重みになる
+    ds = sm.ScheduleDataset(cond, sched)
+    loader = torch.utils.data.DataLoader(ds, batch_size=8, shuffle=False)
+    m_old, m_new = _model(3).train(), _model(3).train()
+    o_old = torch.optim.AdamW(m_old.parameters(), lr=sm.LR, weight_decay=0.0)
+    o_new = torch.optim.AdamW(m_new.parameters(), lr=sm.LR, weight_decay=0.0)
+    torch.manual_seed(11)
+    for c_b, s_b in loader:
+        o_old.zero_grad()
+        _old_loss(d, m_old, s_b, c_b).backward()
+        o_old.step()
+    torch.manual_seed(11)
+    # run_epoch はバッチをモジュール変数 DEVICE へ送るので、テストの間だけ CPU に揃える
+    saved_device, sm.DEVICE = sm.DEVICE, DEVICE
+    try:
+        sm.run_epoch(m_new, d, loader, o_new, rate_lam=0.0)
+    finally:
+        sm.DEVICE = saved_device
+    for (name, p_old), p_new in zip(m_old.named_parameters(), m_new.parameters()):
+        assert torch.equal(p_old, p_new), f"rate_lam=0 の更新が従来とずれた: {name}"
+
+    # (c) v(t) の境目: SNR >= γ の t は 1/√SNR、それより大きい t は 1/√γ
+    snr = d.acp / (1.0 - d.acp)
+    for gamma in (1.0, 0.01):
+        dg = sm.Diffusion(device=DEVICE, rate_gamma=gamma)
+        low, high = snr >= gamma, snr < gamma
+        assert torch.allclose(dg.rate_v[low], snr[low].rsqrt())
+        assert torch.allclose(dg.rate_v[high], torch.full_like(dg.rate_v[high], gamma ** -0.5))
+    assert int(torch.nonzero(snr >= 1.0).max()) == 258, "γ=1 の境目が t=258 でない"
+
+    # (d) SNR >= γ の t では u = v·(eps_hat − eps) が −(x̂0 − x0) に一致する（x0 空間の残差）
+    g = torch.Generator().manual_seed(5)
+    x0 = sm.sched_to_x0(sched)
+    eps = torch.randn(x0.shape, generator=g)
+    eps_hat = eps + 0.1 * torch.randn(x0.shape, generator=g)
+    t = torch.full((8,), 100, dtype=torch.long)
+    x_t = d.q_sample(x0, t, eps)
+    x0_hat = (x_t - d.sqrt_1m_acp[t][:, None, None] * eps_hat) / d.sqrt_acp[t][:, None, None]
+    u = d.rate_v[t][:, None, None] * (eps_hat - eps)
+    assert torch.allclose(u, -(x0_hat - x0), atol=1e-5), "u が x0 空間の残差になっていない"
+
+    # (e) eps_hat = eps なら L_rate も split 推定も 0。偏りを足すと m² に一致する
+    rate, split = d.rate_loss(eps, eps, t)
+    assert float(rate) == 0.0 and float(split) == 0.0
+    bias = torch.full_like(eps, 0.2)
+    rate, split = d.rate_loss(eps + bias, eps, t)
+    expect = float((d.rate_v[100] * 0.2) ** 2)
+    assert abs(float(rate) - expect) < 1e-7 and abs(float(split) - expect) < 1e-7
+
+    # (f) Stage 2 は loss() と既定の make_loaders だけを使う（L_rate も drop_last も入らない）
+    assert inspect.signature(sm.make_loaders).parameters["drop_last"].default is False
+    assert inspect.signature(sm.Diffusion).parameters["rate_gamma"].default == sm.RATE_SNR_GAMMA
+    assert sm.RATE_LAM == 0.0
+    s2 = (Path(__file__).resolve().parent / "stage2_finetune.py").read_text(encoding="utf-8")
+    assert "loss_terms" not in s2 and "drop_last" not in s2 and "rate_gamma" not in s2, \
+        "stage2_finetune が L_rate の経路を使っている"
+    print("  11. 行動者率の項 (loss 不変・λ=0 の更新一致・v(t) の境目 t=258・x0 換算・0 の検算): OK")
+
+
 if __name__ == "__main__":
     print("DDPM_Aggregate_Simple backbone tests")
     test_shapes()
@@ -349,4 +446,5 @@ if __name__ == "__main__":
     test_diff_against_baseline()
     test_clock()
     test_seed_keeps_split()
+    test_rate_loss()
     print("test_backbone: OK")

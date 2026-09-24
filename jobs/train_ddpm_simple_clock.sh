@@ -55,6 +55,11 @@ source jobs/_common.sh
 EPOCHS="${EPOCHS:-1000}"
 CLOCK="${CLOCK:-1}"
 SEED="${SEED:-}"
+# 行動者率の偏りの項 L_rate（model.py の --rate-lam / --rate-gamma）。
+# 未指定なら従来の損失。例:
+#   RATE_LAM=1 jobs/submit.sh -q DBG -l elapstim_req=00:10:00 -v RATE_LAM jobs/train_ddpm_simple_clock.sh
+RATE_LAM="${RATE_LAM:-}"
+RATE_GAMMA="${RATE_GAMMA:-}"
 
 case "${CLOCK}" in
     0|1) ;;
@@ -65,17 +70,31 @@ if [ "${CLOCK}" = "0" ] && [ -z "${SEED}" ]; then
     exit 1
 fi
 
-# model.py の保存先の規則（_clock -> _s{SEED} の順）と同じ名前を組む
+if [ -n "${RATE_GAMMA}" ] && [ -z "${RATE_LAM}" ]; then
+    echo "ERROR: RATE_GAMMA は RATE_LAM と一緒に指定すること（λ=0 では効かない）" >&2
+    exit 1
+fi
+
+# model.py の保存先の規則（_clock -> _rate{λ}[g{γ}] -> _s{SEED} の順）と同じ名前を組む。
+# ★λ・γ の書式は Python の f"{x:g}" と printf '%g' で揃える（1.0 -> 1, 0.1 -> 0.1）
 SUFFIX=""
 ARGS=(--epochs "${EPOCHS}")
 if [ "${CLOCK}" = "1" ]; then SUFFIX="${SUFFIX}_clock"; ARGS+=(--clock); fi
+if [ -n "${RATE_LAM}" ]; then
+    SUFFIX="${SUFFIX}_rate$(printf '%g' "${RATE_LAM}")"
+    ARGS+=(--rate-lam "${RATE_LAM}")
+    if [ -n "${RATE_GAMMA}" ]; then
+        SUFFIX="${SUFFIX}g$(printf '%g' "${RATE_GAMMA}")"
+        ARGS+=(--rate-gamma "${RATE_GAMMA}")
+    fi
+fi
 if [ -n "${SEED}" ]; then SUFFIX="${SUFFIX}_s${SEED}"; ARGS+=(--seed "${SEED}"); fi
 
 CKPT="${REPO}/outputs/checkpoints/ddpm_simple_pretrain_common12_weekday${SUFFIX}.pt"
 DATA="${REPO}/data/processed/atus2024/atus2024_stula_common12_dataset.csv"
 LOG="${WORK}/logs/simple${SUFFIX}_${PBS_JOBID:-manual}.log"
 
-echo "clock: ${CLOCK}  seed: ${SEED:-42(既定)}"
+echo "clock: ${CLOCK}  seed: ${SEED:-42(既定)}  rate_lam: ${RATE_LAM:-0}  rate_gamma: ${RATE_GAMMA:-1(既定)}"
 echo "epochs: ${EPOCHS}"
 echo "log:   ${LOG}"
 echo "ckpt:  ${CKPT}"
@@ -106,7 +125,7 @@ fi
     echo "=== job ${PBS_JOBID:-manual}  $(date '+%Y-%m-%d %H:%M:%S') ==="
     echo "commit: $(git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "dirty : $(git status --porcelain 2>/dev/null | wc -l) file(s)"
-    echo "clock=${CLOCK}  seed=${SEED:-42}  epochs=${EPOCHS}"
+    echo "clock=${CLOCK}  seed=${SEED:-42}  epochs=${EPOCHS}  rate_lam=${RATE_LAM:-0}  rate_gamma=${RATE_GAMMA:-1}"
     nvidia-smi
     echo "==="
 } > "${LOG}" 2>&1
