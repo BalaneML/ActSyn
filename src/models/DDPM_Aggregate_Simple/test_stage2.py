@@ -49,6 +49,10 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     (e)    ★2パス蓄積の勾配が一括計算と一致する（近似ではない）
     (e2)   2パス目に1パス目と同じ zs を渡すと x_0 が一致する
     (d_idx) stage2_targets.d_index が model.d_index と全28組で一致
+    (tilt) 傾けたリハーサル（stage2_tilt.py）: 群の重みの合計が保たれ、傾けない群は
+           元の重みと完全一致し、傾けた群は A* に近づく。rho=inf は傾けない
+    (tug)  ★add_rehearsal_grad が θ.grad を従来の「集計側の上へ backward」と
+           ビット単位で同じにし、tug_cos が 2 つの勾配の cos に一致する
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは勾配の大きさが測れない。
@@ -102,6 +106,7 @@ ck: Any = _load("simple_stage2_checkpoint", HERE / "stage2_checkpoint.py")
 st: Any = _load("simple_stage2_targets", HERE / "stage2_targets.py")
 sl: Any = _load("simple_stage2_loss", HERE / "stage2_loss.py")
 ft: Any = _load("simple_stage2_finetune", HERE / "stage2_finetune.py")
+tl: Any = _load("simple_stage2_tilt", HERE / "stage2_tilt.py")
 se: Any = _load("simple_stage2_select", HERE / "stage2_select.py")
 lg: Any = _load("simple_stage2_lgo", HERE / "stage2_lgo.py")
 sp: Any = _load("simple_stage2_published", HERE / "stage2_published.py")
@@ -2017,6 +2022,112 @@ def test_select_common_random_numbers() -> None:
     print("test_select_common_random_numbers: OK")
 
 
+def test_tilted_rehearsal() -> None:
+    """(tilt) 傾けたリハーサルの重み（stage2_tilt.fit_tilt / stage2_finetune.tilted_rehearsal_weights）。
+
+    ★実データ（ATUS 学習分割）の 2 群だけを傾けて速く測る。
+    """
+    cond_idx, sched, weight, _ = sm.load_data()
+    train_idx, val_idx = sm.split_indices(len(sched))
+    groups = sm.cond_to_d(cond_idx)
+    a_star = np.asarray(st.load_stula_targets()["group_rates_tbl"], dtype=np.float64)
+    tilt_groups = [5, 20]
+    s_tr, g_tr, w_tr = sched[train_idx], groups[train_idx], weight[train_idx]
+
+    res = tl.fit_tilt(s_tr, g_tr, w_tr, a_star, tilt_groups, rho=0.1)
+    for d in range(st.D_GROUPS):
+        m = g_tr == d
+        if not m.any():
+            continue
+        # 群の重みの合計は変わらない
+        assert abs(res.weights[m].sum() - w_tr[m].sum()) <= 1e-9 * w_tr[m].sum(), d
+        if d not in tilt_groups:
+            # 傾けない群（held-out を含む）は元の重みと完全一致
+            assert np.array_equal(res.weights[m], w_tr[m]), d
+            assert not res.eta[d].any(), d
+    t = res.table.set_index("d")
+    for d in tilt_groups:
+        assert t.loc[d, "mse_after"] < 0.5 * t.loc[d, "mse_before"], t.loc[d]
+        assert t.loc[d, "ess_after"] <= t.loc[d, "ess_before"] + 1e-9, t.loc[d]
+        assert t.loc[d, "grad_norm"] < 1e-5, t.loc[d]
+    print(f"  (1) (tilt) 群 5: rate_mse {t.loc[5, 'mse_before']:.5f} -> {t.loc[5, 'mse_after']:.5f}、"
+          f"ESS {t.loc[5, 'ess_before']:.1f} -> {t.loc[5, 'ess_after']:.1f} 人。"
+          "群の合計は保存・傾けない群は完全一致: OK")
+
+    # rho=inf は傾けない（従来のリハーサルと一致）
+    none = tl.fit_tilt(s_tr, g_tr, w_tr, a_star, tilt_groups, rho=float("inf"))
+    assert np.array_equal(none.weights, w_tr) and not none.eta.any()
+    print("  (2) (tilt) rho=inf は w = b（従来と一致）: OK")
+
+    # 学習ループからの入口: 学習分割だけを傾け、val 分割の重みは元のまま
+    w_all, summary = ft.tilted_rehearsal_weights(cond_idx, sched, weight, a_star,
+                                                  np.asarray(tilt_groups), 0.1)
+    assert np.array_equal(w_all[val_idx], weight[val_idx])
+    assert np.array_equal(w_all[train_idx], res.weights)
+    assert summary["tilt_mse_after"] < summary["tilt_mse_before"]
+    # 既定は従来のリハーサル
+    assert inspect.signature(ft.run).parameters["rehearsal"].default == "atus"
+    print("  (3) (tilt) 学習分割だけを傾け、val は元のまま。run の既定は rehearsal='atus': OK")
+    print("test_tilted_rehearsal: OK")
+
+
+def test_add_rehearsal_grad() -> None:
+    """(tug) add_rehearsal_grad が θ.grad を従来の累積とビット単位で同じにし、cos を正しく測ること。
+
+    ★従来は「集計側の backward の上へ (λ·L_atus).backward() で累積」していた。
+      新しい実装は g_agg を退避して λ·g_atus を別に得てから足し戻す。
+      IEEE の加算は交換則が成り立つので一致するはずで、それを固定する。
+    """
+    x1 = torch.randn(3, sm.IN_CH, sm.NUM_SLOTS, generator=torch.Generator().manual_seed(1))
+    x2 = torch.randn(3, sm.IN_CH, sm.NUM_SLOTS, generator=torch.Generator().manual_seed(2))
+    t = torch.full((3,), 100, dtype=torch.long)
+    lam = 0.003
+
+    def losses(model: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        agg = model(x1, t, _cond(3)).square().mean()
+        reh = model(x2, t, None).abs().mean()
+        return agg, reh
+
+    # 従来の経路
+    m_old = _model(4)
+    opt_old = ft.build_optimizer(m_old)
+    agg, reh = losses(m_old)
+    agg.backward()
+    (lam * reh).backward()
+    # 新しい経路
+    m_new = _model(4)
+    opt_new = ft.build_optimizer(m_new)
+    params = [p for g in opt_new.param_groups for p in g["params"]]
+    agg, reh = losses(m_new)
+    agg.backward()
+    tug = ft.add_rehearsal_grad(params, lam * reh)
+    old_params = [p for g in opt_old.param_groups for p in g["params"]]
+    for p_old, p_new in zip(old_params, params):
+        if p_old.grad is None:
+            assert p_new.grad is None
+        else:
+            assert torch.equal(p_old.grad, p_new.grad), "θ.grad が従来の累積とずれた"
+
+    # tug_cos は 2 つの勾配を別々に測った cos に一致する
+    m_a, m_r = _model(4), _model(4)
+    agg_a, _ = losses(m_a)
+    agg_a.backward()
+    _, reh_r = losses(m_r)
+    (lam * reh_r).backward()
+
+    def flat(m: Any) -> torch.Tensor:
+        opt = ft.build_optimizer(m)
+        return torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).flatten()
+                          for g in opt.param_groups for p in g["params"]])
+
+    ga, gr = flat(m_a).double(), flat(m_r).double()      # float64 で比べる（丸め誤差を避ける）
+    cos = float(torch.dot(ga, gr) / (ga.norm() * gr.norm()))
+    assert abs(tug["tug_cos"] - cos) < 1e-6, (tug["tug_cos"], cos)
+    assert abs(tug["tug_ratio"] - float(gr.norm() / ga.norm())) < 1e-6
+    print(f"  (1) (tug) θ.grad は従来とビット一致、tug_cos {tug['tug_cos']:+.4f} = 直接計算 {cos:+.4f}: OK")
+    print("test_add_rehearsal_grad: OK")
+
+
 def main() -> None:
     test_checkpoint_roundtrip()
     test_reverse_step_matches_inline()
@@ -2056,6 +2167,8 @@ def main() -> None:
     test_lam_warmup_is_robust()
     test_jsd_memory_gate()
     test_select_common_random_numbers()
+    test_tilted_rehearsal()
+    test_add_rehearsal_grad()
     print("\ntest_stage2: OK")
 
 

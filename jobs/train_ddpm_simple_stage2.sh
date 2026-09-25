@@ -81,6 +81,19 @@ HOLDOUT="${HOLDOUT:-}"
 RESUME="${RESUME:-0}"
 SAVE_EVERY="${SAVE_EVERY:-25}"
 VAL_EVERY="${VAL_EVERY:-10}"
+# リハーサルの個票の抽出（stage2_finetune.py の --rehearsal / --tilt-rho）。
+#   REHEARSAL=atus（既定）: 従来どおり TUFINLWGT で抽出
+#   REHEARSAL=tilt       : 群ごとに A* へ傾けた重みで抽出。保存先に _tilt が付く
+#                          （TILT_RHO を指定したときは _tilt{ρ}）
+#   例: REHEARSAL=tilt LAM=0.001 STEPS=1000 SAVE_EVERY=50 STAGE1=... \
+#         jobs/submit.sh -v REHEARSAL,LAM,STEPS,SAVE_EVERY,STAGE1 -l elapstim_req=13:00:00 jobs/train_ddpm_simple_stage2.sh
+REHEARSAL="${REHEARSAL:-atus}"
+TILT_RHO="${TILT_RHO:-}"
+case "${REHEARSAL}" in
+    atus) [ -n "${TILT_RHO}" ] && { echo "ERROR: TILT_RHO は REHEARSAL=tilt のときだけ指定できる" >&2; exit 1; } ;;
+    tilt) ;;
+    *) echo "ERROR: REHEARSAL は atus か tilt（指定値: ${REHEARSAL}）" >&2; exit 1 ;;
+esac
 
 STAGE1_DEFAULT="${REPO}/outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_20260819.pt"
 STAGE1="${STAGE1:-${STAGE1_DEFAULT}}"
@@ -97,11 +110,17 @@ DATA="${REPO}/data/processed/atus2024/atus2024_stula_common12_dataset.csv"
 # ★λ ごとに保存先を分ける。CKPT_DIR を明示すればそちらを使う。
 #   分けないと、複数の λ を同時に投入したときに同じディレクトリへ書き合い、
 #   下の「過去の世代を退避」も互いに踏み合って結果が混ざる。
-CKPT_DIR="${CKPT_DIR:-${REPO}/outputs/checkpoints/stage2_lam${LAM}${STAGE1_TAG}}"
+# ★傾けたリハーサルも保存先を分ける。分けないと従来の同じ λ の世代と混ざる
+REH_TAG=""
+if [ "${REHEARSAL}" = "tilt" ]; then
+    REH_TAG="_tilt"
+    [ -n "${TILT_RHO}" ] && REH_TAG="_tilt$(printf '%g' "${TILT_RHO}")"
+fi
+CKPT_DIR="${CKPT_DIR:-${REPO}/outputs/checkpoints/stage2_lam${LAM}${STAGE1_TAG}${REH_TAG}}"
 LOG="${WORK}/logs/simple_stage2_${PBS_JOBID:-manual}.log"
 
 echo "steps=${STEPS} d_sub=${D_SUB} n=${N} K=${K} chunk=${CHUNK} eps=${EPS} loss=${LOSS} lam=${LAM}"
-echo "holdout='${HOLDOUT}' resume=${RESUME}"
+echo "holdout='${HOLDOUT}' resume=${RESUME} rehearsal=${REHEARSAL} tilt_rho=${TILT_RHO:-既定}"
 echo "log:  ${LOG}"
 echo "ckpt: ${CKPT_DIR}"
 
@@ -178,6 +197,7 @@ mkdir -p "${CKPT_DIR}"
     echo "stage1: ${STAGE1}"
     echo "steps=${STEPS} d_sub=${D_SUB} n=${N} K=${K} chunk=${CHUNK} eps=${EPS} loss=${LOSS} lam=${LAM}"
     echo "holdout='${HOLDOUT}' resume=${RESUME} save_every=${SAVE_EVERY} val_every=${VAL_EVERY}"
+    echo "rehearsal=${REHEARSAL} tilt_rho=${TILT_RHO:-既定}"
     echo "VRAM=${VRAM_MIB} MiB  budget=${BUDGET}  load=${LOAD}  B=${TOTAL}"
     nvidia-smi
     echo "==="
@@ -193,6 +213,8 @@ ARGS=(--steps "${STEPS}" --d-sub "${D_SUB}" --n "${N}" --K "${K}" --chunk "${CHU
 [ -n "${LR_EMB:-}" ]   && ARGS+=(--lr-emb "${LR_EMB}")
 [ -n "${LR_CONV:-}" ]  && ARGS+=(--lr-conv "${LR_CONV}")
 [ -n "${LR_CLOCK:-}" ] && ARGS+=(--lr-clock "${LR_CLOCK}")
+ARGS+=(--rehearsal "${REHEARSAL}")
+[ -n "${TILT_RHO}" ] && ARGS+=(--tilt-rho "${TILT_RHO}")
 [ "${RESUME}" = "1" ] && ARGS+=(--resume)
 
 SECONDS=0

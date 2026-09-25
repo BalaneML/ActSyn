@@ -42,6 +42,9 @@ Stage 2 の学習ループ
                          torch / numpy 両方の RNG と λ を引き継ぐ
         --lr-cond / --lr-emb / --lr-conv / --lr-clock  層別学習率（既定は LR_* 定数）。
                          --lr-clock は時計つきの Stage 1（model.py --clock）のときだけ効く
+        --rehearsal {atus,tilt}  リハーサルの個票の抽出。tilt は群ごとに A* へ傾けた重みで抽出する
+                         （stage2_tilt.py。held-out 群は傾けない）
+        --tilt-rho V     傾けのリッジの強さ（既定 0.1）。--rehearsal tilt のときだけ効く
 
 学習ログで最初に見る量:
     agg_gnorm_cond / _emb / _conv  集計側だけで θ に載った勾配の L2 ノルム（層別 LR の3群）
@@ -53,6 +56,8 @@ Stage 2 の学習ループ
         ★agg との比が「集計側が更新方向にどれだけ効いているか」そのもの。
           実測では λ=auto のとき λ‖g_atus‖/‖g_agg‖ = 22〜51 倍、さらに
           cos(g_agg, g_atus) = −0.27（逆向き）。λ を下げないと集計は通らない
+    tug_cos / tug_ratio            cos(g_agg, λ·g_atus) と ‖λ·g_atus‖/‖g_agg‖。綱引きの直接の量。
+        cos < 0 ならリハーサルが集計を押し戻している（従来の実測 −0.27）
     L_atus_val                     ATUS val 分割の ε-MSE（--val-every ごと）
         300 更新は学習分割の約23エポック相当。上がり始めたらリハーサルの過学習
     x0_floor_frac                  x_0 が下側 clamp に張り付いた要素の割合
@@ -96,6 +101,11 @@ sm: Any = _load("simple_model", HERE / "model.py")
 ck: Any = _load("simple_stage2_checkpoint", HERE / "stage2_checkpoint.py")
 st: Any = _load("simple_stage2_targets", HERE / "stage2_targets.py")
 sl: Any = _load("simple_stage2_loss", HERE / "stage2_loss.py")
+tl: Any = _load("simple_stage2_tilt", HERE / "stage2_tilt.py")
+
+# リハーサルの種類。"atus" は従来どおり（TUFINLWGT で抽出）、"tilt" は個票の重みを
+# 群ごとに A* へ傾けてから抽出する（stage2_tilt.py）
+REHEARSAL_KINDS = ("atus", "tilt")
 
 # 既定値。根拠は Stage2_design.md の対応する節
 DEFAULT_STEPS = 300          # §4.7 の見積り（D_sub=7 なら実測3.2時間）
@@ -559,6 +569,91 @@ def grad_norms(optimizer: torch.optim.Optimizer, prefix: str) -> dict[str, float
     return out
 
 
+def tilted_rehearsal_weights(cond_idx: np.ndarray, sched: np.ndarray, weight: np.ndarray,
+                             a_star: np.ndarray, teacher_groups: np.ndarray,
+                             rho: float) -> tuple[np.ndarray, dict[str, float]]:
+    """リハーサルに使う ATUS 個票の重みを、群ごとに教師 A* へ傾ける
+
+    Note:
+        1. 学習分割（split_indices の train_idx）だけを傾ける。val 分割の重みは元のまま
+           （val_loader は非加重なので、どのみち使われない）
+        2. 傾けるのは教師群だけ。held-out 群は元の重みのまま（その群の A* を読まない）
+        3. 群の重みの合計は変えないので、リハーサルに出てくる群の比率は従来と同じ
+
+    Args:
+        cond_idx: ATUS の条件インデックス, dtype=int64, (N, 3)
+        sched: ATUS のスケジュール (インデックス表現), dtype=int64, (N, 96)
+        weight: TUFINLWGT, dtype=float64, (N,)
+        a_star: 教師 A*, (28, 12, 96)
+        teacher_groups: 教師群のインデックス
+        rho: 傾けのリッジの強さ
+
+    Returns:
+        (傾けた重み (N,), 要約 dict)。要約は stage2_tilt.summarize の戻り値
+    """
+    train_idx, _ = sm.split_indices(len(sched))
+    groups = sm.cond_to_d(cond_idx)
+    res = tl.fit_tilt(sched[train_idx], groups[train_idx], weight[train_idx],
+                      a_star, teacher_groups, rho=rho)
+    out = np.asarray(weight, dtype=np.float64).copy()
+    out[train_idx] = res.weights
+    summary = tl.summarize(res.table)
+    print(f"[stage2] rehearsal=tilt rho={rho:g}: A* との rate_mse "
+          f"{summary['tilt_mse_before']:.5f} -> {summary['tilt_mse_after']:.5f}  "
+          f"ESS/n 中央値 {summary['tilt_ess_ratio_median']:.2f} 最小 {summary['tilt_ess_ratio_min']:.2f}"
+          f"（{summary['tilt_ess_min']:.1f} 人）  |∇η| 最大 {summary['tilt_grad_norm_max']:.1e}")
+    return out, summary
+
+
+def add_rehearsal_grad(params: list[torch.nn.Parameter],
+                       rehearsal_loss: torch.Tensor) -> dict[str, float]:
+    """集計側の勾配が θ.grad に載った状態で、リハーサル側の勾配を足し、綱引きを測る
+
+    Note:
+        1. 集計側の勾配 g_agg を退避してから rehearsal_loss（= λ·L_atus）を逆伝播し、
+           g_atus を別に得てから g_agg を足し戻す。IEEE の加算は交換則が成り立つので、
+           θ.grad は従来の「g_agg の上へ backward で累積」とビット単位で一致する
+        2. tug_cos < 0 ならリハーサルが集計を押し戻している（綱引き）
+
+    Args:
+        params: optimizer の全パラメータ（param_groups の順）
+        rehearsal_loss: λ·L_atus。backward できるスカラー
+
+    Returns:
+        tug_cos: cos(g_agg, λ·g_atus)。どちらかが 0 なら 0
+        tug_ratio: ‖λ·g_atus‖ / ‖g_agg‖。g_agg が 0 なら inf
+    """
+    g_agg = [None if p.grad is None else p.grad.detach().clone() for p in params]
+    for p in params:
+        p.grad = None
+    rehearsal_loss.backward()
+    # ★内積とノルムは CPU の float64 で積む。170 万要素を float32 で足すと cos が 1e-4 程度ずれる。
+    #   MPS は float64 を持たないので、先に CPU へ移してから変換する（1 回の .to で両方を
+    #   指定すると MPS 上で変換しようとして落ちる）
+    def f64(x: torch.Tensor) -> torch.Tensor:
+        return x.detach().cpu().double()
+
+    dot, sq_agg, sq_reh = 0.0, 0.0, 0.0
+    for p, ga in zip(params, g_agg):
+        gr = p.grad
+        if ga is not None:
+            sq_agg += float(f64(ga).pow(2).sum())
+        if gr is not None:
+            sq_reh += float(f64(gr).pow(2).sum())
+            if ga is not None:
+                dot += float((f64(ga) * f64(gr)).sum())
+        # 足し戻す。gr + ga と ga + gr は IEEE で同じ値
+        if ga is not None:
+            if gr is None:
+                p.grad = ga
+            else:
+                gr.add_(ga)
+    norm_agg, norm_reh = math.sqrt(sq_agg), math.sqrt(sq_reh)
+    cos = dot / (norm_agg * norm_reh) if norm_agg > 0 and norm_reh > 0 else 0.0
+    ratio = norm_reh / norm_agg if norm_agg > 0 else float("inf")
+    return {"tug_cos": cos, "tug_ratio": ratio}
+
+
 def run(steps: int = DEFAULT_STEPS,
         d_sub: int = DEFAULT_D_SUB,
         n: int = DEFAULT_N,
@@ -579,12 +674,18 @@ def run(steps: int = DEFAULT_STEPS,
         lr_cond: float = LR_COND,
         lr_emb: float = LR_EMB,
         lr_conv: float = LR_CONV,
-        lr_clock: float = LR_CLOCK) -> torch.nn.Module:
+        lr_clock: float = LR_CLOCK,
+        rehearsal: str = "atus",
+        tilt_rho: float = tl.DEFAULT_RHO) -> torch.nn.Module:
     """Stage 2 を固定ステップ回す, 返すのは最終ステップのモデル
 
     lr_cond / lr_emb / lr_conv / lr_clock は build_optimizer の層別学習率。
     lr_clock は時計つきの Stage 1（model.py の --clock）のときだけ使う。
+    rehearsal="tilt" はリハーサルの個票の重みを群ごとに A* へ傾ける（tilted_rehearsal_weights）。
+    tilt_rho はその強さで、rehearsal="atus" では使わない。
     """
+    if rehearsal not in REHEARSAL_KINDS:
+        raise ValueError(f"rehearsal は {REHEARSAL_KINDS} のいずれか: {rehearsal}")
     dev = device or sm.DEVICE
     check_shapes(K, d_sub, n)
     chunk = resolve_chunk(K, d_sub, n, chunk)
@@ -612,6 +713,12 @@ def run(steps: int = DEFAULT_STEPS,
 
     # ---- ATUS リハーサル用のイテレータ ----
     cond_idx, sched, weight, _ = sm.load_data()
+    tilt_summary: dict[str, float] = {}
+    if rehearsal == "tilt":
+        # ★学習分割の重みだけを群ごとに A* へ傾ける。held-out 群と val 分割は元のまま
+        weight, tilt_summary = tilted_rehearsal_weights(
+            cond_idx, sched, weight, np.asarray(tgt["group_rates_tbl"], dtype=np.float64),
+            teacher_groups, tilt_rho)
     train_loader, val_loader = sm.make_loaders(cond_idx, sched, weight)
 
     def atus_batches():
@@ -655,6 +762,10 @@ def run(steps: int = DEFAULT_STEPS,
         "stage1_clock": stage1_clock,
         "lr_clock": lr_clock if stage1_clock else float("nan"),
         "guidance_scale": sm.GUIDANCE_SCALE,
+        # ★従来のリハーサルでは tilt_* は NaN で残す（CSV 列を揃えるため）
+        "rehearsal": rehearsal,
+        "tilt_rho": tilt_rho if rehearsal == "tilt" else float("nan"),
+        **tilt_summary,
     }
 
     wandb_run = None
@@ -717,7 +828,10 @@ def run(steps: int = DEFAULT_STEPS,
                         f"(warmup {len(lam_samples)}/{LAM_WARMUP_STEPS})")
 
         assert lam is not None      # lam_auto の分岐か呼び出し側が必ず与えている
-        (lam * l_atus).backward()
+        # ★集計側の勾配と λ·リハーサル側の勾配を別々に得て綱引きを測り、足し合わせる。
+        #   θ.grad は従来の (lam * l_atus).backward() とビット単位で同じ（add_rehearsal_grad の Note）
+        tug = add_rehearsal_grad([p for g in optimizer.param_groups for p in g["params"]],
+                                 lam * l_atus)
         total_gnorm = grad_norms(optimizer, "total")
         optimizer.step()
 
@@ -729,7 +843,7 @@ def run(steps: int = DEFAULT_STEPS,
                     "L_atus": l_atus_num, "lam": lam, "sec": time.time() - t0,
                     "rate_mae": float((a_full - a_star).abs().mean()),
                     "other_x_share": float(a_full[:, int(st.Common.OTHER_X)].mean()),
-                    **agg_gnorm, **total_gnorm, **x0_diag}
+                    **agg_gnorm, **total_gnorm, **x0_diag, **tug}
             # ★g の診断は二次形式のときだけ。loss_grad は split-batch の二乗誤差の
             #   勾配なので、jsd で回しているときに混ぜると別の損失の勾配を報告することになる
             if loss_kind != "jsd":
@@ -752,6 +866,7 @@ def run(steps: int = DEFAULT_STEPS,
             print(f"  step {step:4d}/{steps}  L_agg={log['L_agg']:+.6f}  "
                     f"L_atus={log['L_atus']:.6f}{val_txt}  rate_mae={log['rate_mae']:.5f}  "
                     f"OTHER_X={log['other_x_share']:.4f}  |g_agg|={gnorm_txt}  "
+                    f"tug_cos={log['tug_cos']:+.3f}  "
                     f"floor={log['x0_floor_frac']:.3f}  {log['sec']:.1f}s")
 
         if step % save_every == 0 or step == steps:
@@ -803,9 +918,15 @@ def main() -> None:
                     help="conv / attention / GroupNorm の学習率")
     ap.add_argument("--lr-clock", type=float, default=LR_CLOCK,
                     help="clock_proj（時計）の学習率。時計つきの Stage 1 のときだけ使う")
+    ap.add_argument("--rehearsal", choices=list(REHEARSAL_KINDS), default="atus",
+                    help="リハーサルの個票の抽出。tilt は群ごとに A* へ傾けた重みで抽出する")
+    ap.add_argument("--tilt-rho", type=float, default=tl.DEFAULT_RHO,
+                    help="傾けのリッジの強さ。--rehearsal tilt のときだけ効く")
     args = ap.parse_args()
-    lrs = {"lr_cond": args.lr_cond, "lr_emb": args.lr_emb,
-           "lr_conv": args.lr_conv, "lr_clock": args.lr_clock}
+    # 層別学習率とリハーサルの設定。smoke と本番の run に同じものを渡す
+    run_opts = {"lr_cond": args.lr_cond, "lr_emb": args.lr_emb,
+           "lr_conv": args.lr_conv, "lr_clock": args.lr_clock,
+           "rehearsal": args.rehearsal, "tilt_rho": args.tilt_rho}
 
     holdout: list[int] = []
     if args.holdout_groups.startswith("auto:"):
@@ -834,7 +955,7 @@ def main() -> None:
             stage1_ckpt=args.stage1_ckpt,
             seed=args.seed,
             use_wandb=False,
-            **lrs)
+            **run_opts)
         print("stage2 smoke: OK")
         return
 
@@ -854,7 +975,7 @@ def main() -> None:
         resume=args.resume,
         seed=args.seed,
         use_wandb=not args.no_wandb,
-        **lrs)
+        **run_opts)
 
 
 if __name__ == "__main__":
