@@ -19,6 +19,8 @@ model.py
         --seed S     : 学習の乱数の種。分割は変えない（反復実験。保存先に _s{S}）
         --rate-lam L : 行動者率の偏りの項 L_rate の重み（既定 0 = 従来の損失。保存先に _rate{L}）
         --rate-gamma G : L_rate の重み v(t) の頭打ち（既定 1.0。既定以外は保存先に g{G}）
+        --rate-mode M  : L_rate の偏りを平均する単位 batch / group / tbin / pop（既定 batch。
+                         batch 以外は保存先の _rate{L} が _{M}rate{L} になる）
 
 出力:
     outputs/checkpoints/ddpm_simple_pretrain_common12_weekday.pt   Stage1 の重み
@@ -33,7 +35,7 @@ import sys
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal, overload
+from typing import Literal, NamedTuple, overload
 
 import numpy as np
 import numpy.typing as npt
@@ -158,6 +160,18 @@ GEN_BATCH   = 1024
 #   RATE_SNR_GAMMA=1 なら t<=258 を x0 空間の重み 1 で見て、t=500 で 0.29、t=999 で 0.006 に下がる
 RATE_LAM       = 0.0
 RATE_SNR_GAMMA = 1.0
+# ★L_rate の偏り m をどの単位で平均するか（Diffusion.rate_objective）。既定 "batch" は従来の L_rate
+#   batch: バッチ全体で平均する
+#   group: 条件ありの行を性×就業の 4 層、条件なしの行（drop_mask）を 1 層に分け、層ごとに平均する
+#   tbin : SNR(t) で 4 区間（>=100 / 10..100 / 1..10 / <1）に分け、区間ごとに平均する
+#   pop  : 目標をバッチの x0 でなく学習分割全体の行動者率 r̄ にする（ユーザー案。対照 arm）
+RateMode = Literal["batch", "group", "tbin", "pop"]
+RATE_MODES: tuple[RateMode, ...] = ("batch", "group", "tbin", "pop")
+RATE_MODE: RateMode = "batch"
+# tbin の区間の境目の SNR（降順）。t が大きいほど SNR は小さい
+RATE_TBIN_SNR = (100.0, 10.0, 1.0)
+# group の層の数。条件ありの 性(N_G)×就業(N_E) と、条件なしの 1 層
+N_RATE_GROUPS = N_G * N_E + 1
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
 
@@ -899,9 +913,82 @@ def eval_mode(model: nn.Module) -> Iterator[nn.Module]:
         model.train(was_training)
 
 
+class EpsPair(NamedTuple):
+    """Diffusion._eps_pair の戻り値。1 回の forward で得た予測と、その入力側の量"""
+    eps_hat: torch.Tensor    # 予測ノイズ, (B, 12, 96)
+    eps: torch.Tensor        # 真のノイズ, (B, 12, 96)
+    t: torch.Tensor          # 拡散ステップ, int64, (B,)
+    x0: torch.Tensor         # one-hot の活動スケジュール, (B, 12, 96)
+    drop_mask: torch.Tensor  # 条件なしで予測した行, bool, (B,)
+
+
+def stratified_mean_sq(u: torch.Tensor, labels: torch.Tensor, n_strata: int) -> torch.Tensor:
+    """層ごとに u をバッチ平均し, 層の大きさで重み付けた二乗平均の和を返す
+
+    Σ_g (n_g/B)·mean_{c,s} m_g²,  m_g = mean_{b ∈ g} u_b
+
+    Note:
+        1. 空の層は 0 を足す (n_g = 0)
+        2. 層が 1 つなら rate_loss の batch の定義 mean_{c,s} (mean_b u_b)² と一致する
+
+    Args:
+        u: 行ごとの残差, dtype=float32, (B, 12, 96)
+        labels: 各行の層番号, dtype=int64, (B,), 値域 [0, n_strata)
+        n_strata: 層の数
+
+    Returns:
+        スカラー, dtype=float32, 勾配グラフを保つ
+    """
+    batch = u.size(0)
+    onehot = F.one_hot(labels, n_strata).to(u.dtype)                 # (B, G)
+    counts = onehot.sum(dim=0)                                        # (G,)
+    means = (onehot.T @ u.reshape(batch, -1)) / counts.clamp_min(1.0)[:, None]   # (G, 12*96)
+    return ((counts / batch) * means.pow(2).mean(dim=1)).sum()
+
+
+def rate_group_strata(cond_idx: torch.Tensor, drop_mask: torch.Tensor) -> torch.Tensor:
+    """group の層番号を返す, -> (B,) int64, 値域 [0, N_RATE_GROUPS)
+
+    Note:
+        1. 条件ありの行は 性×就業 の g·N_E + e (0..3)。年齢は層にしない (1 層あたり約 64 行を保つため)
+        2. ★条件なしの行 (drop_mask) はまとめて最後の層 N_G·N_E にする。条件なしの予測は
+           群ごとには偏りが 0 にならない (全体の平均へ寄る) ので, 群の層に混ぜると
+           正しい予測まで罰してしまう
+
+    Args:
+        cond_idx: 条件インデックス, dtype=int64, (B, 3), 列は [gender, age, telfs]
+        drop_mask: 条件なしで予測した行, dtype=bool, (B,)
+
+    Returns:
+        層番号, dtype=int64, (B,)
+    """
+    strata = cond_idx[:, 0] * N_E + cond_idx[:, 2]
+    return torch.where(drop_mask, torch.full_like(strata, N_G * N_E), strata)
+
+
+def population_rates(sched: npt.NDArray[np.int64], weight: npt.NDArray[np.float64]) -> torch.Tensor:
+    """個票の加重行動者率 r̄ を返す, -> (NUM_ACT, NUM_SLOTS)
+
+    Note:
+        1. rate_mode="pop" の目標。学習分割だけを渡すこと (val の情報を学習へ漏らさない)
+        2. 学習バッチは TUFINLWGT 加重の復元抽出なので, バッチの x0 の期待値はこの r̄ に一致する
+
+    Args:
+        sched: 活動スケジュール, dtype=int64, (N, NUM_SLOTS)
+        weight: 調査ウェイト, dtype=float64, (N,)
+
+    Returns:
+        行動者率, dtype=float32, (NUM_ACT, NUM_SLOTS)。各スロットで活動の和は 1
+    """
+    w = weight / weight.sum()
+    onehot = sched[:, None, :] == np.arange(NUM_ACT)[None, :, None]    # (N, 12, 96)
+    return torch.as_tensor(np.einsum("n,ncs->cs", w, onehot), dtype=torch.float32)
+
+
 class Diffusion:
     """Stage1とStage2を実装"""
-    def __init__(self, device=DEVICE, rate_gamma: float = RATE_SNR_GAMMA):
+    def __init__(self, device=DEVICE, rate_gamma: float = RATE_SNR_GAMMA,
+                 rate_mode: RateMode = RATE_MODE, rate_target: torch.Tensor | None = None):
         """β schedule と, そこから導かれるバッファを事前計算する
 
         Note:
@@ -920,6 +1007,10 @@ class Diffusion:
             6〜8 は事後分布 q(x_{t-1}|x_t, x0) の閉形式で, _reverse_step だけが使う
             9. rate_v: L_rate の重み v(t) = 1/√max(SNR(t), rate_gamma), SNR(t) = ᾱ_t/(1-ᾱ_t)
                rate_loss だけが使う。乱数を消費しないので, 追加しても他の出力は変わらない
+            10. snr: SNR(t)
+            11. rate_x0_coef: min(1, √(SNR/rate_gamma)) = v(t)·√SNR(t)。u = v·(eps_hat − eps) を
+                −rate_x0_coef·(x̂0 − x0) と読むための係数で, rate_mode="pop" だけが使う
+            12. rate_tbin: t の区間番号 0..3 (RATE_TBIN_SNR の境目), rate_mode="tbin" だけが使う
 
         Args:
             device: バッファを置くデバイス, default=DEVICE
@@ -927,9 +1018,21 @@ class Diffusion:
                 小さくするほど高ノイズ側の t まで x0 空間の重み 1 で見る
                 (1.0 なら t<=258, 0.1 なら t<=484, 0.01 なら t<=673)。
                 代償に勾配が最大 1/√rate_gamma 倍になる
+            rate_mode: L_rate の偏りをどの単位で平均するか, default=RATE_MODE="batch" (従来)
+                rate_objective だけが使う。loss() (Stage 2 が呼ぶ) には影響しない
+            rate_target: rate_mode="pop" の目標 r̄, dtype=float32, (NUM_ACT, NUM_SLOTS)。
+                学習分割の TUFINLWGT 加重の行動者率 (population_rates)。他の mode では使わない
+
+        Raises:
+            ValueError: rate_gamma が正でないとき, 未知の rate_mode,
+                rate_mode="pop" で rate_target が無いとき
         """
         if rate_gamma <= 0.0:
             raise ValueError(f"rate_gamma は正でなければならない: {rate_gamma}")
+        if rate_mode not in RATE_MODES:
+            raise ValueError(f"rate_mode は {RATE_MODES} のいずれか: {rate_mode}")
+        if rate_mode == "pop" and rate_target is None:
+            raise ValueError("rate_mode='pop' には rate_target (学習分割の行動者率 r̄) が要る")
         betas = torch.linspace(BETA_START, BETA_END, T_STEPS, device=device)
         alphas = 1.0 - betas
         acp = torch.cumprod(alphas, dim=0)
@@ -945,6 +1048,12 @@ class Diffusion:
         self.post_coef_xt = (1.0 - acp_prev) * alphas.sqrt() / (1.0 - acp)
         self.rate_gamma = rate_gamma
         self.rate_v = (acp / (1.0 - acp)).clamp_min(rate_gamma).rsqrt()
+        self.snr = acp / (1.0 - acp)
+        self.rate_x0_coef = self.rate_v * self.snr.sqrt()
+        self.rate_tbin = torch.stack([(self.snr < thr).long() for thr in RATE_TBIN_SNR]).sum(dim=0)
+        self.rate_mode: RateMode = rate_mode
+        self.rate_target = None if rate_target is None else rate_target.to(device=device,
+                                                                            dtype=torch.float32)
 
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
         """x0 から任意のtステップ先の x_t を求める (前向き拡散過程)
@@ -964,7 +1073,7 @@ class Diffusion:
                 + self.sqrt_1m_acp[t][:, None, None] * eps)
 
     def _eps_pair(self, model: UNet1D, sched: torch.Tensor,
-                  cond_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                  cond_idx: torch.Tensor) -> EpsPair:
         """1バッチに t と ε を引いてノイズを予測する, loss と loss_terms の共通部分
 
         Note:
@@ -979,10 +1088,12 @@ class Diffusion:
             cond_idx: 条件インデックス, dtype=int64, (B, 3)
 
         Returns:
-            (eps_hat, eps, t)
+            EpsPair(eps_hat, eps, t, x0, drop_mask)
                 eps_hat: 予測ノイズ, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)
                 eps: 真のノイズ, dtype=float32, (B, 12, 96)
                 t: 拡散ステップ, dtype=int64, (B,)
+                x0: one-hot の活動スケジュール, dtype=float32, (B, 12, 96)
+                drop_mask: 条件なしで予測した行, dtype=bool, (B,)
         """
         x0 = sched_to_x0(sched)  # (B,96)->(B,12,96)∈{0,1}
         t = torch.randint(0, T_STEPS, (x0.size(0),), device=x0.device)  # t~U{0,T-1}
@@ -992,7 +1103,7 @@ class Diffusion:
         drop_mask = torch.rand(x0.size(0), device=x0.device) < P_UNCOND  # CFGの条件dropout
 
         eps_hat = model(x_t, t, cond_idx, drop_mask)
-        return eps_hat, eps, t
+        return EpsPair(eps_hat, eps, t, x0, drop_mask)
 
     def loss(self, model: UNet1D, sched: torch.Tensor, cond_idx: torch.Tensor) -> torch.Tensor:
         """Stage1学習の目的関数, 標準的な ε予測MSEに CFGを組み込んだもの
@@ -1009,8 +1120,8 @@ class Diffusion:
         Returns:
             バッチ損失, dtype=float32, (スカラ)
         """
-        eps_hat, eps, _ = self._eps_pair(model, sched, cond_idx)
-        return F.mse_loss(eps_hat, eps)  # ノイズ間のMSE
+        pair = self._eps_pair(model, sched, cond_idx)
+        return F.mse_loss(pair.eps_hat, pair.eps)  # ノイズ間のMSE
 
     def rate_loss(self, eps_hat: torch.Tensor, eps: torch.Tensor,
                   t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1068,9 +1179,51 @@ class Diffusion:
             {"eps": ε-MSE, "rate": L_rate, "rate_split": split-batch 推定の bias²}
             それぞれ dtype=float32 のスカラー。rate_split だけ勾配を持たない
         """
-        eps_hat, eps, t = self._eps_pair(model, sched, cond_idx)
-        rate, rate_split = self.rate_loss(eps_hat, eps, t)
-        return {"eps": F.mse_loss(eps_hat, eps), "rate": rate, "rate_split": rate_split}
+        pair = self._eps_pair(model, sched, cond_idx)
+        rate, rate_split = self.rate_objective(pair, cond_idx)
+        return {"eps": F.mse_loss(pair.eps_hat, pair.eps), "rate": rate, "rate_split": rate_split}
+
+    def rate_objective(self, pair: EpsPair,
+                       cond_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """self.rate_mode に応じた行動者率の項と, 記録用の split-batch bias² を返す
+
+        u_b = v(t_b)·(eps_hat_b − eps_b) (rate_loss と同じ, SNR >= γ では −(x̂0 − x0))
+
+            batch: mean_{c,s} m², m = mean_b u_b (rate_loss そのもの)
+            group: Σ_g (n_g/B)·mean_{c,s} m_g², 層 g は rate_group_strata
+            tbin : Σ_k (n_k/B)·mean_{c,s} m_k², 区間 k は rate_tbin[t]
+            pop  : mean_{c,s} m'², m' = mean_b u'_b, u'_b = −u_b + rate_x0_coef[t_b]·(x0_b − r̄)
+                   SNR >= γ では u'_b = x̂0_b − r̄。目標がバッチ自身の x0 でなく r̄ になる
+
+        Note:
+            1. rate_split は mode によらず batch の定義 (rate_loss) で測る。arm 間で同じ物差しにするため
+            2. group と tbin の期待値は Σ_g (n_g/B)·bias_g² + (層の数)·Var(u)/B。
+               第2項の勾配は ε-MSE と同じ向きなので最適解はずれない
+            3. ★pop の期待値は (1−1/B)·bias² + E[(x̂0 − r̄)²]/B で, 第2項はデノイザを定数 r̄ へ
+               縮める向きに働く (ε-MSE と対立する)。これを実測で確かめるための対照 arm である
+
+        Args:
+            pair: _eps_pair の戻り値
+            cond_idx: 条件インデックス, dtype=int64, (B, 3)
+
+        Returns:
+            (rate, rate_split)
+                rate: 行動者率の項, dtype=float32, スカラー, 勾配グラフを保つ
+                rate_split: batch の定義の split-batch bias², dtype=float32, スカラー, 勾配なし
+        """
+        rate, rate_split = self.rate_loss(pair.eps_hat, pair.eps, pair.t)
+        if self.rate_mode == "batch":
+            return rate, rate_split
+        u = self.rate_v[pair.t][:, None, None] * (pair.eps_hat - pair.eps)       # (B, 12, 96)
+        if self.rate_mode == "group":
+            labels = rate_group_strata(cond_idx, pair.drop_mask)
+            return stratified_mean_sq(u, labels, N_RATE_GROUPS), rate_split
+        if self.rate_mode == "tbin":
+            return stratified_mean_sq(u, self.rate_tbin[pair.t], len(RATE_TBIN_SNR) + 1), rate_split
+        assert self.rate_target is not None, "rate_mode='pop' に rate_target が無い"
+        coef = self.rate_x0_coef[pair.t][:, None, None]
+        u_pop = -u + coef * (pair.x0 - self.rate_target)
+        return u_pop.mean(dim=0).pow(2).mean(), rate_split
 
     def _eps(self, model: UNet1D, x: torch.Tensor,
             t_scalar: int, cond_idx: torch.Tensor | None, guidance_scale: float) -> torch.Tensor:
@@ -1319,7 +1472,8 @@ def train(epochs: int = EPOCHS,
             arch: ArchSpec = ArchSpec(),
             seed: int = SEED,
             rate_lam: float = RATE_LAM,
-            rate_gamma: float = RATE_SNR_GAMMA) -> UNet1D:
+            rate_gamma: float = RATE_SNR_GAMMA,
+            rate_mode: RateMode = RATE_MODE) -> UNet1D:
     """Stage1の学習を実行, val 損失が最良だった重みのモデルを返す
 
     ATUS実個票を教師に, 条件付きノイズ予測器 ε_θ(x_t, t, c)を学習
@@ -1339,12 +1493,16 @@ def train(epochs: int = EPOCHS,
             学習/評価の分割は split_indices が SEED で固定するので、この値では変わらない
         rate_lam: 行動者率の偏りの項 L_rate の重み, 0 以上, default=RATE_LAM=0.0 (従来の損失)
         rate_gamma: L_rate の重み v(t) の頭打ち, default=RATE_SNR_GAMMA=1.0
+        rate_mode: L_rate の偏りをどの単位で平均するか, default=RATE_MODE="batch"。
+            "pop" の目標 r̄ は学習分割 (split_indices) だけから作る
 
     Returns:
         best_stateを復元済みのUNet1D, 必ずしも最終エポックのおもみではない
     """
     if rate_lam < 0.0:
         raise ValueError(f"rate_lam は 0 以上でなければならない: {rate_lam}")
+    if rate_mode != "batch" and rate_lam == 0.0:
+        raise ValueError(f"rate_mode={rate_mode!r} は rate_lam > 0 のときだけ意味を持つ")
     run = None
     if use_wandb:
         import wandb
@@ -1371,7 +1529,7 @@ def train(epochs: int = EPOCHS,
                 "clock_harmonics": arch.clock_harmonics if arch.clock_kind == "harmonic" else 0,
                 "arch": asdict(arch),
                 "seed": seed,
-                "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma,
+                "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma, "rate_mode": rate_mode,
             }
         )
 
@@ -1380,7 +1538,11 @@ def train(epochs: int = EPOCHS,
     train_loader, val_loader = make_loaders(cond_idx, sched, weight, drop_last=rate_lam > 0.0)
 
     model = UNet1D(arch=arch).to(DEVICE)
-    diffusion = Diffusion(rate_gamma=rate_gamma)
+    rate_target = None
+    if rate_mode == "pop":
+        train_idx, _ = split_indices(len(sched))     # make_loaders と同じ分割
+        rate_target = population_rates(sched[train_idx], weight[train_idx])
+    diffusion = Diffusion(rate_gamma=rate_gamma, rate_mode=rate_mode, rate_target=rate_target)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.0)
     print(f"device={DEVICE}  N={len(sched)}  params={sum(p.numel() for p in model.parameters()):,}")
 
@@ -1430,7 +1592,8 @@ def train(epochs: int = EPOCHS,
         torch.save({"model": model.state_dict(),
                     "config": {"kernel_size": KERNEL_SIZE, "clock": arch.has_clock,
                                "arch": asdict(arch), "seed": seed,
-                               "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma}}, save_path)
+                               "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma,
+                               "rate_mode": rate_mode}}, save_path)
         print(f"saved model to {save_path}")
     if run is not None:
         run.finish()
@@ -1866,6 +2029,10 @@ if __name__ == "__main__":
     ap.add_argument("--rate-gamma", type=float, default=RATE_SNR_GAMMA,
                     help="L_rate の重み v(t)=1/√max(SNR,γ) の頭打ち γ（既定 1.0）。"
                          "既定以外は保存先に g{値} が付く。--rate-lam > 0 のときだけ意味を持つ")
+    ap.add_argument("--rate-mode", choices=RATE_MODES, default=RATE_MODE,
+                    help="L_rate の偏り m を平均する単位（Diffusion.rate_objective）。"
+                         "batch 以外は保存先の _rate{λ} が _{mode}rate{λ} になる。"
+                         "--rate-lam > 0 のときだけ意味を持つ")
     args = ap.parse_args()
     seed = SEED if args.seed is None else args.seed
     if args.rate_lam < 0.0:
@@ -1874,6 +2041,8 @@ if __name__ == "__main__":
         ap.error(f"--rate-gamma は正: {args.rate_gamma}")
     if args.rate_lam == 0.0 and args.rate_gamma != RATE_SNR_GAMMA:
         ap.error("--rate-gamma は --rate-lam > 0 のときだけ指定できる（λ=0 では効かない）")
+    if args.rate_lam == 0.0 and args.rate_mode != RATE_MODE:
+        ap.error("--rate-mode は --rate-lam > 0 のときだけ指定できる（λ=0 では効かない）")
 
     suffix = ""
     if args.kernel is not None:
@@ -1887,7 +2056,8 @@ if __name__ == "__main__":
         suffix += "_clock"
     if args.rate_lam > 0.0:
         # ★jobs/train_ddpm_simple_clock.sh は同じ名前を printf '%g' で組む。書式を揃えること
-        suffix += f"_rate{args.rate_lam:g}"
+        mode_tag = "" if args.rate_mode == "batch" else args.rate_mode
+        suffix += f"_{mode_tag}rate{args.rate_lam:g}"
         if args.rate_gamma != RATE_SNR_GAMMA:
             suffix += f"g{args.rate_gamma:g}"
     if args.seed is not None:
@@ -1901,14 +2071,16 @@ if __name__ == "__main__":
     arch = ArchSpec(clock_kind="harmonic") if args.clock else ArchSpec()
     print(f"[config] arch={arch}")
     print(f"[config] seed={seed}")
-    print(f"[config] rate_lam={args.rate_lam:g} rate_gamma={args.rate_gamma:g}")
+    print(f"[config] rate_lam={args.rate_lam:g} rate_gamma={args.rate_gamma:g} "
+          f"rate_mode={args.rate_mode}")
     print(f"[config] ckpt={MODEL_SAVE_PATH.name}")
     print(f"[config] gen ={GEN_SAVE_PATH.name}")
 
     smoke_test()
     if args.smoke:
         model = train(epochs=5, use_wandb=False, save_path=None, arch=arch, seed=seed,
-                      rate_lam=args.rate_lam, rate_gamma=args.rate_gamma)
+                      rate_lam=args.rate_lam, rate_gamma=args.rate_gamma,
+                      rate_mode=args.rate_mode)
         # DDIM が無いので生成は 1000 ステップ固定。群あたり 2 本に絞って回す。
         # 暗記チェックは参照集合に対してプールが小さすぎるので飛ばす
         sanity_check(model, n_per_group=2, save_path=None, with_memorization=False)
@@ -1917,5 +2089,6 @@ if __name__ == "__main__":
         #   束縛済みで、上の再代入では差し替わらないため。
         model = train(epochs=args.epochs, use_wandb=not args.no_wandb,
                       save_path=MODEL_SAVE_PATH, arch=arch, seed=seed,
-                      rate_lam=args.rate_lam, rate_gamma=args.rate_gamma)
+                      rate_lam=args.rate_lam, rate_gamma=args.rate_gamma,
+                      rate_mode=args.rate_mode)
         sanity_check(model, save_path=GEN_SAVE_PATH)

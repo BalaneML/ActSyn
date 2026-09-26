@@ -30,6 +30,8 @@ DDPM_Aggregate からずれていないか」を検証する:
    13. 計算ブロック : RoPE は回転 0 で nn.MultiheadAttention と一致し、位置をずらしても出力が不変、
                      96 解像度の attention は attn1 / u1_attn だけを足すこと、
                      条件×時刻のバイアスは零初期化で一致し、学習前から勾配が流れること
+   14. L_rate の単位 (--rate-mode) : 層・区間が 1 つなら batch と一致すること、層の割り当て、
+                     pop は r̄ をバッチ平均に置くと batch と一致すること、loss() が不変なこと
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは出力が恒等的に 0 になり
@@ -43,6 +45,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -186,7 +189,8 @@ def test_no_ddim_no_ema():
     #   '"ema"' の有無では判定できない。wandb の config に "ema": False があるため
     assert ('"config": {"kernel_size": KERNEL_SIZE, "clock": arch.has_clock,\n'
             '                               "arch": asdict(arch), "seed": seed,\n'
-            '                               "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma}}'
+            '                               "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma,\n'
+            '                               "rate_mode": rate_mode}}'
             ) in src, "チェックポイントの config が変わっている"
     print("  5. DDIM / EMA を持たない: OK")
 
@@ -478,6 +482,81 @@ def test_blocks():
           f"条件×時刻 R=4 は +{n_cc - n_base:,} params, 零初期化で一致・勾配が流れる): OK")
 
 
+def test_rate_modes():
+    """★rate_mode（Diffusion.rate_objective）の契約。
+
+    (a) stratified_mean_sq は層が 1 つなら rate_loss（batch）と一致する
+    (b) group の層: 条件ありは 性×就業、条件なし（drop_mask）は最後の層
+    (c) tbin の区間は SNR の境目 100 / 10 / 1 で 0..3。全行が 1 区間なら batch と一致する
+    (d) pop は目標 r̄ をバッチの x0 平均に置き、全行を SNR >= γ にすると batch と一致する。
+        r̄ をずらすと値が変わる（目標が効いている）
+    (e) rate_split は mode によらず batch の定義。loss() は mode によらず同じ値
+    (f) population_rates は各スロットで活動の和が 1。pop に目標が無ければ例外
+    """
+    g = torch.Generator().manual_seed(3)
+    batch = 16
+    sched = torch.randint(0, sm.NUM_ACT, (batch, sm.NUM_SLOTS), generator=g)
+    x0 = sm.sched_to_x0(sched)
+    eps = torch.randn(x0.shape, generator=g)
+    eps_hat = eps + 0.1 * torch.randn(x0.shape, generator=g)
+    t = torch.full((batch,), 50, dtype=torch.long)             # SNR >= 100 の区間 0
+    cond = torch.as_tensor(sm.cond_grid()[:batch], dtype=torch.long)
+    no_drop = torch.zeros(batch, dtype=torch.bool)
+    pair = sm.EpsPair(eps_hat, eps, t, x0, no_drop)
+    d_batch = sm.Diffusion(device=DEVICE)
+    ref, ref_split = d_batch.rate_loss(eps_hat, eps, t)
+
+    # (a) 層が 1 つなら batch と一致
+    u = d_batch.rate_v[t][:, None, None] * (eps_hat - eps)
+    one = sm.stratified_mean_sq(u, torch.zeros(batch, dtype=torch.long), 3)
+    assert torch.allclose(one, ref, rtol=1e-6, atol=0.0), "層 1 つの stratified_mean_sq が batch とずれた"
+
+    # (b) group の層
+    drop = torch.zeros(batch, dtype=torch.bool)
+    drop[0] = True
+    strata = sm.rate_group_strata(cond, drop)
+    expect = cond[:, 0] * sm.N_E + cond[:, 2]
+    expect[0] = sm.N_G * sm.N_E
+    assert torch.equal(strata, expect) and int(strata.max()) < sm.N_RATE_GROUPS
+
+    # (c) tbin の区間
+    snr = d_batch.snr
+    tb = d_batch.rate_tbin
+    for k, (lo, hi) in enumerate([(100.0, float("inf")), (10.0, 100.0), (1.0, 10.0), (0.0, 1.0)]):
+        sel = (snr >= lo) & (snr < hi)
+        assert bool((tb[sel] == k).all()), f"tbin の区間 {k} の割り当てが違う"
+    d_tbin = sm.Diffusion(device=DEVICE, rate_mode="tbin")
+    rate_tbin, split_tbin = d_tbin.rate_objective(pair, cond)
+    assert torch.allclose(rate_tbin, ref, rtol=1e-6, atol=0.0), "全行 1 区間の tbin が batch とずれた"
+
+    # (d) pop: r̄ = バッチの x0 平均、t=50 は SNR >= γ=1
+    d_pop = sm.Diffusion(device=DEVICE, rate_mode="pop", rate_target=x0.mean(dim=0))
+    rate_pop, split_pop = d_pop.rate_objective(pair, cond)
+    assert torch.allclose(rate_pop, ref, rtol=1e-5, atol=1e-10), "r̄ をバッチ平均に置いた pop が batch とずれた"
+    d_off = sm.Diffusion(device=DEVICE, rate_mode="pop", rate_target=x0.mean(dim=0) + 0.05)
+    assert float(d_off.rate_objective(pair, cond)[0]) > float(ref) + 1e-4, "pop の目標 r̄ が効いていない"
+
+    # (e) rate_split は mode によらず batch の定義。loss() は mode によらない
+    assert torch.equal(split_tbin, ref_split) and torch.equal(split_pop, ref_split)
+    model = _model(0).train()
+    torch.manual_seed(5)
+    l_batch = d_batch.loss(model, sched[:8], cond[:8])
+    torch.manual_seed(5)
+    l_group = sm.Diffusion(device=DEVICE, rate_mode="group").loss(model, sched[:8], cond[:8])
+    assert torch.equal(l_batch, l_group), "rate_mode で loss() が変わった（Stage 2 に影響する）"
+
+    # (f) population_rates と例外
+    r = sm.population_rates(sched.numpy(), np.linspace(1.0, 2.0, batch))
+    assert r.shape == (sm.NUM_ACT, sm.NUM_SLOTS) and torch.allclose(r.sum(dim=0), torch.ones(sm.NUM_SLOTS))
+    for kwargs in (dict(rate_mode="pop"), dict(rate_mode="median")):
+        try:
+            sm.Diffusion(device=DEVICE, **kwargs)
+        except ValueError:
+            continue
+        raise AssertionError(f"不正な指定を弾かなかった: {kwargs}")
+    print("  14. L_rate の単位 (batch/group/tbin/pop の一致・層と区間の割り当て・loss 不変): OK")
+
+
 def test_seed_keeps_split():
     """--seed は学習の乱数だけを変え、学習/評価の分割（split_indices）は変えないこと。
 
@@ -603,4 +682,5 @@ if __name__ == "__main__":
     test_rate_loss()
     test_arch_spec()
     test_blocks()
+    test_rate_modes()
     print("test_backbone: OK")
