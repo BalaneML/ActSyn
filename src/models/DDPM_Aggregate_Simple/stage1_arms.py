@@ -14,6 +14,9 @@ Stage 1 アブレーションの arm の表（唯一の出所）
     clock_h12         倍音 K=12                                       ε のみ
     clock_h48         倍音 K=48（96 スロットの全関数）                  ε のみ
     clock_tf96        Transformer 型 96 次元                          ε のみ
+    clock_rope        倍音 K=4 + attention に RoPE                     ε のみ
+    clock_rope_attn96 倍音 K=4 + RoPE + 96 解像度の attention          ε のみ
+    clock_condclock   倍音 K=4 + 条件×時刻のバイアス (R=4)             ε のみ
 
 段 2・3 の arm は、前の段の判定で土台が決まってから下の ARMS に足す。
 
@@ -66,6 +69,16 @@ ARMS: dict[str, ArmSpec] = {
     "clock_h48": ArmSpec(arch=_h(48), suffix="_clock_h48", note="倍音 K=48（全基底）"),
     "clock_tf96": ArmSpec(arch={"clock_kind": "transformer"}, suffix="_clock_tf96",
                           note="Transformer 型 96 次元"),
+    # --- 段 2: 計算ブロック（土台は段 1 の勝者 clock = 倍音 K=4、損失は ε のみ） ---
+    # 段 1 の判定（2026-09-27, stage1_replicates_stage1_judge.csv）: K=12 / K=48 / Transformer 型は
+    # 行動者率を大きく改善したが、3 つとも switch_emd が基準の 3 本全てより悪く失格。勝者は clock
+    "clock_rope": ArmSpec(arch={**_h(4), "attn_rope": True}, suffix="_clock_rope",
+                          note="倍音 K=4 + attention に RoPE"),
+    "clock_rope_attn96": ArmSpec(arch={**_h(4), "attn_rope": True, "attn96": True},
+                                 suffix="_clock_rope_attn96",
+                                 note="倍音 K=4 + RoPE + 96 解像度の attention"),
+    "clock_condclock": ArmSpec(arch={**_h(4), "cond_clock_rank": 4}, suffix="_clock_condclock",
+                               note="倍音 K=4 + 条件×時刻のバイアス (R=4)"),
 }
 
 
