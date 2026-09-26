@@ -27,6 +27,9 @@ DDPM_Aggregate からずれていないか」を検証する:
    12. 構造の指定 (ArchSpec) : 倍音 K=48 が 96 スロットの全関数を張ること、Transformer 型が
                      timestep_embedding と一致すること、零初期化で時刻符号なしと出力が一致すること、
                      config["arch"] から構造が戻ること、矛盾する指定を弾くこと
+   13. 計算ブロック : RoPE は回転 0 で nn.MultiheadAttention と一致し、位置をずらしても出力が不変、
+                     96 解像度の attention は attn1 / u1_attn だけを足すこと、
+                     条件×時刻のバイアスは零初期化で一致し、学習前から勾配が流れること
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは出力が恒等的に 0 になり
@@ -417,6 +420,64 @@ def test_arch_spec():
           f"K=48 は +{n_h48 - n_base:,} params): OK")
 
 
+def test_blocks():
+    """★ArchSpec の計算ブロック（attn_rope / attn96 / cond_clock_rank）の契約。
+
+    (a) RoPE: 位置を全て 0 にすると nn.MultiheadAttention と一致する。全位置を同じ量だけ
+        ずらしても出力は変わらない（内積が位置の差だけで決まる）。重みのキーは増えない
+    (b) attn96: 増えるキーは attn1 / u1_attn だけ
+    (c) cond_clock: 増えるキーは cond_clock_* だけで、零初期化の時点で出力が一致する。
+        混ぜる重み a が 0 でも、1 回の逆伝播で a に勾配が流れる（学習が始まる）
+    """
+    torch.manual_seed(0)
+    block = sm.AttnBlock1D(sm.BASE_CH * 2, rope=True).eval()
+    h = torch.randn(3, 48, sm.BASE_CH * 2)
+    pos = sm.slot_positions(48, "cpu")
+    with torch.no_grad():
+        ref, _ = block.attn(h, h, h, need_weights=False)
+        zero = block.rope_attention(h, torch.zeros_like(pos))
+        a0, a7 = block.rope_attention(h, pos), block.rope_attention(h, pos + 7.0)
+    assert torch.allclose(zero, ref, atol=1e-5), "回転 0 の RoPE が MultiheadAttention と一致しない"
+    assert torch.allclose(a0, a7, atol=1e-4), "位置をずらすと RoPE の出力が変わった（相対位置でない）"
+    assert not torch.allclose(a0, zero, atol=1e-4), "RoPE の回転が効いていない"
+    assert torch.equal(pos[:3], torch.tensor([0.0, 2.0, 4.0])), "48 解像度の位置がスロット 2j でない"
+
+    h48 = sm.ArchSpec(clock_kind="harmonic", clock_harmonics=48)
+    torch.manual_seed(0)
+    base = sm.UNet1D(arch=h48).eval()
+    x, t, c = _inputs()
+    n_base = sum(p.numel() for p in base.parameters())
+
+    rope = sm.UNet1D(arch=sm.ArchSpec(clock_kind="harmonic", clock_harmonics=48, attn_rope=True))
+    assert set(rope.state_dict()) == set(base.state_dict()), "RoPE で重みのキーが変わった"
+
+    attn96 = sm.UNet1D(arch=sm.ArchSpec(clock_kind="harmonic", clock_harmonics=48,
+                                        attn_rope=True, attn96=True)).eval()
+    extra = set(attn96.state_dict()) - set(base.state_dict())
+    assert extra and all(k.startswith(("attn1.", "u1_attn.")) for k in extra), sorted(extra)
+    with torch.no_grad():
+        assert attn96(x, t, c).shape == (x.size(0), sm.IN_CH, sm.NUM_SLOTS)
+    n_attn96 = sum(p.numel() for p in attn96.parameters())
+
+    cc = sm.UNet1D(arch=sm.ArchSpec(clock_kind="harmonic", clock_harmonics=48,
+                                    cond_clock_rank=4)).eval()
+    only = _copy_into(cc, base)
+    assert only and all(".cond_clock_" in k for k in only), sorted(only)
+    _wake_up(base)
+    _wake_up(cc)
+    with torch.no_grad():
+        assert torch.equal(base(x, t, c), cc(x, t, c)), "零初期化の条件×時刻のバイアスで出力が変わった"
+    cc.train()
+    cc.zero_grad()
+    cc(x, t, c).pow(2).mean().backward()
+    grad = cc.d1a.cond_clock_mix.weight.grad
+    assert grad is not None and float(grad.abs().sum()) > 0.0, "混ぜる重み a に勾配が流れない"
+    n_cc = sum(p.numel() for p in cc.parameters())
+
+    print(f"  13. 計算ブロック (RoPE の一致と相対性・attn96 は +{n_attn96 - n_base:,}・"
+          f"条件×時刻 R=4 は +{n_cc - n_base:,} params, 零初期化で一致・勾配が流れる): OK")
+
+
 def test_seed_keeps_split():
     """--seed は学習の乱数だけを変え、学習/評価の分割（split_indices）は変えないこと。
 
@@ -541,4 +602,5 @@ if __name__ == "__main__":
     test_seed_keeps_split()
     test_rate_loss()
     test_arch_spec()
+    test_blocks()
     print("test_backbone: OK")

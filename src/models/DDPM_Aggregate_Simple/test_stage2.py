@@ -1799,6 +1799,40 @@ def test_clock_param_group() -> None:
     print("test_clock_param_group: OK")
 
 
+def test_arch_param_groups() -> None:
+    """(ar) ArchSpec の追加部品が Stage 2 の層別 LR 群へ正しく入ること。
+
+    ★条件×時刻のバイアス（cond_clock_*）は clock 群、96 解像度の attention（attn1 / u1_attn）は
+      conv 群に入る。cond_clock_* が cond 群（cond_embeds / cond_proj）へ混ざらないこと、
+      Stage 2 の世代の config に arch が残り、そこから同じ構造が組み直せることを固定する。
+    """
+    import tempfile
+    from dataclasses import asdict
+
+    arch = sm.ArchSpec(clock_kind="harmonic", clock_harmonics=48, attn_rope=True,
+                       attn96=True, cond_clock_rank=4)
+    torch.manual_seed(0)
+    model = sm.UNet1D(arch=arch).to(DEVICE)
+    groups = ft.split_param_groups(model)
+    pname = {id(p): n for n, p in model.named_parameters()}
+    in_group = {k: {pname[id(p)] for p in v} for k, v in groups.items()}
+    cc = {n for n in pname.values() if ".cond_clock_" in n}
+    a96 = {n for n in pname.values() if n.startswith(("attn1.", "u1_attn."))}
+    assert cc and cc <= in_group[ft.CLOCK_GROUP_NAME], sorted(cc - in_group[ft.CLOCK_GROUP_NAME])
+    assert not cc & in_group["cond"], "cond_clock_* が cond 群へ混入している"
+    assert a96 and a96 <= in_group["conv"], sorted(a96 - in_group["conv"])
+
+    # Stage 2 の世代（config は Stage 2 の設定 + arch）から同じ構造が戻る
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "stage2_step0001.pt"
+        torch.save({"model": model.state_dict(), "step": 1,
+                    "config": {"K": 1, "arch": asdict(arch)}}, path)
+        assert sm.build_unet_for_ckpt(path).arch == arch
+    print(f"  (1) (ar) cond_clock_* {len(cc)} 個は clock 群、attn96 {len(a96)} 個は conv 群・"
+          f"Stage 2 の世代から構造が戻る: OK")
+    print("test_arch_param_groups: OK")
+
+
 def test_x0_diagnostics() -> None:
     """(x0) clamp の飽和と straight-through の鋭さが観測できること。
 
@@ -2161,6 +2195,7 @@ def main() -> None:
     test_resolve_chunk()
     test_grad_norms()
     test_clock_param_group()
+    test_arch_param_groups()
     test_x0_diagnostics()
     test_val_epsilon_mse()
     test_memorization_guardrail()

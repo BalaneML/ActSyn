@@ -155,8 +155,10 @@ CKPT_DIR = REPO_ROOT / "outputs" / "checkpoints" / "stage2"
 COND_PATH_KEYS = ("cond_embeds", "cond_proj", "null_emb")
 EMB_PATH_KEYS = ("emb_proj",)
 # ★CLOCK_PATH_KEYS は時刻符号つきモデルにだけある。時刻（1 日のうちの何時か）ごとに違う値を
-#   足す経路で、群によらない。無いモデルでは clock 群を作らない（従来の 3 群のまま）
-CLOCK_PATH_KEYS = ("clock_proj",)
+#   足す経路。clock_proj は群によらず、cond_clock_*（ArchSpec.cond_clock_rank > 0）は群と t で
+#   形が変わる。無いモデルでは clock 群を作らない（従来の 3 群のまま）。
+#   ★cond_clock_* は COND_PATH_KEYS（cond_embeds / cond_proj）と重ならない名前にしてある
+CLOCK_PATH_KEYS = ("clock_proj", "cond_clock_profile", "cond_clock_mix")
 
 
 # ============================================================

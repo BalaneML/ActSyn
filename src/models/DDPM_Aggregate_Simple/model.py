@@ -444,6 +444,8 @@ class ResBlock1D(nn.Module):
         3. 時間長Lは変えない (padding = KERNEL_SIZE // 2)
         4. arch.has_clock のときだけ、時刻の特徴 φ (time_features) を clock_proj で c_out 次元へ
            落とし、スロットごとに違う値のバイアスとして 2. と同じ位置に加算する
+        5. arch.cond_clock_rank = R > 0 のときだけ、条件×時刻のバイアス (cond_clock_bias) を
+           同じ位置に加算する。4. は全員に同じ時刻の形を足すが、5. は emb に応じて形が変わる
     """
     # arch.has_clock のときだけ register_buffer で作る。型チェッカに Tensor と伝えるための宣言
     clock_phi: torch.Tensor
@@ -480,6 +482,18 @@ class ResBlock1D(nn.Module):
             self.clock_proj = nn.Linear(arch.clock_dim, c_out)
             nn.init.zeros_(self.clock_proj.weight)
             nn.init.zeros_(self.clock_proj.bias)
+
+        # ★条件×時刻のバイアス。R 本の時刻プロファイル V φ を emb に応じた重み a(emb) で混ぜる。
+        #   a を零初期化し、V は通常の初期化にする（両方を 0 にすると互いの勾配が 0 のままになる）。
+        #   a が 0 なので、学習前の出力は条件×時刻のバイアスが無い構造と一致する
+        self.cond_clock_rank = arch.cond_clock_rank
+        self.cond_clock_profile: nn.Linear | None = None
+        self.cond_clock_mix: nn.Linear | None = None
+        if arch.cond_clock_rank > 0:
+            self.cond_clock_profile = nn.Linear(arch.clock_dim, c_out * arch.cond_clock_rank)
+            self.cond_clock_mix = nn.Linear(emb_dim, arch.cond_clock_rank)
+            nn.init.zeros_(self.cond_clock_mix.weight)
+            nn.init.zeros_(self.cond_clock_mix.bias)
 
     def clock_bias(self, length: int) -> torch.Tensor:
         """時刻符号のバイアスを解像度 length で返す, -> (1, c_out, length)
@@ -522,23 +536,102 @@ class ResBlock1D(nn.Module):
         h = h + self.emb_proj(emb)[:, :, None]           # 全スロットで同じ値
         if self.clock_proj is not None:
             h = h + self.clock_bias(h.size(-1))          # スロットごとに違う値
+        if self.cond_clock_mix is not None:
+            h = h + self.cond_clock_bias(emb, h.size(-1))  # 行（群・t）とスロットごとに違う値
         h = self.conv2(self.dropout(F.silu(self.norm2(h))))
         return h + self.skip(x)
+
+    def cond_clock_bias(self, emb: torch.Tensor, length: int) -> torch.Tensor:
+        """条件×時刻のバイアスを解像度 length で返す, -> (B, c_out, length)
+
+        bias[b, c, l] = Σ_r a_r(emb_b) · P[l, c, r],  a = cond_clock_mix(emb),  P = cond_clock_profile(φ(l))
+
+        Note:
+            1. emb は拡散ステップ埋め込みと条件埋め込みの和なので, 混ぜる重み a は群と t の両方で変わる
+            2. φ の間引きは clock_bias と同じ規約 (stride = NUM_SLOTS // length)
+
+        Args:
+            emb: 拡散ステップ埋め込みと条件埋め込みの和, dtype=float32, (B, emb_dim)
+            length: 特徴の時間長 L。NUM_SLOTS を割り切る値 (96 / 48 / 24)
+
+        Returns:
+            行とスロットごとのバイアス, dtype=float32, (B, c_out, length)
+
+        Raises:
+            RuntimeError: 条件×時刻のバイアスを持たないブロックで呼んだとき
+        """
+        if self.cond_clock_mix is None or self.cond_clock_profile is None:
+            raise RuntimeError("cond_clock_rank=0 の ResBlock1D には条件×時刻のバイアスが無い")
+        phi = self.clock_phi[:, ::NUM_SLOTS // length]                       # (clock_dim, L)
+        profile = self.cond_clock_profile(phi.T).view(length, -1, self.cond_clock_rank)  # (L, c_out, R)
+        mix = self.cond_clock_mix(emb)                                       # (B, R)
+        return torch.einsum("br,lcr->bcl", mix, profile)
+
+
+# ★RoPE の周波数の底。timestep_embedding と同じ値（Transformer の標準形）
+ROPE_BASE = 10000.0
+
+
+def slot_positions(length: int, device: torch.device | str) -> torch.Tensor:
+    """解像度 length の各位置が指すスロット番号を返す, -> (length,)
+
+    Note:
+        1. clock_bias と同じ規約。48 解像度の j はスロット 2j、24 解像度の j はスロット 4j
+
+    Args:
+        length: 特徴の時間長 L。NUM_SLOTS を割り切る値 (96 / 48 / 24)
+        device: 返すテンソルのデバイス
+
+    Returns:
+        スロット番号, dtype=float32, (length,)
+    """
+    return torch.arange(length, device=device, dtype=torch.float32) * (NUM_SLOTS // length)
+
+
+def rope_rotate(x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+    """q または k を位置 pos に応じて回転させる (RoPE), (B, H, L, d) -> (B, H, L, d)
+
+    Note:
+        1. 次元を前半と後半に分け, i 番目の組 (x_i, x_{i+d/2}) を角度 pos·θ_i だけ回す。
+           θ_i = ROPE_BASE^(-i/(d/2)) で, timestep_embedding と同じ等比周波数
+        2. 回転後の内積 q'·k' は位置の差 pos_q − pos_k だけで決まる (相対位置)
+
+    Args:
+        x: 回転させる q または k, dtype=float32, (B, H, L, d)。d は偶数
+        pos: 各位置のスロット番号, dtype=float32, (L,)
+
+    Returns:
+        回転後のテンソル, dtype=float32, (B, H, L, d)
+    """
+    half = x.size(-1) // 2
+    freqs = torch.exp(-math.log(ROPE_BASE)
+                      * torch.arange(half, device=x.device, dtype=x.dtype) / half)   # (d/2,)
+    angle = pos.to(x.dtype)[:, None] * freqs[None, :]                               # (L, d/2)
+    cos, sin = angle.cos(), angle.sin()
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
 
 class AttnBlock1D(nn.Module):
     """時間軸(スロット間)の self-attention + residual
     畳み込みが届かない遠いスロット同士を直接結ぶ
+
+    Note:
+        1. rope=False では位置の情報を持たない（スロットの並べ替えに対して等変）
+        2. rope=True では q と k をスロット番号で回転させ, 2 つのスロットの時刻差を attention に渡す。
+           重みは nn.MultiheadAttention のものをそのまま使うので, state_dict のキーは変わらない
     """
-    def __init__(self, ch: int):
+    def __init__(self, ch: int, rope: bool = False):
         """attention層を構築する。
 
         Args:
             ch: 入出力チャネル数, GroupNorm(8, ch) のため8の倍数
+            rope: q, k をスロット番号で回転させるか, default=False (従来の構造)
         """
         super().__init__()
         self.norm = nn.GroupNorm(8, ch)
         self.attn = nn.MultiheadAttention(ch, ATTN_HEADS, batch_first=True)
+        self.rope = rope
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """self-attentionを1回かける, (B, C, L) -> (B, C, L)
@@ -550,8 +643,35 @@ class AttnBlock1D(nn.Module):
             出力特徴, dtype=float32, (B, C, L)
         """
         h = self.norm(x).permute(0, 2, 1)
-        h, _ = self.attn(h, h, h, need_weights=False)
+        if self.rope:
+            h = self.rope_attention(h, slot_positions(h.size(1), h.device))
+        else:
+            h, _ = self.attn(h, h, h, need_weights=False)
         return h.permute(0, 2, 1) + x
+
+    def rope_attention(self, h: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """nn.MultiheadAttention の重みで q, k, v を作り, q と k を回転させて attention をかける
+
+        Note:
+            1. pos を全て 0 にすると回転は恒等写像になり, self.attn(h, h, h) と一致する (test_backbone)
+            2. self.attn の dropout は 0 (既定) なので, 学習時と評価時で同じ計算になる
+
+        Args:
+            h: 正規化済みの入力, dtype=float32, (B, L, C)
+            pos: 各位置のスロット番号, dtype=float32, (L,)
+
+        Returns:
+            attention の出力 (残差加算の前), dtype=float32, (B, L, C)
+        """
+        weight, bias = self.attn.in_proj_weight, self.attn.in_proj_bias
+        assert weight is not None, "in_proj_weight が無い（kdim/vdim を変えた MultiheadAttention）"
+        batch, length, ch = h.shape
+        heads = self.attn.num_heads
+        q, k, v = F.linear(h, weight, bias).chunk(3, dim=-1)                  # 各 (B, L, C)
+        q, k, v = (z.view(batch, length, heads, ch // heads).transpose(1, 2)
+                   for z in (q, k, v))                                        # 各 (B, H, L, d)
+        out = F.scaled_dot_product_attention(rope_rotate(q, pos), rope_rotate(k, pos), v)
+        return self.attn.out_proj(out.transpose(1, 2).reshape(batch, length, ch))
 
 
 class UNet1D(nn.Module):
@@ -590,22 +710,27 @@ class UNet1D(nn.Module):
 
         k, pad = KERNEL_SIZE, KERNEL_SIZE // 2
 
+        def attn_block(ch: int) -> AttnBlock1D:
+            return AttnBlock1D(ch, rope=arch.attn_rope)
+
         # Down h1
         self.in_conv = nn.Conv1d(IN_CH, c1, k, padding=pad)
         self.d1a, self.d1b = res_block(c1, c1), res_block(c1, c1)
+        # ★arch.attn96 のときだけ 96 解像度にも attention を置く（attn2 / u2_attn と対称な位置）
+        self.attn1: AttnBlock1D | None = attn_block(c1) if arch.attn96 else None
         self.ds1 = nn.Conv1d(c1, c1, k, stride=2, padding=pad)
 
         # Down h2
         self.d2a, self.d2b = res_block(c1, c2), res_block(c2, c2)
-        self.attn2 = AttnBlock1D(c2)
+        self.attn2 = attn_block(c2)
         self.ds2 = nn.Conv1d(c2, c2, k, stride=2, padding=pad)
 
         # Down h3
         self.d3a, self.d3b = res_block(c2, c2), res_block(c2, c2)
-        self.attn3 = AttnBlock1D(c2)
+        self.attn3 = attn_block(c2)
 
         # Bottleneck (middle)
-        self.m1, self.m_attn, self.m2 = res_block(c2, c2), AttnBlock1D(c2), res_block(c2, c2)
+        self.m1, self.m_attn, self.m2 = res_block(c2, c2), attn_block(c2), res_block(c2, c2)
 
         # Up with h3
         self.u3 = res_block(c2 + c2, c2)
@@ -613,11 +738,12 @@ class UNet1D(nn.Module):
         # Up with h2
         self.us2 = nn.Conv1d(c2, c2, k, padding=pad)
         self.u2 = res_block(c2 + c2, c2)
-        self.u2_attn = AttnBlock1D(c2)
+        self.u2_attn = attn_block(c2)
 
         # Up with h1
         self.us1 = nn.Conv1d(c2, c1, k, padding=pad)
         self.u1 = res_block(c1 + c1, c1)
+        self.u1_attn: AttnBlock1D | None = attn_block(c1) if arch.attn96 else None
 
         # 最終出力層
         self.out_norm = nn.GroupNorm(8, c1)
@@ -691,6 +817,8 @@ class UNet1D(nn.Module):
                 h3: (B, BASE_CH*2, NUM_SLOTS//4) = (B, 128, 24)  Bottleneck への入力
         """
         h1 = self.d1b(self.d1a(self.in_conv(x_t), emb), emb)
+        if self.attn1 is not None:
+            h1 = self.attn1(h1)
         h2 = self.attn2(self.d2b(self.d2a(self.ds1(h1), emb), emb))
         h3 = self.attn3(self.d3b(self.d3a(self.ds2(h2), emb), emb))
         return h1, h2, h3
@@ -747,6 +875,8 @@ class UNet1D(nn.Module):
         u = self.u2_attn(self.u2(torch.cat([u, h2], dim=1), emb))
         u = self.us1(F.interpolate(u, scale_factor=2, mode='nearest'))
         u = self.u1(torch.cat([u, h1], dim=1), emb)
+        if self.u1_attn is not None:
+            u = self.u1_attn(u)
         return self.out_conv(F.silu(self.out_norm(u)))
 
 
