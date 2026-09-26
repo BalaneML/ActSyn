@@ -14,9 +14,9 @@ Stage 1 アブレーションの arm の表（唯一の出所）
     clock_h12         倍音 K=12                                       ε のみ
     clock_h48         倍音 K=48（96 スロットの全関数）                  ε のみ
     clock_tf96        Transformer 型 96 次元                          ε のみ
-    clock_rope        倍音 K=4 + attention に RoPE                     ε のみ
-    clock_rope_attn96 倍音 K=4 + RoPE + 96 解像度の attention          ε のみ
-    clock_condclock   倍音 K=4 + 条件×時刻のバイアス (R=4)             ε のみ
+    clock_tf96_rope         Transformer 型 + attention に RoPE              ε のみ
+    clock_tf96_rope_attn96  Transformer 型 + RoPE + 96 解像度の attention   ε のみ
+    clock_tf96_condclock    Transformer 型 + 条件×時刻のバイアス (R=4)      ε のみ
 
 段 2・3 の arm は、前の段の判定で土台が決まってから下の ARMS に足す。
 
@@ -58,6 +58,10 @@ def _h(k: int) -> dict[str, Any]:
     return {"clock_kind": "harmonic", "clock_harmonics": k}
 
 
+# Transformer 型の時刻符号の ArchSpec 引数（段 2 以降の土台）
+TF96: dict[str, Any] = {"clock_kind": "transformer"}
+
+
 ARMS: dict[str, ArmSpec] = {
     # --- 既存（比較の基準） ---
     "noclock": ArmSpec(suffix="", legacy_seed42_tag="20260819", note="時刻符号なし"),
@@ -67,18 +71,22 @@ ARMS: dict[str, ArmSpec] = {
     # --- 段 1: 時刻符号の種類と解像度（損失は ε のみ） ---
     "clock_h12": ArmSpec(arch=_h(12), suffix="_clock_h12", note="倍音 K=12"),
     "clock_h48": ArmSpec(arch=_h(48), suffix="_clock_h48", note="倍音 K=48（全基底）"),
-    "clock_tf96": ArmSpec(arch={"clock_kind": "transformer"}, suffix="_clock_tf96",
+    "clock_tf96": ArmSpec(arch=TF96, suffix="_clock_tf96",
                           note="Transformer 型 96 次元"),
-    # --- 段 2: 計算ブロック（土台は段 1 の勝者 clock = 倍音 K=4、損失は ε のみ） ---
-    # 段 1 の判定（2026-09-27, stage1_replicates_stage1_judge.csv）: K=12 / K=48 / Transformer 型は
-    # 行動者率を大きく改善したが、3 つとも switch_emd が基準の 3 本全てより悪く失格。勝者は clock
-    "clock_rope": ArmSpec(arch={**_h(4), "attn_rope": True}, suffix="_clock_rope",
-                          note="倍音 K=4 + attention に RoPE"),
-    "clock_rope_attn96": ArmSpec(arch={**_h(4), "attn_rope": True, "attn96": True},
-                                 suffix="_clock_rope_attn96",
-                                 note="倍音 K=4 + RoPE + 96 解像度の attention"),
-    "clock_condclock": ArmSpec(arch={**_h(4), "cond_clock_rank": 4}, suffix="_clock_condclock",
-                               note="倍音 K=4 + 条件×時刻のバイアス (R=4)"),
+    # --- 段 2: 計算ブロック（土台は clock_tf96、損失は ε のみ） ---
+    # 段 1 の判定（2026-09-27, stage1_replicates_stage1_judge.csv）: 事前規則では K=12 / K=48 /
+    # Transformer 型の 3 つとも switch_emd が clock（K=4）の 3 本全てより悪く失格で、勝者は clock だった。
+    # ユーザーの判断で土台を clock_tf96 に変更した。理由: 行動者率の改善が大きい（MEALS 12:00
+    # 0.121→0.160、主指標の順位和が最良）一方、switch_emd の悪化（0.29→0.47）は時刻符号なし（0.61）
+    # より小さい。標準の Transformer の位置符号をそのまま使うので説明しやすい
+    "clock_tf96_rope": ArmSpec(arch={**TF96, "attn_rope": True}, suffix="_clock_tf96_rope",
+                               note="Transformer 型 + attention に RoPE"),
+    "clock_tf96_rope_attn96": ArmSpec(arch={**TF96, "attn_rope": True, "attn96": True},
+                                      suffix="_clock_tf96_rope_attn96",
+                                      note="Transformer 型 + RoPE + 96 解像度の attention"),
+    "clock_tf96_condclock": ArmSpec(arch={**TF96, "cond_clock_rank": 4},
+                                    suffix="_clock_tf96_condclock",
+                                    note="Transformer 型 + 条件×時刻のバイアス (R=4)"),
 }
 
 
