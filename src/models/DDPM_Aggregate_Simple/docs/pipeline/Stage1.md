@@ -113,12 +113,13 @@ flowchart TB
     end
 
     EMB["emb = timestep_embedding(t) + embed_cond(cond_idx, B, drop_mask)<br/>(B,256)<br/>★time_mlp を通さない (sinusoidal を直接加算)<br/>drop_mask が True の行は null_emb に置換"]
-    CLOCK["--clock のときだけ: clock_phi = clock_features() (CLOCK_DIM=8, 96)<br/>24h 周期のフーリエ特徴 k=1..CLOCK_HARMONICS=4<br/>学習パラメータなしの buffer (各 ResBlock1D が保持)"]
+    CLOCK["arch.has_clock のときだけ: clock_phi = time_features(arch) (arch.clock_dim, 96)<br/>harmonic: clock_features(K) 24h の倍音 k=1..K（--clock は K=4、K=48 で全関数）<br/>transformer: timestep_embedding(0..95, 96).T（底 10000）<br/>学習パラメータなしの buffer (各 ResBlock1D が保持)"]
+    CC["arch.cond_clock_rank=R>0 のときだけ: cond_clock_bias(emb, L)<br/>Σ_r cond_clock_mix(emb)_r · cond_clock_profile(φ)[l,c,r]<br/>mix は零初期化（群と t で形が変わる時刻の山）"]
 
     subgraph NET["UNet1D.forward(x_t, t, cond_idx, drop_mask) :449"]
         direction TB
         N0["in_conv Conv1d(IN_CH=12 → c1=64, k=KERNEL_SIZE)"]
-        N1["d1a, d1b : ResBlock1D(64,64)<br/>h1 (B,64,96)"]
+        N1["d1a, d1b : ResBlock1D(64,64) → attn1（arch.attn96 のときだけ）<br/>h1 (B,64,96)"]
         N2["ds1 : Conv1d stride=2"]
         N3["d2a, d2b : ResBlock1D(64→128) → attn2 : AttnBlock1D(128)<br/>h2 (B,128,48)"]
         N4["ds2 : Conv1d stride=2"]
@@ -126,7 +127,7 @@ flowchart TB
         N6["m1 → m_attn → m2<br/>m (B,128,24)"]
         N7["u3 : ResBlock1D(cat of m and h3)<br/>u (B,128,24)"]
         N8["interpolate x2 → us2 → u2 : ResBlock1D(cat of u and h2) → u2_attn<br/>u (B,128,48)"]
-        N9["interpolate x2 → us1 → u1 : ResBlock1D(cat of u and h1)<br/>u (B,64,96)"]
+        N9["interpolate x2 → us1 → u1 : ResBlock1D(cat of u and h1) → u1_attn（arch.attn96 のときだけ）<br/>u (B,64,96)"]
         N10["out_norm → SiLU → out_conv (重み・バイアスをゼロ初期化)"]
         N0 --> N1 --> N2 --> N3 --> N4 --> N5 --> N6 --> N7 --> N8 --> N9 --> N10
         N1 -.->|"skip"| N9
@@ -136,7 +137,7 @@ flowchart TB
 
     EPS["eps_hat (B,12,96)"]
     OBJ["l_eps = F.mse_loss(eps_hat, eps)<br/>(Diffusion.loss はこれだけを返す。Stage 2 が呼ぶ)"]
-    RATE["--rate-lam のときだけ効く: Diffusion.rate_loss(eps_hat, eps, t)<br/>u = rate_v[t] * (eps_hat − eps)、rate_v = 1/√max(SNR(t), RATE_SNR_GAMMA=1)<br/>m = u.mean(dim=0) (12,96)　★行動者率の偏り<br/>l_rate = (m ** 2).mean()"]
+    RATE["--rate-lam のときだけ効く: Diffusion.rate_objective(pair, cond_idx)<br/>u = rate_v[t] * (eps_hat − eps)、rate_v = 1/√max(SNR(t), RATE_SNR_GAMMA=1)<br/>rate_mode=batch: m = u.mean(dim=0) (12,96)　★行動者率の偏り、l_rate = (m ** 2).mean()<br/>group / tbin: stratified_mean_sq(u, 層, 層の数)（性×就業+条件なし / SNR 4 区間）<br/>pop: u' = −u + rate_x0_coef[t]·(x0 − rate_target)（目標を学習分割の r̄ にする対照）"]
     TOT["total = l_eps + rate_lam * l_rate<br/>(rate_lam=0 なら total = l_eps で従来と一致)"]
 
     subgraph EPOCH["run_epoch :724 → train :749"]
@@ -177,6 +178,9 @@ flowchart TB
     L4 --> N0
     EMB -.->|"各 ResBlock1D の emb_proj で加算 (adaLN ではない)<br/>全スロットで同じ値"| NET
     CLOCK -.->|"各 ResBlock1D の clock_proj (零初期化) で加算<br/>clock_bias(L): φ を stride 96//L で間引く<br/>スロットごとに違う値"| NET
+    CLOCK --> CC
+    EMB --> CC
+    CC -.->|"各 ResBlock1D で clock_bias と同じ位置に加算"| NET
     N10 --> EPS
     EPS --> OBJ
     L3 --> OBJ
@@ -193,6 +197,13 @@ flowchart TB
 
 **要点**
 
+- **構造は `ArchSpec`** でまとめて指定する（`clock_kind` / `clock_harmonics` / `attn_rope` /
+  `attn96` / `cond_clock_rank`）。チェックポイントの `config["arch"]` に保存し、`arch_spec_from_ckpt` が
+  構造を戻す（倍音 K=48 と Transformer 型 96 次元は重みの形が同じなので、重みのキーでは区別できない）。
+  アブレーションの arm は `stage1_arms.ARMS` が唯一の出所で、`model.py --arm NAME` で学習する。
+- **`attn_rope`** は既存の attention の q, k をスロット番号で回転させる（RoPE、重みのキーは不変）。
+- **`--rate-mode`**（既定 batch）で L_rate の偏りを平均する単位を変える（`rate_objective`）。
+  `pop` は目標をバッチ自身の x0 でなく学習分割の r̄ にする対照で、デノイザを r̄ へ縮める項が入る。
 - **`--rate-lam`（既定 0）**で行動者率の偏りの項 `l_rate` を足す。同じ forward の残差を
   `rate_v[t]` で行動者率（x0）の単位へ換算し、バッチ平均した `m` (12,96) の二乗平均を取る。
   個票ごとの残差は平均で打ち消され、全員に共通する偏りだけが残る。`rate_v` は t<=258 で
