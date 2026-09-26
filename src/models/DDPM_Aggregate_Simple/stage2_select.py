@@ -786,7 +786,7 @@ def dump_rates(ckpt: Path, out_npz: Path, n: int = DEFAULT_N,
     """
     dev = device or sm.DEVICE
     raw = torch.load(ckpt, map_location=dev, weights_only=False)
-    model = sm.UNet1D(clock=sm.state_has_clock(raw["model"])).to(dev)
+    model = sm.UNet1D(arch=sm.arch_spec_from_ckpt(raw)).to(dev)
     model.load_state_dict(raw["model"])
     step = int(raw.get("step", 0))
     config: dict[str, Any] = dict(raw.get("config", {}))

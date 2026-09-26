@@ -31,6 +31,7 @@ import importlib.util
 import math
 import sys
 from collections.abc import Iterator
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, overload
 
@@ -118,6 +119,9 @@ TIME_EMB_DIM = 256
 #   周期 24h の関数なので左端 04:00 と右端の翌 04:00 がつながる（活動日は環）
 CLOCK_HARMONICS = 4
 CLOCK_DIM = 2 * CLOCK_HARMONICS
+# ★Transformer 型の時刻符号の次元（ArchSpec.clock_kind="transformer"）。timestep_embedding と同じ
+#   底 10000 の等比周波数をスロット番号 0..95 に当てる。96 スロットの全基底（倍音 K=48）と同じ次元にそろえる
+CLOCK_TRANSFORMER_DIM = NUM_SLOTS
 
 # Classifier-Free Guidance
 P_UNCOND       = 0.1
@@ -319,19 +323,116 @@ def clock_features(num_slots: int = NUM_SLOTS,
         1. 拡散ステップの timestep_embedding とは別物。こちらは「1 日のうちの何時か」を表す
         2. 学習パラメータを持たない固定の特徴。学習するのは ResBlock1D.clock_proj だけ
         3. k=1 の cos/sin の組だけで 96 スロットすべてが別の点になる（円周上の 96 点）。
-           k=2..4 は 12h・8h・6h 周期で、昼食の 1 時間のような狭い山を線形に作りやすくする
+           ただし clock_proj は φ の線形結合なので、作れるバイアスの形は最短周期 24h/harmonics
+           までに限られる。harmonics=4 では周期 6h 以上で、ATUS の 12:00 の 1 スロット幅の段差
+           （MEALS 0.082→0.169）は線形の当てはめでも 0.103 までしか戻らない。
+           harmonics=48 で 96 スロットの全関数を表せる（clock_proj の bias が定数成分を担う）
+        4. harmonics=num_slots//2 の sin 列は sin(πs)=0 で恒等的に 0 になる。
+           その列の重みに勾配が流れないだけで害は無い
 
     Args:
         num_slots: 1 日のスロット数, default=NUM_SLOTS=96
-        harmonics: 調和次数の上限 k, default=CLOCK_HARMONICS=4
+        harmonics: 調和次数の上限 k, 1..num_slots//2, default=CLOCK_HARMONICS=4
 
     Returns:
         フーリエ特徴 φ, dtype=float32, (2*harmonics, num_slots)
+
+    Raises:
+        ValueError: harmonics が 1..num_slots//2 の外のとき
     """
+    if not 1 <= harmonics <= num_slots // 2:
+        raise ValueError(f"harmonics は 1..{num_slots // 2}: {harmonics}")
     s = torch.arange(num_slots, dtype=torch.float32)
     k = torch.arange(1, harmonics + 1, dtype=torch.float32)
     angle = 2.0 * math.pi * k[:, None] * s[None, :] / num_slots          # (H, S)
     return torch.stack([torch.cos(angle), torch.sin(angle)], dim=1).reshape(2 * harmonics, num_slots)
+
+
+ClockKind = Literal["none", "harmonic", "transformer"]
+CLOCK_KINDS: tuple[ClockKind, ...] = ("none", "harmonic", "transformer")
+
+
+@dataclass(frozen=True)
+class ArchSpec:
+    """UNet1D の構造の指定。チェックポイントの config["arch"] に asdict で保存する
+
+    Note:
+        1. 既定値は時刻符号なしの従来の構造 (本編・DDPM_Aggregate との差分テストの対象)
+        2. 時刻の特徴 φ は保存しない buffer なので, 倍音 K=48 と Transformer 型 96 次元は
+           重みの形が同じになる。そのため構造は重みのキーでなく config["arch"] から復元する
+           (arch_spec_from_ckpt)
+        3. 追加した部品はすべて零初期化か, 零初期化の部品の後ろに置く。ただし attn_rope と
+           attn96 は学習前から出力が変わる (attention の計算そのものを変えるため)
+
+    Attributes:
+        clock_kind: 時刻符号の種類
+            "none": 時刻符号なし
+            "harmonic": 24h を基本周期とする倍音のフーリエ特徴 (clock_features)
+            "transformer": 底 10000 の等比周波数の sin/cos (timestep_embedding をスロット番号に当てる)
+        clock_harmonics: 倍音の調和次数の上限 K, 1..NUM_SLOTS//2。clock_kind="harmonic" のときだけ使う
+        attn_rope: attention の q, k をスロット番号で回転させる (RoPE) か
+        attn96: 96 解像度に attention (attn1, u1_attn) を足すか
+        cond_clock_rank: 条件×時刻のバイアスのランク R。0 なら足さない。時刻符号が要る
+    """
+    clock_kind: ClockKind = "none"
+    clock_harmonics: int = CLOCK_HARMONICS
+    attn_rope: bool = False
+    attn96: bool = False
+    cond_clock_rank: int = 0
+
+    def __post_init__(self) -> None:
+        """組み合わせの矛盾を構築時に弾く
+
+        Raises:
+            ValueError: 未知の clock_kind, 範囲外の clock_harmonics, 負のランク,
+                時刻符号なしで cond_clock_rank > 0 のとき
+        """
+        if self.clock_kind not in CLOCK_KINDS:
+            raise ValueError(f"clock_kind は {CLOCK_KINDS} のいずれか: {self.clock_kind}")
+        if not 1 <= self.clock_harmonics <= NUM_SLOTS // 2:
+            raise ValueError(f"clock_harmonics は 1..{NUM_SLOTS // 2}: {self.clock_harmonics}")
+        if self.cond_clock_rank < 0:
+            raise ValueError(f"cond_clock_rank は 0 以上: {self.cond_clock_rank}")
+        if self.cond_clock_rank > 0 and self.clock_kind == "none":
+            raise ValueError("cond_clock_rank > 0 には時刻符号 (clock_kind != 'none') が要る")
+
+    @property
+    def has_clock(self) -> bool:
+        """時刻符号を持つか"""
+        return self.clock_kind != "none"
+
+    @property
+    def clock_dim(self) -> int:
+        """時刻の特徴 φ の次元。時刻符号なしは 0"""
+        if self.clock_kind == "harmonic":
+            return 2 * self.clock_harmonics
+        if self.clock_kind == "transformer":
+            return CLOCK_TRANSFORMER_DIM
+        return 0
+
+
+def time_features(arch: ArchSpec) -> torch.Tensor:
+    """構造の指定に合う時刻の特徴 φ を返す, -> (arch.clock_dim, NUM_SLOTS)
+
+    Note:
+        1. "transformer" は既存の timestep_embedding をスロット番号 0..95 にそのまま当てる。
+           底 10000 は数千位置の系列向けの値で, 96 位置では大半の列がほぼ定数か直線になる
+           (96 次元でも独立な成分は 34 個)。比較のために手を加えず標準形のまま使う
+
+    Args:
+        arch: 構造の指定。clock_kind != "none" であること
+
+    Returns:
+        時刻の特徴 φ, dtype=float32, (arch.clock_dim, NUM_SLOTS)
+
+    Raises:
+        ValueError: 時刻符号なしの指定を渡したとき
+    """
+    if arch.clock_kind == "harmonic":
+        return clock_features(harmonics=arch.clock_harmonics)
+    if arch.clock_kind == "transformer":
+        return timestep_embedding(torch.arange(NUM_SLOTS), CLOCK_TRANSFORMER_DIM).T.contiguous()
+    raise ValueError("時刻符号なしの ArchSpec には時刻の特徴が無い")
 
 
 class ResBlock1D(nn.Module):
@@ -341,21 +442,21 @@ class ResBlock1D(nn.Module):
         1. GroupNorm -> SiLU -> Conv1d の pre-activation 構成を2段重ね, 入力を残差加算する
         2. emb を emb_proj で c_out 次元へ落とし、チャネル毎バイアスとして時間軸一様に加算する
         3. 時間長Lは変えない (padding = KERNEL_SIZE // 2)
-        4. clock=True のときだけ、時刻符号 φ を clock_proj で c_out 次元へ落とし、
-           スロットごとに違う値のバイアスとして 2. と同じ位置に加算する
+        4. arch.has_clock のときだけ、時刻の特徴 φ (time_features) を clock_proj で c_out 次元へ
+           落とし、スロットごとに違う値のバイアスとして 2. と同じ位置に加算する
     """
-    # clock=True のときだけ register_buffer で作る。型チェッカに Tensor と伝えるための宣言
+    # arch.has_clock のときだけ register_buffer で作る。型チェッカに Tensor と伝えるための宣言
     clock_phi: torch.Tensor
 
     def __init__(self, c_in: int, c_out: int, emb_dim: int = TIME_EMB_DIM,
-                 clock: bool = False):
+                 arch: ArchSpec = ArchSpec()):
         """残差ブロックの層を構築する。
 
         Args:
             c_in: 入力チャネル数, GroupNorm(8, c_in) のため8の倍数
             c_out: 出力チャネル数, 8の倍数, c_in と異なるとき skip は 1x1 conv になる
             emb_dim: 条件埋め込みの次元, default=TIME_EMB_DIM=256
-            clock: 24 時間の時刻符号を足すか, default=False (従来の構造)
+            arch: 構造の指定, default=ArchSpec() (時刻符号なしの従来の構造)
         """
         super().__init__()
         k, pad = KERNEL_SIZE, KERNEL_SIZE // 2
@@ -369,14 +470,14 @@ class ResBlock1D(nn.Module):
 
         self.skip = nn.Identity() if c_in == c_out else nn.Conv1d(c_in, c_out, 1)
 
-        # ★clock=False では nn.Linear を作らないので、乱数の消費も層の初期値も従来と同じ。
-        #   clock=True では nn.Linear の初期化が乱数を消費するため、後続ブロックの初期値は
+        # ★時刻符号なしでは nn.Linear を作らないので、乱数の消費も層の初期値も従来と同じ。
+        #   時刻符号つきでは nn.Linear の初期化が乱数を消費するため、後続ブロックの初期値は
         #   時刻符号なしのモデルと一致しない（新しく学習するモデルなので問題にしない）。
         # ★零初期化。学習前の出力は時刻符号なしの構造と一致する（test_backbone で検証）
         self.clock_proj: nn.Linear | None = None
-        if clock:
-            self.register_buffer("clock_phi", clock_features(), persistent=False)
-            self.clock_proj = nn.Linear(CLOCK_DIM, c_out)
+        if arch.has_clock:
+            self.register_buffer("clock_phi", time_features(arch), persistent=False)
+            self.clock_proj = nn.Linear(arch.clock_dim, c_out)
             nn.init.zeros_(self.clock_proj.weight)
             nn.init.zeros_(self.clock_proj.bias)
 
@@ -399,10 +500,10 @@ class ResBlock1D(nn.Module):
             ValueError: length が NUM_SLOTS を割り切らないとき
         """
         if self.clock_proj is None:
-            raise RuntimeError("clock=False の ResBlock1D には時刻符号が無い")
+            raise RuntimeError("時刻符号なしの ResBlock1D には時刻符号が無い")
         if NUM_SLOTS % length != 0:
             raise ValueError(f"時間長 {length} が NUM_SLOTS={NUM_SLOTS} を割り切らない")
-        phi = self.clock_phi[:, ::NUM_SLOTS // length]          # (CLOCK_DIM, L)
+        phi = self.clock_phi[:, ::NUM_SLOTS // length]          # (clock_dim, L)
         return self.clock_proj(phi.T).T[None]                    # (1, c_out, L)
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
@@ -455,19 +556,30 @@ class AttnBlock1D(nn.Module):
 
 class UNet1D(nn.Module):
     """ε予測ネットワーク: (B,12,96) + 拡散ステップt + 条件cond -> (B,12,96)"""
-    def __init__(self, clock: bool = False):
+    def __init__(self, clock: bool = False, arch: ArchSpec | None = None):
         """UNet1D の層を構築する。
 
         Args:
-            clock: 全 ResBlock1D (11 個) に 24 時間の時刻符号を足すか, default=False (従来の構造)。
-                True でも零初期化なので、学習前の出力は False と一致する
+            clock: 全 ResBlock1D (11 個) に 24 時間の倍音の時刻符号 (K=CLOCK_HARMONICS) を足すか,
+                default=False (従来の構造)。True は arch=ArchSpec(clock_kind="harmonic") の略記。
+                零初期化なので、学習前の出力は False と一致する
+            arch: 構造の指定, default=None。None なら clock から決める。
+                渡すときは clock を省略すること
+
+        Raises:
+            ValueError: clock=True と arch を同時に渡したとき
         """
         super().__init__()
-        self.clock = clock
+        if arch is None:
+            arch = ArchSpec(clock_kind="harmonic") if clock else ArchSpec()
+        elif clock:
+            raise ValueError("clock=True と arch は同時に渡せない。arch.clock_kind で指定すること")
+        self.arch = arch
+        self.clock = arch.has_clock
         c1, c2 = BASE_CH, BASE_CH * 2
 
         def res_block(c_in: int, c_out: int) -> ResBlock1D:
-            return ResBlock1D(c_in, c_out, clock=clock)
+            return ResBlock1D(c_in, c_out, arch=arch)
 
         # Condition Embedding
         self.cond_embeds = nn.ModuleList([
@@ -1074,7 +1186,7 @@ def run_epoch(model: UNet1D, diffusion: Diffusion, loader: DataLoader,
 def train(epochs: int = EPOCHS,
             use_wandb: bool = True,
             save_path: Path | None = MODEL_SAVE_PATH,
-            clock: bool = False,
+            arch: ArchSpec = ArchSpec(),
             seed: int = SEED,
             rate_lam: float = RATE_LAM,
             rate_gamma: float = RATE_SNR_GAMMA) -> UNet1D:
@@ -1092,7 +1204,7 @@ def train(epochs: int = EPOCHS,
         epochs: 学習エポック数の上限, default=EPOCHS=1000
         use_wandb: wandbへハイパラと学習曲線を記録するか, default=True
         save_path: チェックポイントの保存先, Noneなら保存しない
-        clock: UNet1D に 24 時間の時刻符号を足すか, default=False
+        arch: UNet1D の構造の指定, default=ArchSpec() (時刻符号なしの従来の構造)
         seed: 学習の乱数の種（初期値・ミニバッチ・t・ε）, default=SEED=42。
             学習/評価の分割は split_indices が SEED で固定するので、この値では変わらない
         rate_lam: 行動者率の偏りの項 L_rate の重み, 0 以上, default=RATE_LAM=0.0 (従来の損失)
@@ -1125,7 +1237,9 @@ def train(epochs: int = EPOCHS,
                 "day_filter": DAY_FILTER, "num_act": NUM_ACT, "d_groups": D_GROUPS,
                 "data": DATA_PATH.name,
                 "kernel_size": KERNEL_SIZE,
-                "clock": clock, "clock_harmonics": CLOCK_HARMONICS if clock else 0,
+                "clock": arch.has_clock,
+                "clock_harmonics": arch.clock_harmonics if arch.clock_kind == "harmonic" else 0,
+                "arch": asdict(arch),
                 "seed": seed,
                 "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma,
             }
@@ -1135,7 +1249,7 @@ def train(epochs: int = EPOCHS,
     cond_idx, sched, weight, _ = load_data(DATA_PATH)
     train_loader, val_loader = make_loaders(cond_idx, sched, weight, drop_last=rate_lam > 0.0)
 
-    model = UNet1D(clock=clock).to(DEVICE)
+    model = UNet1D(arch=arch).to(DEVICE)
     diffusion = Diffusion(rate_gamma=rate_gamma)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.0)
     print(f"device={DEVICE}  N={len(sched)}  params={sum(p.numel() for p in model.parameters()):,}")
@@ -1181,9 +1295,11 @@ def train(epochs: int = EPOCHS,
 
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        # config は出所の記録。構造の判定には使わない（state_has_clock が重みのキーで決める）
+        # ★config["arch"] は構造の復元に使う（arch_spec_from_ckpt）。時刻の特徴 φ は保存しない
+        #   buffer なので、倍音 K=48 と Transformer 型 96 次元は重みの形だけでは区別できない
         torch.save({"model": model.state_dict(),
-                    "config": {"kernel_size": KERNEL_SIZE, "clock": clock, "seed": seed,
+                    "config": {"kernel_size": KERNEL_SIZE, "clock": arch.has_clock,
+                               "arch": asdict(arch), "seed": seed,
                                "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma}}, save_path)
         print(f"saved model to {save_path}")
     if run is not None:
@@ -1196,8 +1312,7 @@ def state_has_clock(state: dict[str, torch.Tensor]) -> bool:
     """重みの state_dict が時刻符号つきの UNet1D のものかを返す
 
     Note:
-        ★構造の判定は重みのキーだけで行う。config を持たない古いチェックポイント
-          （20260819 版など）も、Stage 2 の世代も同じ規則で読めるようにするため。
+        ★時刻符号の有無だけは重みのキーで判定できる。種類と次元は arch_spec_from_ckpt を使う
 
     Args:
         state: UNet1D の state_dict
@@ -1206,6 +1321,40 @@ def state_has_clock(state: dict[str, torch.Tensor]) -> bool:
         clock_proj の重みを持てば True
     """
     return any(".clock_proj." in k for k in state)
+
+
+def arch_spec_from_ckpt(ckpt: dict) -> ArchSpec:
+    """チェックポイントから UNet1D の構造の指定を復元する
+
+    Note:
+        1. config["arch"] があればそれを使う（この形式で保存した Stage 1 と、それを引き継いだ Stage 2）
+        2. 無ければ重みのキーから決める。config を持たない古いチェックポイント（20260819 版など）と、
+           ArchSpec 導入前の時刻符号つき（倍音 K=4）を同じ規則で読むため
+        3. ★2. で時刻符号の入力次元が CLOCK_DIM と違うときは, 種類 (倍音 / Transformer 型) を
+          決められないので例外にする
+
+    Args:
+        ckpt: キー "model" に state_dict を持つチェックポイントの dict。
+            Stage 1 の重みと Stage 2 の世代（stage2_step*.pt）のどちらでもよい
+
+    Returns:
+        構造の指定
+
+    Raises:
+        ValueError: config["arch"] が無く、時刻符号の入力次元が CLOCK_DIM と違うとき
+    """
+    config = ckpt.get("config") or {}
+    arch = config.get("arch")
+    if arch is not None:
+        return ArchSpec(**arch)
+    state = ckpt["model"]
+    if not state_has_clock(state):
+        return ArchSpec()
+    dims = {int(v.shape[1]) for k, v in state.items() if k.endswith(".clock_proj.weight")}
+    if dims != {CLOCK_DIM}:
+        raise ValueError(f"config['arch'] が無く、時刻符号の入力次元 {sorted(dims)} が "
+                         f"CLOCK_DIM={CLOCK_DIM} と違うので構造を決められない")
+    return ArchSpec(clock_kind="harmonic", clock_harmonics=CLOCK_HARMONICS)
 
 
 def build_unet_for_ckpt(path: Path) -> UNet1D:
@@ -1218,11 +1367,11 @@ def build_unet_for_ckpt(path: Path) -> UNet1D:
         path: キー "model" に state_dict を持つチェックポイント
 
     Returns:
-        CPU 上の UNet1D。時刻符号の有無は state_has_clock で決める
+        CPU 上の UNet1D。構造は arch_spec_from_ckpt で決める
     """
     # ★weights_only=False。Stage 2 の世代は RNG 状態と config を含む。自分で書いたファイルだけを読む
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    return UNet1D(clock=state_has_clock(ckpt["model"]))
+    return UNet1D(arch=arch_spec_from_ckpt(ckpt))
 
 
 def load_pretrained(path: Path = MODEL_SAVE_PATH) -> nn.Module:
@@ -1230,10 +1379,10 @@ def load_pretrained(path: Path = MODEL_SAVE_PATH) -> nn.Module:
 
     ★EMA が無いので use_ema 引数も無い。重みはキー "model"、出所の記録はキー "config"
       （20260819 版など古いチェックポイントには config が無い）
-    ★時刻符号の有無は重みのキーから決める（state_has_clock）
+    ★構造は arch_spec_from_ckpt で決める（config["arch"]、無ければ重みのキー）
     """
     ckpt = torch.load(path, map_location=DEVICE)
-    model = UNet1D(clock=state_has_clock(ckpt["model"])).to(DEVICE)
+    model = UNet1D(arch=arch_spec_from_ckpt(ckpt)).to(DEVICE)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model
@@ -1619,7 +1768,8 @@ if __name__ == "__main__":
         GEN_SAVE_PATH = GEN_SAVE_PATH.with_name(
             f"{GEN_SAVE_PATH.stem}{suffix}{GEN_SAVE_PATH.suffix}")
     print(f"[config] kernel_size={KERNEL_SIZE}")
-    print(f"[config] clock={args.clock}")
+    arch = ArchSpec(clock_kind="harmonic") if args.clock else ArchSpec()
+    print(f"[config] arch={arch}")
     print(f"[config] seed={seed}")
     print(f"[config] rate_lam={args.rate_lam:g} rate_gamma={args.rate_gamma:g}")
     print(f"[config] ckpt={MODEL_SAVE_PATH.name}")
@@ -1627,7 +1777,7 @@ if __name__ == "__main__":
 
     smoke_test()
     if args.smoke:
-        model = train(epochs=5, use_wandb=False, save_path=None, clock=args.clock, seed=seed,
+        model = train(epochs=5, use_wandb=False, save_path=None, arch=arch, seed=seed,
                       rate_lam=args.rate_lam, rate_gamma=args.rate_gamma)
         # DDIM が無いので生成は 1000 ステップ固定。群あたり 2 本に絞って回す。
         # 暗記チェックは参照集合に対してプールが小さすぎるので飛ばす
@@ -1636,6 +1786,6 @@ if __name__ == "__main__":
         # ★保存先は明示的に渡す。train/sanity_check の既定引数は定義時に
         #   束縛済みで、上の再代入では差し替わらないため。
         model = train(epochs=args.epochs, use_wandb=not args.no_wandb,
-                      save_path=MODEL_SAVE_PATH, clock=args.clock, seed=seed,
+                      save_path=MODEL_SAVE_PATH, arch=arch, seed=seed,
                       rate_lam=args.rate_lam, rate_gamma=args.rate_gamma)
         sanity_check(model, save_path=GEN_SAVE_PATH)

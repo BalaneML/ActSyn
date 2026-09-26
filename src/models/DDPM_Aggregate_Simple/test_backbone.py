@@ -24,6 +24,9 @@ DDPM_Aggregate からずれていないか」を検証する:
    11. 行動者率の項 (--rate-lam) : ★loss() が従来の式と厳密に一致すること（Stage 2 が呼ぶ）、
                      rate_lam=0 の 1 更新が従来のループと一致すること、v(t) の境目、
                      u = −(x̂0 − x0) の換算、eps_hat=eps で 0、Stage 2 が loss_terms を呼ばないこと
+   12. 構造の指定 (ArchSpec) : 倍音 K=48 が 96 スロットの全関数を張ること、Transformer 型が
+                     timestep_embedding と一致すること、零初期化で時刻符号なしと出力が一致すること、
+                     config["arch"] から構造が戻ること、矛盾する指定を弾くこと
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは出力が恒等的に 0 になり
@@ -178,7 +181,8 @@ def test_no_ddim_no_ema():
     assert '{"model": model.state_dict(),' in src, "保存するチェックポイントの形が変わっている"
     # ★保存する dict のリテラルを丸ごと固定する（EMA の重みなど第3のキーが入ると落ちる）。
     #   '"ema"' の有無では判定できない。wandb の config に "ema": False があるため
-    assert ('"config": {"kernel_size": KERNEL_SIZE, "clock": clock, "seed": seed,\n'
+    assert ('"config": {"kernel_size": KERNEL_SIZE, "clock": arch.has_clock,\n'
+            '                               "arch": asdict(arch), "seed": seed,\n'
             '                               "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma}}'
             ) in src, "チェックポイントの config が変わっている"
     print("  5. DDIM / EMA を持たない: OK")
@@ -324,6 +328,95 @@ def test_clock():
     print(f"  9. 時刻符号 (φ 直交・零初期化で一致・解像度の対応・読み直し, +{n_extra:,} params): OK")
 
 
+def _copy_into(dst: Any, src: Any) -> set[str]:
+    """src の重みを dst へ流し込み、dst にだけある（流し込まれなかった）キーを返す。"""
+    missing, unexpected = dst.load_state_dict(src.state_dict(), strict=False)
+    assert not unexpected, unexpected
+    return set(missing)
+
+
+def test_arch_spec():
+    """★ArchSpec の契約（時刻符号の種類と次元、構造の保存と復元）。
+
+    (a) 倍音 K=48 の φ に定数の行を足すと階数 96（96 スロットの全関数を張る）。
+        sin(πs) の行は恒等的に 0
+    (b) Transformer 型の φ は timestep_embedding(0..95, 96) の転置そのもの
+    (c) どちらの種類も零初期化の時点で時刻符号なしと出力がビット単位で一致する
+    (d) config["arch"] を持つ ckpt から同じ構造が戻る。config["arch"] が無く
+        入力次元が CLOCK_DIM と違う ckpt は構造を決められないので例外
+    (e) 矛盾する指定（範囲外の K、時刻符号なしのランク、clock=True と arch の併用）を弾く
+    """
+    import tempfile
+    from dataclasses import asdict
+
+    # (a) 倍音 K=48
+    h48 = sm.ArchSpec(clock_kind="harmonic", clock_harmonics=48)
+    phi = sm.time_features(h48)
+    assert phi.shape == (96, sm.NUM_SLOTS) and h48.clock_dim == 96
+    assert torch.allclose(phi[-1], torch.zeros(sm.NUM_SLOTS), atol=1e-4), "sin(πs) の行が 0 でない"
+    full = torch.cat([torch.ones(1, sm.NUM_SLOTS), phi], dim=0).double()
+    assert int(torch.linalg.matrix_rank(full)) == sm.NUM_SLOTS, "倍音 K=48 が全関数を張らない"
+
+    # (b) Transformer 型
+    tf = sm.ArchSpec(clock_kind="transformer")
+    phi_tf = sm.time_features(tf)
+    ref = sm.timestep_embedding(torch.arange(sm.NUM_SLOTS), sm.CLOCK_TRANSFORMER_DIM).T
+    assert phi_tf.shape == (sm.CLOCK_TRANSFORMER_DIM, sm.NUM_SLOTS) and torch.equal(phi_tf, ref)
+
+    # (c) 零初期化で時刻符号なしと一致
+    torch.manual_seed(0)
+    base = sm.UNet1D().to(DEVICE).eval()
+    x, t, c = _inputs()
+    for arch in (h48, tf):
+        model = sm.UNet1D(arch=arch).to(DEVICE).eval()
+        only = _copy_into(model, base)
+        assert only and all(".clock_proj." in k for k in only), sorted(only)
+        _wake_up(base)
+        _wake_up(model)
+        with torch.no_grad():
+            assert torch.equal(base(x, t, c), model(x, t, c)), f"{arch} が零初期化で一致しない"
+
+    # (d) 保存と復元
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "arch.pt"
+        for arch in (sm.ArchSpec(), h48, tf):
+            model = sm.UNet1D(arch=arch)
+            torch.save({"model": model.state_dict(), "config": {"arch": asdict(arch)}}, path)
+            assert sm.build_unet_for_ckpt(path).arch == arch
+            assert sm.load_pretrained(path).arch == arch
+        # config["arch"] の無い K=48 は種類を決められない
+        torch.save({"model": sm.UNet1D(arch=h48).state_dict()}, path)
+        try:
+            sm.build_unet_for_ckpt(path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("config['arch'] の無い K=48 の ckpt を黙って読んだ")
+
+    # (e) 矛盾する指定を弾く
+    bad_specs = [dict(clock_kind="harmonic", clock_harmonics=0),
+                 dict(clock_kind="harmonic", clock_harmonics=49),
+                 dict(clock_kind="none", cond_clock_rank=4),
+                 dict(clock_kind="sundial")]
+    for kwargs in bad_specs:
+        try:
+            sm.ArchSpec(**kwargs)
+        except ValueError:
+            continue
+        raise AssertionError(f"矛盾する指定を弾かなかった: {kwargs}")
+    try:
+        sm.UNet1D(clock=True, arch=h48)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("clock=True と arch の併用を弾かなかった")
+
+    n_h48 = sum(p.numel() for p in sm.UNet1D(arch=h48).parameters())
+    n_base = sum(p.numel() for p in base.parameters())
+    print(f"  12. ArchSpec (K=48 全基底・Transformer 型・零初期化で一致・保存と復元, "
+          f"K=48 は +{n_h48 - n_base:,} params): OK")
+
+
 def test_seed_keeps_split():
     """--seed は学習の乱数だけを変え、学習/評価の分割（split_indices）は変えないこと。
 
@@ -447,4 +540,5 @@ if __name__ == "__main__":
     test_clock()
     test_seed_keeps_split()
     test_rate_loss()
+    test_arch_spec()
     print("test_backbone: OK")

@@ -68,6 +68,7 @@ import importlib.util
 import math
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -761,6 +762,8 @@ def run(steps: int = DEFAULT_STEPS,
         # ★時刻符号なしの Stage 1 では lr_clock を使わないので NaN で残す（CSV 列を揃えるため）
         "stage1_clock": stage1_clock,
         "lr_clock": lr_clock if stage1_clock else float("nan"),
+        # ★構造の復元に使う（sm.arch_spec_from_ckpt）。倍音 K=48 と Transformer 型は重みの形が同じ
+        "arch": asdict(model.arch),
         "guidance_scale": sm.GUIDANCE_SCALE,
         # ★従来のリハーサルでは tilt_* は NaN で残す（CSV 列を揃えるため）
         "rehearsal": rehearsal,
