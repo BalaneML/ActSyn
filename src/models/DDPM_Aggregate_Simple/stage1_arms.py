@@ -17,6 +17,10 @@ Stage 1 アブレーションの arm の表（唯一の出所）
     clock_tf96_rope         Transformer 型 + attention に RoPE              ε のみ
     clock_tf96_rope_attn96  Transformer 型 + RoPE + 96 解像度の attention   ε のみ
     clock_tf96_condclock    Transformer 型 + 条件×時刻のバイアス (R=4)      ε のみ
+    clock_tf96_rate3        Transformer 型                                  ε + 3·L_rate (batch)
+    clock_tf96_grouprate3   Transformer 型                                  ε + 3·L_rate (group)
+    clock_tf96_tbinrate3    Transformer 型                                  ε + 3·L_rate (tbin)
+    clock_tf96_poprate3     Transformer 型                                  ε + 3·L_rate (pop)
 
 段 2・3 の arm は、前の段の判定で土台が決まってから下の ARMS に足す。
 
@@ -87,6 +91,21 @@ ARMS: dict[str, ArmSpec] = {
     "clock_tf96_condclock": ArmSpec(arch={**TF96, "cond_clock_rank": 4},
                                     suffix="_clock_tf96_condclock",
                                     note="Transformer 型 + 条件×時刻のバイアス (R=4)"),
+    # --- 段 3: 損失（土台は段 2 の勝者 clock_tf96、λ_rate=3） ---
+    # 段 2 の判定（2026-09-27, stage1_replicates_stage2_judge.csv、共通乱数で作り直したプール @g1.25）:
+    # RoPE / RoPE+attn96 / 条件×時刻のバイアスはどれもガードレールを通ったが主指標の順位和で土台に届かず、
+    # 勝者は clock_tf96
+    "clock_tf96_rate3": ArmSpec(arch=TF96, rate_lam=3.0, rate_mode="batch",
+                                suffix="_clock_tf96_rate3", note="Transformer 型 + L_rate(batch) λ=3"),
+    "clock_tf96_grouprate3": ArmSpec(arch=TF96, rate_lam=3.0, rate_mode="group",
+                                     suffix="_clock_tf96_grouprate3",
+                                     note="Transformer 型 + L_rate(group: 性×就業) λ=3"),
+    "clock_tf96_tbinrate3": ArmSpec(arch=TF96, rate_lam=3.0, rate_mode="tbin",
+                                    suffix="_clock_tf96_tbinrate3",
+                                    note="Transformer 型 + L_rate(tbin: SNR 4 区間) λ=3"),
+    "clock_tf96_poprate3": ArmSpec(arch=TF96, rate_lam=3.0, rate_mode="pop",
+                                   suffix="_clock_tf96_poprate3",
+                                   note="Transformer 型 + L_rate(pop: 目標 r̄、素の二乗) λ=3"),
 }
 
 
