@@ -21,6 +21,8 @@ model.py
         --rate-gamma G : L_rate の重み v(t) の頭打ち（既定 1.0。既定以外は保存先に g{G}）
         --rate-mode M  : L_rate の偏りを平均する単位 batch / group / tbin / pop（既定 batch。
                          batch 以外は保存先の _rate{L} が _{M}rate{L} になる）
+        --arm NAME     : stage1_arms.ARMS の arm を学習する（構造・損失・保存先を表から決める。
+                         上の構造・損失のフラグとは併用できない）
 
 出力:
     outputs/checkpoints/ddpm_simple_pretrain_common12_weekday.pt   Stage1 の重み
@@ -1915,15 +1917,30 @@ def sanity_check(model, n_per_group: int = 256, save_path: Path | None = GEN_SAV
     if save_path is None:
         print("\n(save_path=None のため生成CSVは書かない)")
         return
+    write_pool_csv(pool, save_path)
+    print(f"\nsaved generated schedules to {save_path}")
+
+
+def write_pool_csv(pool: npt.NDArray[np.int64], save_path: Path) -> None:
+    """群別サンプルプールを生成個票の CSV として書く
+
+    列は group_d, sampler, gender, age7, employment, s0..s95。
+    stage2_curves.load_sample_pool と clock_diagnostics がこの形式を読む。
+
+    Args:
+        pool: 群別サンプルプール, dtype=int64, (D_GROUPS, M, NUM_SLOTS)。行 d は cond_grid()[d] の条件
+        save_path: 書き出す CSV のパス
+    """
+    n_per_group = pool.shape[1]
+    gen = pool.reshape(-1, NUM_SLOTS)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    grid = cond_grid()
-    meta = pd.DataFrame(np.repeat(grid, n_per_group, axis=0), columns=["gender", "age7", "employment"])
-    meta.insert(0, "group_d", gen_d)   # w_gen と同一の群割り当て（ずれ得ない）
+    meta = pd.DataFrame(np.repeat(cond_grid(), n_per_group, axis=0),
+                        columns=["gender", "age7", "employment"])
+    meta.insert(0, "group_d", np.repeat(np.arange(D_GROUPS), n_per_group))
     # サンプラ列は clock_diagnostics が読むので残す。本実装では常に ancestral
     meta.insert(1, "sampler", "ancestral")
     pd.concat([meta, pd.DataFrame(gen, columns=[f"s{i}" for i in range(NUM_SLOTS)])],
-                axis=1).to_csv(save_path, index=False)
-    print(f"\nsaved generated schedules to {save_path}")
+              axis=1).to_csv(save_path, index=False)
 
 
 # ============================================================
@@ -2029,6 +2046,9 @@ if __name__ == "__main__":
     ap.add_argument("--rate-gamma", type=float, default=RATE_SNR_GAMMA,
                     help="L_rate の重み v(t)=1/√max(SNR,γ) の頭打ち γ（既定 1.0）。"
                          "既定以外は保存先に g{値} が付く。--rate-lam > 0 のときだけ意味を持つ")
+    ap.add_argument("--arm", default=None,
+                    help="stage1_arms.ARMS の arm 名。構造・損失・保存先の接尾辞を表から決める。"
+                         "--kernel / --clock / --rate-* とは併用できない")
     ap.add_argument("--rate-mode", choices=RATE_MODES, default=RATE_MODE,
                     help="L_rate の偏り m を平均する単位（Diffusion.rate_objective）。"
                          "batch 以外は保存先の _rate{λ} が _{mode}rate{λ} になる。"
@@ -2044,43 +2064,59 @@ if __name__ == "__main__":
     if args.rate_lam == 0.0 and args.rate_mode != RATE_MODE:
         ap.error("--rate-mode は --rate-lam > 0 のときだけ指定できる（λ=0 では効かない）")
 
-    suffix = ""
-    if args.kernel is not None:
-        # ★モデル構築より前に差し替える。UNet1D/ResBlock1D は __init__ で
-        #   モジュール変数 KERNEL_SIZE を読むため、ここで決めた値が全層に効く。
-        KERNEL_SIZE = args.kernel
-        # --kernel を明示した実行は、値が 3 でもアブレーションとして別名に隔離する。
-        # スイープ一式を同じ規則で並べられるようにするため。
-        suffix += f"_k{args.kernel}"
-    if args.clock:
-        suffix += "_clock"
-    if args.rate_lam > 0.0:
-        # ★jobs/train_ddpm_simple_clock.sh は同じ名前を printf '%g' で組む。書式を揃えること
-        mode_tag = "" if args.rate_mode == "batch" else args.rate_mode
-        suffix += f"_{mode_tag}rate{args.rate_lam:g}"
-        if args.rate_gamma != RATE_SNR_GAMMA:
-            suffix += f"g{args.rate_gamma:g}"
-    if args.seed is not None:
-        suffix += f"_s{args.seed}"
+    rate_lam, rate_gamma, rate_mode = args.rate_lam, args.rate_gamma, args.rate_mode
+    if args.arm is not None:
+        # ★構造・損失・保存先の接尾辞はすべて stage1_arms.ARMS から決める（唯一の出所）
+        if (args.kernel is not None or args.clock or args.rate_lam != RATE_LAM
+                or args.rate_gamma != RATE_SNR_GAMMA or args.rate_mode != RATE_MODE):
+            ap.error("--arm は --kernel / --clock / --rate-lam / --rate-gamma / --rate-mode と併用できない")
+        arms = _load_module("simple_stage1_arms", Path(__file__).resolve().parent / "stage1_arms.py")
+        if args.arm not in arms.ARMS:
+            ap.error(f"未知の arm: {args.arm}（既知: {sorted(arms.ARMS)}）")
+        arm_spec = arms.ARMS[args.arm]
+        if seed == SEED and arm_spec.legacy_seed42_tag is not None:
+            ap.error(f"arm {args.arm} の種 {SEED} は既存の本編（{arm_spec.legacy_seed42_tag}）を指す。"
+                     "上書きしないよう学習を禁止している")
+        arch = ArchSpec(**arm_spec.arch)
+        rate_lam, rate_mode = arm_spec.rate_lam, arm_spec.rate_mode
+        suffix = arms.arm_suffix(args.arm, seed)
+    else:
+        arch = ArchSpec(clock_kind="harmonic") if args.clock else ArchSpec()
+        suffix = ""
+        if args.kernel is not None:
+            # ★モデル構築より前に差し替える。UNet1D/ResBlock1D は __init__ で
+            #   モジュール変数 KERNEL_SIZE を読むため、ここで決めた値が全層に効く。
+            KERNEL_SIZE = args.kernel
+            # --kernel を明示した実行は、値が 3 でもアブレーションとして別名に隔離する。
+            # スイープ一式を同じ規則で並べられるようにするため。
+            suffix += f"_k{args.kernel}"
+        if args.clock:
+            suffix += "_clock"
+        if args.rate_lam > 0.0:
+            # ★jobs/train_ddpm_simple_clock.sh は同じ名前を printf '%g' で組む。書式を揃えること
+            mode_tag = "" if args.rate_mode == "batch" else args.rate_mode
+            suffix += f"_{mode_tag}rate{args.rate_lam:g}"
+            if args.rate_gamma != RATE_SNR_GAMMA:
+                suffix += f"g{args.rate_gamma:g}"
+        if args.seed is not None:
+            suffix += f"_s{args.seed}"
     if suffix:
         MODEL_SAVE_PATH = MODEL_SAVE_PATH.with_name(
             f"{MODEL_SAVE_PATH.stem}{suffix}{MODEL_SAVE_PATH.suffix}")
         GEN_SAVE_PATH = GEN_SAVE_PATH.with_name(
             f"{GEN_SAVE_PATH.stem}{suffix}{GEN_SAVE_PATH.suffix}")
+    print(f"[config] arm={args.arm}")
     print(f"[config] kernel_size={KERNEL_SIZE}")
-    arch = ArchSpec(clock_kind="harmonic") if args.clock else ArchSpec()
     print(f"[config] arch={arch}")
     print(f"[config] seed={seed}")
-    print(f"[config] rate_lam={args.rate_lam:g} rate_gamma={args.rate_gamma:g} "
-          f"rate_mode={args.rate_mode}")
+    print(f"[config] rate_lam={rate_lam:g} rate_gamma={rate_gamma:g} rate_mode={rate_mode}")
     print(f"[config] ckpt={MODEL_SAVE_PATH.name}")
     print(f"[config] gen ={GEN_SAVE_PATH.name}")
 
     smoke_test()
     if args.smoke:
         model = train(epochs=5, use_wandb=False, save_path=None, arch=arch, seed=seed,
-                      rate_lam=args.rate_lam, rate_gamma=args.rate_gamma,
-                      rate_mode=args.rate_mode)
+                      rate_lam=rate_lam, rate_gamma=rate_gamma, rate_mode=rate_mode)
         # DDIM が無いので生成は 1000 ステップ固定。群あたり 2 本に絞って回す。
         # 暗記チェックは参照集合に対してプールが小さすぎるので飛ばす
         sanity_check(model, n_per_group=2, save_path=None, with_memorization=False)
@@ -2089,6 +2125,5 @@ if __name__ == "__main__":
         #   束縛済みで、上の再代入では差し替わらないため。
         model = train(epochs=args.epochs, use_wandb=not args.no_wandb,
                       save_path=MODEL_SAVE_PATH, arch=arch, seed=seed,
-                      rate_lam=args.rate_lam, rate_gamma=args.rate_gamma,
-                      rate_mode=args.rate_mode)
+                      rate_lam=rate_lam, rate_gamma=rate_gamma, rate_mode=rate_mode)
         sanity_check(model, save_path=GEN_SAVE_PATH)
