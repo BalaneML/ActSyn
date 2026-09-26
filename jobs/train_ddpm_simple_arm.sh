@@ -42,7 +42,7 @@ esac
 # 保存先の接尾辞を arm の表から引く。未知の arm はここで止まる
 SUFFIX="$(singularity exec "${SIF}" python -c "
 import sys
-sys.path.insert(0, 'src/models/DDPM_Aggregate_Simple')
+sys.path.insert(0, '${REPO}/src/models/DDPM_Aggregate_Simple')
 import stage1_arms
 print(stage1_arms.arm_suffix('${ARM}', ${SEED}))
 ")" || { echo "ERROR: arm_suffix を引けない（ARM=${ARM}）" >&2; exit 1; }
