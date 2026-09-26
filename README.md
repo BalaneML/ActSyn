@@ -309,7 +309,7 @@ uv run python src/models/DDPM_Aggregate_Simple/test_stage2.py
 │   │   ├── DDPM_Aggregate_Tang/            Tang et al. 2025 バックボーン
 │   │   ├── DDPM_Aggregate_DiT/             DiT バックボーン
 │   │   └── DDPM_Aggregate_Simple/          簡素版 + Stage2 パラメータ微調整一式
-│   └── eval/                               個票指標 / 実現可能性 / 時計診断（モデル非依存）
+│   └── eval/                               個票指標 / 実現可能性 / 時刻符号診断（モデル非依存）
 ├── jobs/                                   SQUID (PBS) ジョブスクリプト
 │   ├── train_ddpm_simple_stage2.sh      Stage 2 の学習（約 3.2 時間）
 │   └── eval_stage2_select.sh            Stage 2 の事後選択（生成に 1〜4 時間）

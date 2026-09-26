@@ -7,7 +7,7 @@
 #PBS -r n
 #PBS -m e
 #
-# 時計アブレーション（AggDDPM-Simple の UNet1D に 24 時間の時計だけを足す）。
+# 時刻符号アブレーション（AggDDPM-Simple の UNet1D に 24 時間の時刻符号だけを足す）。
 #
 # 問い: Stage 1 が ATUS 自身の鋭い日内リズム（正午の食事ピーク・昼休みの仕事の凹み）を
 #       半分に鈍らせるのは、「何時か」を表す経路がバックボーンに無いからか。
@@ -28,9 +28,9 @@
 # 投入手順:
 #   jobs/submit.sh jobs/train_ddpm_simple_clock.sh
 #
-# 学習の種による反復（時計の効果を種のばらつきから切り分ける）:
-#   CLOCK=1 SEED=43 jobs/submit.sh -v CLOCK,SEED jobs/train_ddpm_simple_clock.sh   # 時計つき・種43
-#   CLOCK=0 SEED=43 jobs/submit.sh -v CLOCK,SEED jobs/train_ddpm_simple_clock.sh   # 時計なし・種43
+# 学習の種による反復（時刻符号の効果を種のばらつきから切り分ける）:
+#   CLOCK=1 SEED=43 jobs/submit.sh -v CLOCK,SEED jobs/train_ddpm_simple_clock.sh   # 時刻符号つき・種43
+#   CLOCK=0 SEED=43 jobs/submit.sh -v CLOCK,SEED jobs/train_ddpm_simple_clock.sh   # 時刻符号なし・種43
 #   SEED は学習の乱数だけを変え、学習/評価の分割は変えない（model.py の --seed）。
 #   保存先は model.py と同じ規則で _clock / _s{SEED} が付く。SEED 未指定は種42（本編と同じ）。
 #   ★CLOCK=0 かつ SEED 未指定は本編の再学習になり保存先が本編と重なるので、このジョブでは弾く
@@ -41,12 +41,12 @@
 #   .venv/bin/python src/eval/clock_diagnostics.py --model-dir src/models/DDPM_Aggregate_Simple \
 #       --ckpt outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_clock.pt \
 #       --gen outputs/generated/ddpm_simple_pretrain_samples_clock.csv --tag clock
-#   基準（時計なし）は同じ手順を 20260819 版に掛けた
+#   基準（時刻符号なし）は同じ手順を 20260819 版に掛けた
 #   data/processed/aggregates/ddpm_clock_diagnostics_DDPM_Aggregate_Simple_20260819.csv
 #
 # elapstim_req=01:30:00 の根拠:
 #   同一構成の本学習 (job 1120951) と kernel スイープ (k=3) が実測 7 分。
-#   時計は 11 個の Linear(8, c_out) だけで計算量はほぼ変わらない。
+#   時刻符号は 11 個の Linear(8, c_out) だけで計算量はほぼ変わらない。
 #   train_ddpm_simple_kernel.sh と同じ枠を取る。
 
 cd "${PBS_O_WORKDIR}"

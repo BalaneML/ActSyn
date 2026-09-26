@@ -42,10 +42,10 @@
 #   例: EPS=0.01 jobs/submit.sh -v EPS jobs/train_ddpm_simple_stage2.sh     # 主B（χ²）
 #       RESUME=1 jobs/submit.sh -v RESUME jobs/train_ddpm_simple_stage2.sh  # 途中から再開
 #
-#   時計つきの Stage 1（jobs/train_ddpm_simple_clock.sh の出力）から始める:
+#   時刻符号つきの Stage 1（jobs/train_ddpm_simple_clock.sh の出力）から始める:
 #       STAGE1=outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_clock.pt LAM=0.003 \
 #           jobs/submit.sh -v STAGE1,LAM jobs/train_ddpm_simple_stage2.sh
-#     保存先は自動で stage2_lam0.003_clock になる（時計なしの stage2_lam0.003 を踏まない）。
+#     保存先は自動で stage2_lam0.003_clock になる（時刻符号なしの stage2_lam0.003 を踏まない）。
 #     STAGE1 は ${REPO} 起点の相対パスでなく絶対パスで渡すと確実。
 #     層別学習率は LR_COND / LR_EMB / LR_CONV / LR_CLOCK で上書きできる（-v に並べる）
 #
@@ -98,7 +98,7 @@ esac
 STAGE1_DEFAULT="${REPO}/outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_20260819.pt"
 STAGE1="${STAGE1:-${STAGE1_DEFAULT}}"
 # ★既定以外の Stage 1 から始めるときは、保存先に Stage 1 の識別子を付ける
-#   （..._weekday_clock.pt なら _clock）。付けないと時計つきの λ=0.003 が時計なしの
+#   （..._weekday_clock.pt なら _clock）。付けないと時刻符号つきの λ=0.003 が時刻符号なしの
 #   stage2_lam0.003 に書き込み、下の「過去の世代を退避」で既存の結果を動かしてしまう
 STAGE1_TAG=""
 if [ "${STAGE1}" != "${STAGE1_DEFAULT}" ]; then

@@ -1753,9 +1753,9 @@ def test_grad_norms() -> None:
 
 
 def test_clock_param_group() -> None:
-    """(ck) 時計つきの Stage 1 では clock 群が 4 つ目の層別 LR 群として立つこと。
+    """(ck) 時刻符号つきの Stage 1 では clock 群が 4 つ目の層別 LR 群として立つこと。
 
-    ★時計なしモデルは従来の 3 群のまま（test_layered_lr が固定）。時計つきでは
+    ★時刻符号なしモデルは従来の 3 群のまま（test_layered_lr が固定）。時刻符号つきでは
       clock_proj だけが clock 群に入り、conv へ混ざらないこと、grad_norms が
       agg_gnorm_clock を出すこと、群名を持たない optimizer を黙って読まないことを固定する。
     """
@@ -1774,7 +1774,7 @@ def test_clock_param_group() -> None:
         "clock_proj が conv 群へ混入している"
     n_clock = sum(p.numel() for p in groups[ft.CLOCK_GROUP_NAME])
     assert n_clock == 10_944, f"clock_proj のパラメータ数が想定と違う: {n_clock}"
-    # 時計以外の 3 群は時計なしモデルと同じ大きさ
+    # 時刻符号以外の 3 群は時刻符号なしモデルと同じ大きさ
     base_groups = ft.split_param_groups(_model())
     for k in ft.PARAM_GROUP_NAMES:
         assert sum(p.numel() for p in groups[k]) == sum(p.numel() for p in base_groups[k]), k

@@ -1,11 +1,11 @@
 """
 stage1_clock_replicates.py
 ==========================
-Stage 1 の時計アブレーションを、学習の種の反復で読む。
+Stage 1 の時刻符号アブレーションを、学習の種の反復で読む。
 
-時計つき（`model.py --clock`）と時計なしの Stage 1 は、時計の有無だけでなく
-学習の乱数列も違う（時計の nn.Linear が初期化で乱数を消費するため）。1 本ずつの比較では
-「時計の効果」と「種のばらつき」を分けられない。そこで両群を同じ種の組
+時刻符号つき（`model.py --clock`）と時刻符号なしの Stage 1 は、時刻符号の有無だけでなく
+学習の乱数列も違う（時刻符号の nn.Linear が初期化で乱数を消費するため）。1 本ずつの比較では
+「時刻符号の効果」と「種のばらつき」を分けられない。そこで両群を同じ種の組
 （既定 42 / 43 / 44）で学習し、指標ごとに群の平均・標準偏差と、2 群が完全に分離したかを出す。
 
     arm      seed  生成プール（model.sanity_check が書く CSV, 群一様 28 群 × 256 本）
@@ -62,7 +62,7 @@ SIMPLE_DIR = REPO_ROOT / "src" / "models" / "DDPM_Aggregate_Simple"
 GEN_DIR = REPO_ROOT / "outputs" / "generated"
 OUT_CSV = REPO_ROOT / "data" / "processed" / "aggregates" / "stage1_clock_replicates.csv"
 
-# 本編の時計なし・種42。kernel スイープの k=3 がこのプールの指標を完全再現している
+# 本編の時刻符号なし・種42。kernel スイープの k=3 がこのプールの指標を完全再現している
 BASELINE_SEED = 42
 BASELINE_NOCLOCK_CSV = GEN_DIR / "ddpm_simple_pretrain_samples_20260819.csv"
 

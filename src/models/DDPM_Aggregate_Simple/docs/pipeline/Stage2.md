@@ -5,7 +5,8 @@
 置き換えたものである。設計上の根拠は [Stage2_design.md](../Stage2_design.md)、
 実装判断の根拠表は [Stage2_implementation.md](../Stage2_implementation.md) §3 に残してある。
 
-**関連**: [Stage 1 の処理の流れ](./Stage1.md)
+**関連**: [2 段学習の全体像](./Overview.md)（論文 概要図の下敷き） ／
+[Stage 1 の処理の流れ](./Stage1.md)
 
 図中の識別子はすべてコード中の実名である。モジュール別名は `stage2_finetune.py` の
 `_load()` が付けるものと同じ（`sm`=`model`, `st`=`stage2_targets`, `sl`=`stage2_loss`,
@@ -21,14 +22,14 @@ flowchart TB
     subgraph INIT["初期化 :541-621"]
         direction TB
         I0["check_shapes(K, d_sub, n) :232<br/>K&gt;=1 / D_sub&gt;=1 / n が2以上の偶数か<br/>★生成を1回でも回す前に落とす (本番の1更新は約40秒)"]
-        I1["model = sm.load_pretrained(STAGE1_CKPT) :561<br/>ddpm_simple_pretrain_common12_weekday_20260819.pt<br/>1,759,124 params すべて学習対象 (凍結しない)"]
-        I2["optimizer = build_optimizer(model) :200<br/>split_param_groups :171 が3群へ分ける<br/>cond 4,680 (0.27%) = cond_embeds+cond_proj+null_emb → LR_COND=1e-4<br/>emb 312,512 (17.8%) = emb_proj → LR_EMB=2e-5 ★時刻と条件の共有注入路<br/>conv 1,441,932 (82.0%) → LR_CONV=1e-5<br/>AdamW(weight_decay=0.0)"]
+        I1["model = sm.load_pretrained(STAGE1_CKPT) :561<br/>ddpm_simple_pretrain_common12_weekday_20260819.pt<br/>1,759,124 params すべて学習対象 (凍結しない)<br/>時刻符号つき (_clock.pt) なら state_has_clock が構造を合わせ 1,770,068 params"]
+        I2["optimizer = build_optimizer(model, lr_cond, lr_emb, lr_conv, lr_clock)<br/>split_param_groups が3群 (時刻符号つきは4群) へ分ける<br/>cond 4,680 (0.27%) = cond_embeds+cond_proj+null_emb → LR_COND=1e-4<br/>emb 312,512 (17.8%) = emb_proj → LR_EMB=2e-5 ★拡散ステップと条件の共有注入路<br/>clock 10,944 = clock_proj → LR_CLOCK=1e-4 ★時刻符号つきのときだけ<br/>conv 1,441,932 (82.0%) → LR_CONV=1e-5<br/>各 param_group に name キー。AdamW(weight_decay=0.0)"]
         I3["tgt = st.load_stula_targets() :554<br/>data/processed/stula/timeband_weekday.csv<br/>group_rates_tbl (28,12,96) と pop (2,7,2)"]
         I4["a_star_all = sl.teacher_tensor(tgt, dev) :555 → (28,12,96)<br/>omega_all = sl.chi2_weights(a_star_all, eps) :556<br/>eps=inf なら全て1 (主A の素の MSE)、有限なら 1/(A*+eps) を平均1に正規化 (主B の χ²)"]
         I5["teacher_mask = build_teacher_mask(holdout) :140<br/>(28,) bool。held-out 群だけ False<br/>teacher_groups = flatnonzero(teacher_mask)"]
         I6["chunk = resolve_chunk(K, d_sub, n, chunk) :274<br/>check_memory_budget :260 で K*chunk が MEMORY_BUDGET=6600 以下か検査<br/>★loss=jsd は chunk を使えないので K*B で測り直す :549"]
         I7["rng = np.random.default_rng(seed) :579<br/>★群サブサンプリング専用の乱数源。torch とは別で、<br/>再開時は ck.load_ckpt(np_rng=rng) が戻す"]
-        I8["atus = atus_batches() :583<br/>sm.make_loaders の train_loader を無限に回す<br/>val_loader は val_epsilon_mse :453 が使う"]
+        I8["atus = atus_batches() :583<br/>sm.make_loaders の train_loader を無限に回す<br/>val_loader は val_epsilon_mse :453 が使う<br/>★--rehearsal tilt のときは先に tilted_rehearsal_weights で<br/>学習分割の重みを群ごとに A* へ傾ける（stage2_tilt.fit_tilt。held-out 群・val は元のまま）"]
         I9["grid = sm.cond_grid() :578 → (28,3)<br/>base_config :601 に stage1_ckpt / lr_cond / lr_emb / lr_conv / guidance_scale を入れる"]
     end
 
@@ -69,14 +70,14 @@ flowchart TB
             BR -->|"no"| TWO
         end
 
-        GN1["agg_gnorm = grad_norms(optimizer, 'agg') :640 / :494<br/>cond / emb / conv の3群それぞれの L2 ノルム<br/>★straight_through と clamp を抜けて来たかを見る唯一の量。<br/>実測では λ=auto のとき集計は更新方向の 3.4% しか占めない"]
+        GN1["agg_gnorm = grad_norms(optimizer, 'agg')<br/>cond / emb / (clock) / conv の群ごとの L2 ノルム。群名は param_group の name で読む<br/>★straight_through と clamp を抜けて来たかを見る唯一の量。<br/>実測では λ=auto のとき集計は更新方向の 3.4% しか占めない"]
 
         subgraph REH["リハーサル側 (train モード。Stage 1 と同じ損失)"]
             direction TB
             H1["model.train() :645<br/>b_cond, b_sched = next(atus) — ATUS 個票 256 本"]
             H2["l_atus = diffusion.loss(model, b_sched, b_cond) :647<br/>ε-MSE + CFG 条件dropout (Stage1 図② と同一の関数)"]
             H3["lam_auto なら lam_samples へ (|l_agg|, l_atus) を積み :653-666<br/>LAM_WARMUP_STEPS=5 更新の中央値の比で lam を決めて固定<br/>★--resume では ckpt の lam を引き継ぎ、再推定しない :591-597<br/>★実測 cos(g_agg, g_atus) = −0.27。2つの勾配は逆を向いている"]
-            H4["(lam * l_atus).backward() :668"]
+            H4["tug = add_rehearsal_grad(params, lam * l_atus)<br/>g_agg を退避 → λ·g_atus を逆伝播 → 足し戻す（従来とビット一致）<br/>tug_cos = cos(g_agg, λ·g_atus)、tug_ratio を記録"]
             H1 --> H2 --> H3 --> H4
         end
 
@@ -131,6 +132,13 @@ flowchart TB
   `timestep_embedding(t) + embed_cond(...)` という **和** を受け取るので条件専用ではない。
   群ごとに違う値を持つのは `cond` 群の 4,680 params（全体の 0.27%）だけで、
   日米差の 64.2%（`dev` 成分）を動かせるのはそこである。
+- **時刻符号つきの Stage 1（`model.py --clock`）では 4 群目 `clock`** が立つ（`clock_proj` 10,944 params、
+  `LR_CLOCK=1e-4`）。`cond` と `emb` は全スロットに同じ値を足すので、「何時に」を動かせる経路は
+  `clock` だけである。時刻符号なしの λ=0.003 step200 では、残差のうち周期 8h 以下の成分が
+  2.2〜2.6% しか埋まらなかった（`stage2_curves.band_closure_table`）。
+  `agg_gnorm_clock` が 0 に張り付くなら、集計勾配は時刻符号を使っていない。
+- 層別 LR は `--lr-cond / --lr-emb / --lr-conv / --lr-clock` で上書きでき、`base_config` に
+  `lr_*` と `stage1_clock` として残る（時刻符号なしでは `lr_clock` は NaN）。
 - 設計判断（12 チャネルのまま再正規化しない／split-batch 不偏推定／群は等重み／早期終了なし）
   の根拠は [Stage2_implementation.md](../Stage2_implementation.md) §3 の表を参照する。
 

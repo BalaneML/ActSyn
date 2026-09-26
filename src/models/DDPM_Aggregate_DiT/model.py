@@ -22,7 +22,7 @@ AggDDPM の denoiser を Diffusion Transformer (DiT) に置き換えたバック
         一切使わず、96 スロット全体を最初の層から self-attention で見る。
         断片化（実 12.64 に対する生成の平均切替回数）が畳み込みの局所性に
         依存していたのかを切り分けられる。
-    - DiT は位置符号を持つ。現行 AggDDPM に欠けている「時計」
+    - DiT は位置符号を持つ。現行 AggDDPM に欠けている「時刻符号」
         (src/eval/clock_diagnostics.py が診断中の問題) が Tang と同様に解消される。
 
 DiT の構成 (Peebles & Xie Fig.3):

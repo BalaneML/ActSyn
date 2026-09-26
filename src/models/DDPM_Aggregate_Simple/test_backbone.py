@@ -18,7 +18,7 @@ DDPM_Aggregate からずれていないか」を検証する:
     7. 逆過程       : T を短くした ancestral が最後まで走り、正しい範囲のラベルを返す
     8. 原本との差分 : ★DDPM_Aggregate.UNet1D との違いが time_mlp だけであること。
                      自己完結（コピー）なので、意図しない差分が混入していないかを固定する
-    9. 時計 (--clock) : φ の直交性、零初期化の時点で時計なしと出力が一致すること、
+    9. 時刻符号 (--clock) : φ の直交性、零初期化の時点で時刻符号なしと出力が一致すること、
                      解像度 96/48/24 の位置の対応、保存して読み直したときの構造
    10. 反復 (--seed) : 学習の乱数だけを変え、学習/評価の分割は SEED で固定のまま
    11. 行動者率の項 (--rate-lam) : ★loss() が従来の式と厳密に一致すること（Stage 2 が呼ぶ）、
@@ -257,14 +257,14 @@ def test_diff_against_baseline():
 
 
 def test_clock():
-    """★--clock の契約（時計つき UNet1D）。
+    """★--clock の契約（時刻符号つき UNet1D）。
 
     (a) φ は 8 行 × 96 スロットで、行どうしが直交する（離散フーリエの直交性 φφᵀ = 48·I）
     (b) 追加されるパラメータは 11 個の clock_proj だけ
-    (c) 零初期化の時点では、時計なしのモデルと出力がビット単位で一致する
+    (c) 零初期化の時点では、時刻符号なしのモデルと出力がビット単位で一致する
     (d) clock_proj を動かすと出力が変わり、48 解像度のバイアスは 96 解像度を 2 つおきに
         取ったものと一致する（ds1 の出力位置 j がスロット 2j にあたるという規約）
-    (e) 保存して load_pretrained で読むと、時計つきの構造で組み直される
+    (e) 保存して load_pretrained で読むと、時刻符号つきの構造で組み直される
     """
     import tempfile
 
@@ -288,7 +288,7 @@ def test_clock():
     assert not sm.state_has_clock(base.state_dict()) and sm.state_has_clock(clk.state_dict())
     n_extra = sum(p.numel() for p in clk.parameters()) - sum(p.numel() for p in base.parameters())
 
-    # (c) 零初期化の時点で一致。時計なしの重みを時計つきへ流し込み、clock_proj は零のまま
+    # (c) 零初期化の時点で一致。時刻符号なしの重みを時刻符号つきへ流し込み、clock_proj は零のまま
     missing, unexpected = clk.load_state_dict(base.state_dict(), strict=False)
     assert not unexpected and set(missing) == only_clk
     _wake_up(base)
@@ -296,7 +296,7 @@ def test_clock():
     x, t, c = _inputs()
     with torch.no_grad():
         y_base, y_clk = base(x, t, c), clk(x, t, c)
-    assert torch.equal(y_base, y_clk), "零初期化の時計つきが時計なしと一致しない"
+    assert torch.equal(y_base, y_clk), "零初期化の時刻符号つきが時刻符号なしと一致しない"
 
     # (d) clock_proj を動かすと出力が変わる。解像度間の位置の対応
     g = torch.Generator().manual_seed(1)
@@ -310,18 +310,18 @@ def test_clock():
     assert b96.shape == (1, sm.BASE_CH, 96) and b48.shape == (1, sm.BASE_CH, 48)
     assert torch.allclose(b48, b96[:, :, ::2]) and torch.allclose(b24, b96[:, :, ::4])
 
-    # (e) 保存 -> load_pretrained / build_unet_for_ckpt で時計つきの構造に戻る
+    # (e) 保存 -> load_pretrained / build_unet_for_ckpt で時刻符号つきの構造に戻る
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "clock.pt"
         torch.save({"model": clk.state_dict(), "config": {"clock": True}}, path)
         loaded = sm.load_pretrained(path).to(DEVICE)
         assert loaded.clock and sm.build_unet_for_ckpt(path).clock
         with torch.no_grad():
-            assert torch.equal(loaded(x, t, c), y_moved), "読み直した時計つきの出力が変わった"
+            assert torch.equal(loaded(x, t, c), y_moved), "読み直した時刻符号つきの出力が変わった"
         torch.save({"model": base.state_dict()}, path)      # config の無い古い形式
         assert not sm.load_pretrained(path).clock
 
-    print(f"  9. 時計 (φ 直交・零初期化で一致・解像度の対応・読み直し, +{n_extra:,} params): OK")
+    print(f"  9. 時刻符号 (φ 直交・零初期化で一致・解像度の対応・読み直し, +{n_extra:,} params): OK")
 
 
 def test_seed_keeps_split():

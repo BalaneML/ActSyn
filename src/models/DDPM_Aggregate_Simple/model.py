@@ -15,7 +15,7 @@ model.py
         --no-wandb   : wandb ログを無効化
         --smoke      : 形状・整合の確認だけを短時間で回す
         --kernel K   : 畳み込みの受容野（アブレーション。保存先に _k{K}）
-        --clock      : 全 ResBlock1D に 24 時間の時計を足す（アブレーション。保存先に _clock）
+        --clock      : 全 ResBlock1D に 24 時間の時刻符号を足す（アブレーション。保存先に _clock）
         --seed S     : 学習の乱数の種。分割は変えない（反復実験。保存先に _s{S}）
         --rate-lam L : 行動者率の偏りの項 L_rate の重み（既定 0 = 従来の損失。保存先に _rate{L}）
         --rate-gamma G : L_rate の重み v(t) の頭打ち（既定 1.0。既定以外は保存先に g{G}）
@@ -111,10 +111,10 @@ KERNEL_SIZE = 3
 # ★時刻埋め込みの次元。sinusoidal をこの次元で直接作り、MLP を通さずに足す。
 #   条件埋め込み (cond_proj) の出力次元と null_emb の次元もこれに揃う
 TIME_EMB_DIM = 256
-# ★24 時間の時計（--clock のときだけ使う）。スロット s の位相 2πs/96 のフーリエ特徴を
+# ★24 時間の時刻符号（--clock のときだけ使う）。スロット s の位相 2πs/96 のフーリエ特徴を
 #   調和次数 k=1..CLOCK_HARMONICS（周期 24h, 12h, 8h, 6h）で作り、各 ResBlock1D へ
 #   スロットごとに違う値のバイアスとして足す。条件は emb_proj で全スロット同じ値として
-#   足されるので、時計が無いと「何時に」を表す経路が無い（clock_diagnostics の B4）。
+#   足されるので、時刻符号が無いと「何時に」を表す経路が無い（clock_diagnostics の B4）。
 #   周期 24h の関数なので左端 04:00 と右端の翌 04:00 がつながる（活動日は環）
 CLOCK_HARMONICS = 4
 CLOCK_DIM = 2 * CLOCK_HARMONICS
@@ -341,7 +341,7 @@ class ResBlock1D(nn.Module):
         1. GroupNorm -> SiLU -> Conv1d の pre-activation 構成を2段重ね, 入力を残差加算する
         2. emb を emb_proj で c_out 次元へ落とし、チャネル毎バイアスとして時間軸一様に加算する
         3. 時間長Lは変えない (padding = KERNEL_SIZE // 2)
-        4. clock=True のときだけ、時計 φ を clock_proj で c_out 次元へ落とし、
+        4. clock=True のときだけ、時刻符号 φ を clock_proj で c_out 次元へ落とし、
            スロットごとに違う値のバイアスとして 2. と同じ位置に加算する
     """
     # clock=True のときだけ register_buffer で作る。型チェッカに Tensor と伝えるための宣言
@@ -355,7 +355,7 @@ class ResBlock1D(nn.Module):
             c_in: 入力チャネル数, GroupNorm(8, c_in) のため8の倍数
             c_out: 出力チャネル数, 8の倍数, c_in と異なるとき skip は 1x1 conv になる
             emb_dim: 条件埋め込みの次元, default=TIME_EMB_DIM=256
-            clock: 24 時間の時計を足すか, default=False (従来の構造)
+            clock: 24 時間の時刻符号を足すか, default=False (従来の構造)
         """
         super().__init__()
         k, pad = KERNEL_SIZE, KERNEL_SIZE // 2
@@ -371,8 +371,8 @@ class ResBlock1D(nn.Module):
 
         # ★clock=False では nn.Linear を作らないので、乱数の消費も層の初期値も従来と同じ。
         #   clock=True では nn.Linear の初期化が乱数を消費するため、後続ブロックの初期値は
-        #   時計なしのモデルと一致しない（新しく学習するモデルなので問題にしない）。
-        # ★零初期化。学習前の出力は時計なしの構造と一致する（test_backbone で検証）
+        #   時刻符号なしのモデルと一致しない（新しく学習するモデルなので問題にしない）。
+        # ★零初期化。学習前の出力は時刻符号なしの構造と一致する（test_backbone で検証）
         self.clock_proj: nn.Linear | None = None
         if clock:
             self.register_buffer("clock_phi", clock_features(), persistent=False)
@@ -381,7 +381,7 @@ class ResBlock1D(nn.Module):
             nn.init.zeros_(self.clock_proj.bias)
 
     def clock_bias(self, length: int) -> torch.Tensor:
-        """時計のバイアスを解像度 length で返す, -> (1, c_out, length)
+        """時刻符号のバイアスを解像度 length で返す, -> (1, c_out, length)
 
         Note:
             ★φ は 96 スロットで作ってあり、stride = 96 // length で間引く。
@@ -395,11 +395,11 @@ class ResBlock1D(nn.Module):
             スロットごとのバイアス, dtype=float32, (1, c_out, length)
 
         Raises:
-            RuntimeError: 時計を持たないブロックで呼んだとき
+            RuntimeError: 時刻符号を持たないブロックで呼んだとき
             ValueError: length が NUM_SLOTS を割り切らないとき
         """
         if self.clock_proj is None:
-            raise RuntimeError("clock=False の ResBlock1D には時計が無い")
+            raise RuntimeError("clock=False の ResBlock1D には時刻符号が無い")
         if NUM_SLOTS % length != 0:
             raise ValueError(f"時間長 {length} が NUM_SLOTS={NUM_SLOTS} を割り切らない")
         phi = self.clock_phi[:, ::NUM_SLOTS // length]          # (CLOCK_DIM, L)
@@ -459,7 +459,7 @@ class UNet1D(nn.Module):
         """UNet1D の層を構築する。
 
         Args:
-            clock: 全 ResBlock1D (11 個) に 24 時間の時計を足すか, default=False (従来の構造)。
+            clock: 全 ResBlock1D (11 個) に 24 時間の時刻符号を足すか, default=False (従来の構造)。
                 True でも零初期化なので、学習前の出力は False と一致する
         """
         super().__init__()
@@ -1092,7 +1092,7 @@ def train(epochs: int = EPOCHS,
         epochs: 学習エポック数の上限, default=EPOCHS=1000
         use_wandb: wandbへハイパラと学習曲線を記録するか, default=True
         save_path: チェックポイントの保存先, Noneなら保存しない
-        clock: UNet1D に 24 時間の時計を足すか, default=False
+        clock: UNet1D に 24 時間の時刻符号を足すか, default=False
         seed: 学習の乱数の種（初期値・ミニバッチ・t・ε）, default=SEED=42。
             学習/評価の分割は split_indices が SEED で固定するので、この値では変わらない
         rate_lam: 行動者率の偏りの項 L_rate の重み, 0 以上, default=RATE_LAM=0.0 (従来の損失)
@@ -1193,7 +1193,7 @@ def train(epochs: int = EPOCHS,
 
 
 def state_has_clock(state: dict[str, torch.Tensor]) -> bool:
-    """重みの state_dict が時計つきの UNet1D のものかを返す
+    """重みの state_dict が時刻符号つきの UNet1D のものかを返す
 
     Note:
         ★構造の判定は重みのキーだけで行う。config を持たない古いチェックポイント
@@ -1218,7 +1218,7 @@ def build_unet_for_ckpt(path: Path) -> UNet1D:
         path: キー "model" に state_dict を持つチェックポイント
 
     Returns:
-        CPU 上の UNet1D。時計の有無は state_has_clock で決める
+        CPU 上の UNet1D。時刻符号の有無は state_has_clock で決める
     """
     # ★weights_only=False。Stage 2 の世代は RNG 状態と config を含む。自分で書いたファイルだけを読む
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
@@ -1230,7 +1230,7 @@ def load_pretrained(path: Path = MODEL_SAVE_PATH) -> nn.Module:
 
     ★EMA が無いので use_ema 引数も無い。重みはキー "model"、出所の記録はキー "config"
       （20260819 版など古いチェックポイントには config が無い）
-    ★時計の有無は重みのキーから決める（state_has_clock）
+    ★時刻符号の有無は重みのキーから決める（state_has_clock）
     """
     ckpt = torch.load(path, map_location=DEVICE)
     model = UNet1D(clock=state_has_clock(ckpt["model"])).to(DEVICE)
@@ -1576,7 +1576,7 @@ if __name__ == "__main__":
                          "既定の保存先に書く。明示するとアブレーション扱いになり、"
                          "保存先に _k{K} が付くので本編の成果物とは混ざらない")
     ap.add_argument("--clock", action="store_true",
-                    help="全 ResBlock1D に 24 時間の時計（clock_proj）を足す。"
+                    help="全 ResBlock1D に 24 時間の時刻符号（clock_proj）を足す。"
                          "アブレーション扱いで、保存先に _clock が付く")
     ap.add_argument("--seed", type=int, default=None,
                     help="学習の乱数の種（既定 SEED=42）。学習/評価の分割は変えない。"

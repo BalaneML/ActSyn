@@ -1,14 +1,14 @@
 """
 stage2_clock_compare.py
 =======================
-時計なし／時計つきの Stage 1 から始めた Stage 2 を、同じ物差しで並べる（関門 B）。
+時刻符号なし／時刻符号つきの Stage 1 から始めた Stage 2 を、同じ物差しで並べる（関門 B）。
 
-関門 B の問い: 時計つきの Stage 1 から始めると、Stage 2 は日本の教師 A* の
+関門 B の問い: 時刻符号つきの Stage 1 から始めると、Stage 2 は日本の教師 A* の
 **鋭い時刻構造**（周期 8 時間以下の成分。12:00 の昼食・7:00 の朝食・8:00 の通勤）を
-時計なしより多く埋めるか。そのとき系列の妥当性（ガードレール）を壊していないか。
+時刻符号なしより多く埋めるか。そのとき系列の妥当性（ガードレール）を壊していないか。
 
-★各 run は**自分の Stage 1 の zero-shot** を起点に測る。時計なしの step200 は時計なしの
-  zero-shot から、時計つきの step200 は時計つきの zero-shot から、どれだけ A* へ寄ったか。
+★各 run は**自分の Stage 1 の zero-shot** を起点に測る。時刻符号なしの step200 は時刻符号なしの
+  zero-shot から、時刻符号つきの step200 は時刻符号つきの zero-shot から、どれだけ A* へ寄ったか。
   起点を混ぜると「Stage 1 の差」と「Stage 2 で動いた量」が区別できない。
 
     run                 起点（zero-shot）                                  微調整後
@@ -53,6 +53,7 @@ flowchart TD
 """
 import argparse
 import importlib.util
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -160,11 +161,38 @@ def parse_run(spec: str) -> tuple[str, tuple[Path, Path, int]]:
     return name, (Path(zs), Path(ft), int(step))
 
 
+# run 名の接頭辞 -> 凡例に出す構造の呼び名
+ARCH_LABELS = {"clock": "時刻符号つき", "noclock": "時刻符号なし"}
+
+
+def legend_labels(run: str) -> tuple[str, str]:
+    """run 名から、図の凡例に出す (起点, 微調整後) の文言を作る。
+
+    Stage 1 だけで学習したモデルを Pre-trained、Stage 2 まで学習したモデルを Fine-tuned と呼ぶ。
+    CSV の run 列は run 名のまま残し、凡例だけをこの文言にする。
+
+    Args:
+        run: `{clock|noclock}_lam{λ}_s{step}` 形式の run 名（例: clock_lam0_s300）
+
+    Returns:
+        (起点の凡例, 微調整後の凡例)。
+        例: ("時刻符号つき Pre-trained", "時刻符号つき Fine-tuned (λ=0, step300)")。
+        ARCH_LABELS に無い接頭辞はそのまま使い、形式に合わない run 名は微調整後の凡例に run 名をそのまま使う
+    """
+    prefix = run.split("_lam")[0]
+    arch = ARCH_LABELS.get(prefix, prefix)
+    m = re.fullmatch(r"[a-z]+_lam(?P<lam>[0-9.]+)_s(?P<step>[0-9]+)", run)
+    if m is None:
+        return f"{arch} Pre-trained", run
+    return (f"{arch} Pre-trained",
+            f"{arch} Fine-tuned (λ={m['lam']}, step{m['step']})")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", action="append", default=[], metavar="NAME=ZS_NPZ,FT_NPZ,STEP",
-                    help="比較に足す run。既定の 2 本（時計なし/時計つきの λ=0.003 step200）に加わる")
+                    help="比較に足す run。既定の 2 本（時刻符号なし/時刻符号つきの λ=0.003 step200）に加わる")
     ap.add_argument("--out-csv", type=Path, default=OUT_CSV)
     ap.add_argument("--out-fig", type=Path, default=OUT_FIG)
     args = ap.parse_args()
@@ -186,8 +214,9 @@ def main() -> None:
         print(f"[compare] {run}: {zs_path.name} -> {ft_path.relative_to(REPO_ROOT) if ft_path.is_absolute() else ft_path}")
         c_zs = cur.weighted_slot_rates(cur.load_rates_npz(zs_path), tgt)
         c_ft = cur.weighted_slot_rates(cur.load_rates_npz(ft_path), tgt)
-        fig_curves.setdefault(f"{run.split('_lam')[0]} zero-shot", c_zs)
-        fig_curves[run] = c_ft
+        zs_label, ft_label = legend_labels(run)
+        fig_curves.setdefault(zs_label, c_zs)
+        fig_curves[ft_label] = c_ft
 
         bands = cur.band_closure_table({"zs": c_zs, "ft": c_ft}, teacher, "zs")
         for _, row in bands[bands.activity == "ALL"].iterrows():
@@ -219,8 +248,9 @@ def main() -> None:
     args.out_csv.parent.mkdir(parents=True, exist_ok=True)
     long.to_csv(args.out_csv, index=False)
     print(f"\n[compare] 縦持ちを書いた: {args.out_csv}")
+    # λ と step は凡例（run 名）に出る。--run で足した run もあるので題には書かない
     cur.plot_curves(teacher, fig_curves, args.out_fig,
-                    "人口加重平均の時刻別行動者率（時計なし vs 時計つき, λ=0.003 step200）",
+                    "人口加重平均の時刻別行動者率（時刻符号なし vs 時刻符号つき）",
                     refs={cur.ATUS_REAL_LABEL: atus})
     print(f"[compare] 図を書いた: {args.out_fig}")
 

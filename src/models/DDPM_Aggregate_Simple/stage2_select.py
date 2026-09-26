@@ -398,8 +398,8 @@ def evaluate_ckpt(path: Path, tgt: dict, sched_real: np.ndarray, d_real: np.ndar
         ★torch.manual_seed を ck.load_ckpt の **後** に置くこと。load_ckpt は学習時の
         RNG を復元する副作用を持つので、先に seed を置くと上書きされてしまう。
     """
-    # ★構造（時計の有無）はチェックポイントの重みから決める。sm.UNet1D() 固定だと
-    #   時計つきの世代で load_state_dict が Unexpected key で落ちる
+    # ★構造（時刻符号の有無）はチェックポイントの重みから決める。sm.UNet1D() 固定だと
+    #   時刻符号つきの世代で load_state_dict が Unexpected key で落ちる
     model = sm.build_unet_for_ckpt(path).to(device)
     step, config = ck.load_ckpt(path, model, map_location=device)
     holdout = list(config.get("holdout", []))
