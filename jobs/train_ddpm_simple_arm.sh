@@ -17,6 +17,8 @@
 # 投入:
 #   ARM=clock_h48 SEED=43 jobs/submit.sh -v ARM,SEED jobs/train_ddpm_simple_arm.sh
 #   for s in 42 43 44; do ARM=clock_h48 SEED=$s jobs/submit.sh -v ARM,SEED jobs/train_ddpm_simple_arm.sh; done
+#   学習だけ（生成は jobs/guidance_pool_simple.sh で別に行う）:
+#   ARM=clock_tf96 SEED=43 NO_POOL=1 jobs/submit.sh -v ARM,SEED,NO_POOL jobs/train_ddpm_simple_arm.sh
 #
 # 出力（${REPO} 配下）:
 #   outputs/checkpoints/ddpm_simple_pretrain_common12_weekday{接尾辞}.pt
@@ -34,6 +36,11 @@ source jobs/_common.sh
 ARM="${ARM:?ARM を指定すること（stage1_arms.ARMS のキー）}"
 SEED="${SEED:-42}"
 EPOCHS="${EPOCHS:-1000}"
+# 1 なら学習後の生成（sanity_check）を飛ばす。96 解像度の attention などで学習と生成が 10 分に収まらない
+# arm のため（2026-09-27: clock_tf96_rope_attn96 は生成の途中で打ち切られた）
+NO_POOL="${NO_POOL:-0}"
+EXTRA=()
+[ "${NO_POOL}" = "1" ] && EXTRA+=(--no-pool)
 
 case "${SEED}" in
     ''|*[!0-9]*) echo "ERROR: SEED は非負の整数（指定値: ${SEED}）" >&2; exit 1 ;;
@@ -91,7 +98,7 @@ done
 
 SECONDS=0
 run_gpu python src/models/DDPM_Aggregate_Simple/model.py \
-    --arm "${ARM}" --seed "${SEED}" --epochs "${EPOCHS}" >> "${LOG}" 2>&1
+    --arm "${ARM}" --seed "${SEED}" --epochs "${EPOCHS}" ${EXTRA[@]+"${EXTRA[@]}"} >> "${LOG}" 2>&1
 status=$?
 
 echo "elapsed: $((SECONDS / 60))m $((SECONDS % 60))s" | tee -a "${LOG}"
@@ -105,7 +112,9 @@ if [ -n "${BASE_STAMP}" ]; then
     fi
 fi
 
-for f in "${CKPT}" "${POOL}"; do
+EXPECTED=("${CKPT}")
+[ "${NO_POOL}" = "1" ] || EXPECTED+=("${POOL}")
+for f in "${EXPECTED[@]}"; do
     if [ -f "${f}" ]; then
         echo "saved: ${f} ($(du -h "${f}" | cut -f1))"
     else

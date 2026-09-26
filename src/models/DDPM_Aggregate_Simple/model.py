@@ -21,6 +21,7 @@ model.py
         --rate-gamma G : L_rate の重み v(t) の頭打ち（既定 1.0。既定以外は保存先に g{G}）
         --rate-mode M  : L_rate の偏りを平均する単位 batch / group / tbin / pop（既定 batch。
                          batch 以外は保存先の _rate{L} が _{M}rate{L} になる）
+        --no-pool      : 学習後の生成（sanity_check）を飛ばす。生成は stage1_guidance_pool.py で行う
         --arm NAME     : stage1_arms.ARMS の arm を学習する（構造・損失・保存先を表から決める。
                          上の構造・損失のフラグとは併用できない）
 
@@ -2029,6 +2030,10 @@ if __name__ == "__main__":
         description="AggDDPM-Simple: ATUS平日・共通12分類・28群の条件付き pretrain（簡素化版）")
     ap.add_argument("--epochs", type=int, default=EPOCHS)
     ap.add_argument("--no-wandb", action="store_true")
+    ap.add_argument("--no-pool", action="store_true",
+                    help="学習後の sanity_check（7,168 本の生成と暗記チェック）を飛ばす。"
+                         "生成は src/eval/diagnostics/stage1_guidance_pool.py で別に行う"
+                         "（DBG の 10 分枠に学習だけを収めるため）")
     ap.add_argument("--smoke", action="store_true", help="短時間の動作確認のみ")
     ap.add_argument("--kernel", type=int, default=None, choices=[1, 3, 5, 7],
                     help="畳み込みの受容野。省略すると本編の設定 (3) で"
@@ -2126,4 +2131,7 @@ if __name__ == "__main__":
         model = train(epochs=args.epochs, use_wandb=not args.no_wandb,
                       save_path=MODEL_SAVE_PATH, arch=arch, seed=seed,
                       rate_lam=rate_lam, rate_gamma=rate_gamma, rate_mode=rate_mode)
-        sanity_check(model, save_path=GEN_SAVE_PATH)
+        if args.no_pool:
+            print("[config] --no-pool: sanity_check（生成と暗記チェック）を飛ばした")
+        else:
+            sanity_check(model, save_path=GEN_SAVE_PATH)
