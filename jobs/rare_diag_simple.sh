@@ -12,6 +12,7 @@
 #
 #   MODE=restore      H5・H6。ATUS 平日の実個票を雑音水準 t0 まで進めてから戻す
 #   MODE=epoch-pools  H4。途中の ckpt（model.py --save-every）ごとに 64 人/群の小プールを作る
+#   MODE=final-continuous  H6 の補足。t0 = 999 の argmax 前の連続値をスロットごとに保存する
 #
 # 投入:
 #   for s in 42 43 44; do ARM=clock_tf96 SEED=$s MODE=restore \
@@ -24,6 +25,7 @@
 #
 # 出力（${REPO} 配下）:
 #   restore:      outputs/generated/ddpm_simple_restore{接尾辞}.npz
+#   final-continuous: outputs/generated/ddpm_simple_restore{接尾辞}_final.npz
 #   epoch-pools:  outputs/generated/ddpm_simple_pretrain_samples{接尾辞}_ep{epoch:04d}_n64.csv
 #                 （WITH_BEST=1 なら ..._best_n64.csv も）
 #
@@ -37,7 +39,7 @@ source jobs/_common.sh
 
 ARM="${ARM:?ARM を指定すること（stage1_arms.ARMS のキー）}"
 SEED="${SEED:?SEED を指定すること}"
-MODE="${MODE:?MODE を指定すること（restore / epoch-pools）}"
+MODE="${MODE:?MODE を指定すること（restore / epoch-pools / final-continuous）}"
 EVERY="${EVERY:-100}"
 EPOCHS_LIST="${EPOCHS_LIST:-}"
 WITH_BEST="${WITH_BEST:-0}"
@@ -45,7 +47,7 @@ LOG="${WORK}/logs/simple_rare_${MODE}_${ARM}_s${SEED}_${PBS_JOBID:-manual}.log"
 
 ARGS=(--mode "${MODE}" --arm "${ARM}" --seed "${SEED}")
 case "${MODE}" in
-    restore) ;;
+    restore|final-continuous) ;;
     epoch-pools)
         if [ -n "${EPOCHS_LIST}" ]; then
             # shellcheck disable=SC2206  # EPOCHS_LIST は空白区切りの epoch の並びとして展開する
@@ -55,7 +57,7 @@ case "${MODE}" in
         fi
         [ "${WITH_BEST}" = "1" ] && ARGS+=(--with-best)
         ;;
-    *) echo "ERROR: MODE は restore / epoch-pools（指定値: ${MODE}）" >&2; exit 1 ;;
+    *) echo "ERROR: MODE は restore / epoch-pools / final-continuous（指定値: ${MODE}）" >&2; exit 1 ;;
 esac
 
 {

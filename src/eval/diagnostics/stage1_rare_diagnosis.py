@@ -24,6 +24,17 @@ Stage 1 で少ない活動（買い物・介護・育児・移動・スポーツ
                H1 生成の乱数: 同じ ckpt の 2 プール（学習時・@g1.25）の差 vs 種の間の差
                H2 評価の加重: 総量の比を日本人口加重と ATUS ウェイトの群構成で出す
                H3 暗記: 行動者に絞った train までの距離（DCR）を、holdout の行動者の距離と比べる
+    restore    段 B。stage1_rare_diagnosis_gen --mode restore の結果を読む
+               H5 実個票を t0 まで雑音化して戻したとき、床を超える最小の t0（t*）で段階を分ける
+                  （t* ≤ 100: エピソードの長さ、t* ≥ 500: 誰が行動者か）
+               H6 最大の t0 で argmax 前の連続値の総量と argmax 後の総量を比べる
+    guidance   H7 CFG: clock_tf96 の guidance 1.0 と 1.25（同じ乱数）の差を、H1 のプール間の差と比べる
+    trajectory 段 C。H4 ckpt の選び方: 途中の ckpt の小プールで、最良 epoch 前後の種内の揺れと
+               種間の揺れを比べる（--best-epochs に学習ログの最良 epoch を渡す）
+    seeds      H8 K=4 と Transformer 型を種 5 本ずつで比べる（長時間の行動者の割合など）
+
+判定の閾値は計画で事前に固定したもの（H1_RATIO_THRESHOLD / FLOOR_Z / H5_T_* / H6_THRESHOLD / H4_WINDOW）。
+床 = ATUS の回答者を復元抽出したときの比の sd × FLOOR_Z。
 
 データフロー:
 
@@ -39,10 +50,21 @@ flowchart TD
     AP --> H2["h2_weighting<br/>日本人口加重 vs ATUS の群構成"]
     PP --> H3["h3_copies<br/>individual_metrics.memorization<br/>行動者だけの DCR"]
     SPLIT["model.split_indices<br/>train / holdout"] --> H3
+    NPZ["ddpm_simple_restore{接尾辞}.npz<br/>sched_out / soft_sum / raw_sum"] --> H5["h5_restore / h5_first_t0<br/>t0 ごとの比と t*"]
+    NPZ --> H6["h6_decoding<br/>argmax 前後の総量"]
+    BOOT["bootstrap_floor<br/>復元抽出の sd"] --> H5
+    EPP["gen.epoch_pools<br/>_ep{epoch:04d}_n64.csv"] --> H4["h4_trajectory<br/>種内 sd vs 種間 sd"]
+    AP --> H7["h7_guidance<br/>@g1 vs @g1.25"]
+    AP --> H8["h8_seeds<br/>種 5 本の完全分離"]
 ```
 
 使い方:
     .venv/bin/python src/eval/diagnostics/stage1_rare_diagnosis.py --part existing
+    .venv/bin/python src/eval/diagnostics/stage1_rare_diagnosis.py --part restore
+    .venv/bin/python src/eval/diagnostics/stage1_rare_diagnosis.py --part guidance
+    .venv/bin/python src/eval/diagnostics/stage1_rare_diagnosis.py --part trajectory \\
+        --best-epochs 42:612 43:658 44:700
+    .venv/bin/python src/eval/diagnostics/stage1_rare_diagnosis.py --part seeds
 """
 import argparse
 import importlib.util
@@ -66,6 +88,27 @@ DIAG_SEEDS: tuple[int, ...] = (42, 43, 44)
 H1_ARMS: tuple[str, ...] = ("clock", "clock_tf96")
 # H1 の判定: プール間の差 ≥ 種間 sd × この値なら「生成の乱数」を支持（計画で固定）
 H1_RATIO_THRESHOLD = 1.0 / 3.0
+
+# 段 B・C（計画で固定した判定の閾値）
+METRICS: tuple[str, ...] = ("level", "doer_share", "slots_per_doer", "episodes_per_person",
+                            "long_doer_share")
+RESTORE_ARMS: tuple[str, ...] = ("clock", "clock_tf96")
+ARM_LABELS: dict[str, str] = {"clock": "倍音 K=4", "clock_tf96": "Transformer 型"}
+# 床 = ATUS の回答者を復元抽出したときの比の sd × FLOOR_Z（約 95%）
+FLOOR_Z = 2.0
+N_BOOT = 200
+# H5: 床を超える最小の t0（t*）がこれ以下なら「エピソードの長さ」、これ以上なら「誰が行動者か」の段階
+H5_T_LOCAL = 100
+H5_T_GLOBAL = 500
+# H6: argmax 前の連続値の総量と argmax 後の総量の相対差がこれを超えたら離散化のずれ
+H6_THRESHOLD = 0.10
+# H4: 最良 epoch の前後この幅の epoch で種内の揺れを測る
+H4_WINDOW = 200
+H4_ARM = "clock_tf96_traj"
+EPOCH_POOL_N = 64
+# H8: 種を 5 本にして比べる
+H8_SEEDS: tuple[int, ...] = (42, 43, 44, 45, 46)
+FIG_DIR = REPO_ROOT / "src" / "models" / "DDPM_Aggregate_Simple" / "docs" / "figures"
 
 GroupWeightKind = Literal["japan", "atus"]
 FloatArr = npt.NDArray[np.float64]
@@ -91,6 +134,11 @@ cur: Any = rep.cur
 sm: Any = rep.sm
 agr: Any = rep.agr
 im: Any = rep.sel.im
+
+
+def _gen() -> Any:
+    """stage1_rare_diagnosis_gen（保存先の名前の唯一の出所）を読む"""
+    return _load("rare_diag_gen", REPO_ROOT / "src" / "eval" / "diagnostics" / "stage1_rare_diagnosis_gen.py")
 
 
 # ============================================================
@@ -143,6 +191,30 @@ def group_weights(kind: GroupWeightKind, tgt: dict, d_real: IntArr, w_real: Floa
 # ============================================================
 # 活動ごとの個人単位の要約
 # ============================================================
+def group_weighted_mean(values: FloatArr, d: IntArr, w: FloatArr, pi_d: FloatArr) -> FloatArr:
+    """個人単位の値を、群の中は w、群の間は pi_d で平均する
+
+    Args:
+        values: 個人単位の値, (N, k)
+        d: 群インデックス, (N,)
+        w: 群の中の個票のウェイト, (N,)
+        pi_d: 群の間の重み, (28,)。個票の無い群は除いて正規化し直す
+
+    Returns:
+        加重平均, (k,)
+    """
+    means = np.zeros(values.shape[1], dtype=np.float64)
+    total = 0.0
+    for g in range(len(pi_d)):
+        idx = np.flatnonzero(d == g)
+        if len(idx) == 0:
+            continue
+        wn = w[idx] / w[idx].sum()
+        means += pi_d[g] * (wn @ values[idx])
+        total += pi_d[g]
+    return means / total
+
+
 def activity_profile(sched: IntArr, d: IntArr, w: FloatArr, pi_d: FloatArr,
                      act: str) -> dict[str, float]:
     """1 活動の総量を、行動者の割合と 1 人あたりの長さに分ける
@@ -164,17 +236,7 @@ def activity_profile(sched: IntArr, d: IntArr, w: FloatArr, pi_d: FloatArr,
     episodes = hit[:, 0].astype(np.int64) + (hit[:, 1:] & ~hit[:, :-1]).sum(axis=1)
     per_person = np.stack([slots / sm.NUM_SLOTS, slots > 0, episodes,
                            slots >= LONG_DOER_SLOTS], axis=1).astype(np.float64)   # (N, 4)
-
-    means = np.zeros(4, dtype=np.float64)
-    total = 0.0
-    for g in range(len(pi_d)):
-        idx = np.flatnonzero(d == g)
-        if len(idx) == 0:
-            continue
-        wn = w[idx] / w[idx].sum()
-        means += pi_d[g] * (wn @ per_person[idx])
-        total += pi_d[g]
-    level, doer, epi, long_ = means / total
+    level, doer, epi, long_ = group_weighted_mean(per_person, d, w, pi_d)
     return {"level": float(level), "doer_share": float(doer),
             "slots_per_doer": float(level * sm.NUM_SLOTS / doer) if doer > 0 else float("nan"),
             "episodes_per_person": float(epi), "long_doer_share": float(long_)}
@@ -301,6 +363,347 @@ def h3_copies(arms: tuple[str, ...] = H1_ARMS) -> pd.DataFrame:
 
 
 # ============================================================
+# 段 B・C の共通: 実データの並びと床
+# ============================================================
+def _rows(df: pd.DataFrame, **eq: Any) -> pd.DataFrame:
+    """列 = 値 の条件をすべて満たす行（.loc と numpy の真偽値で絞り、型を DataFrame に保つ）"""
+    mask = np.ones(len(df), dtype=bool)
+    for col, val in eq.items():
+        mask &= df[col].to_numpy() == val
+    return df.loc[mask]
+
+
+def model_order_people() -> tuple[IntArr, IntArr, FloatArr]:
+    """model.load_data の行順の ATUS 実（restore の入力と同じ並び）, (sched, d, w)"""
+    cond_idx, sched, w, _ = sm.load_data()
+    return (np.asarray(sched, dtype=np.int64), np.asarray(sm.cond_to_d(cond_idx), dtype=np.int64),
+            np.asarray(w, dtype=np.float64))
+
+
+def bootstrap_floor(people: tuple[IntArr, IntArr, FloatArr], pi_d: FloatArr,
+                    n_boot: int = N_BOOT, seed: int = 0) -> pd.DataFrame:
+    """ATUS の回答者を復元抽出したときの、各指標の比（作り直し / 元）の sd
+
+    Returns:
+        index = 活動, columns = METRICS の sd の表
+    """
+    sched, d, w = people
+    base = profile_table(sched, d, w, pi_d)[list(METRICS)].to_numpy()
+    rng = np.random.default_rng(seed)
+    ratios = []
+    for _ in range(n_boot):
+        i = rng.integers(0, len(sched), len(sched))
+        ratios.append(profile_table(sched[i], d[i], w[i], pi_d)[list(METRICS)].to_numpy() / base)
+    return pd.DataFrame(np.std(np.asarray(ratios), axis=0, ddof=1),
+                        index=list(FOCUS_ACTS), columns=list(METRICS))
+
+
+# ============================================================
+# H5 逆過程のどの段階でずれるか / H6 最後の離散化
+# ============================================================
+def load_restore(arm: str, seed: int, n_rows: int) -> dict[str, np.ndarray]:
+    """stage1_rare_diagnosis_gen --mode restore の結果を読む（ckpt より古ければ止める）"""
+    path = _gen().restore_path(arm, seed)
+    if not path.exists():
+        raise FileNotFoundError(f"部分ノイズ化の結果が無い ({arm}, seed={seed}): {path}")
+    rep.check_fresh(path, rep.ckpt_path(arm, seed))
+    with np.load(path) as z:
+        res = {k: z[k] for k in z.files}
+    if int(res["n_rows"]) != n_rows:
+        raise ValueError(f"入力の行数が違う: {int(res['n_rows'])} != {n_rows}（--limit 付きの結果?）")
+    return res
+
+
+def h5_restore(people: tuple[IntArr, IntArr, FloatArr], pi_d: FloatArr) -> pd.DataFrame:
+    """t0 ごとの各指標の比（復元した個票 / 入力の実個票）
+
+    Returns:
+        縦持ち (arm, seed, t0, activity, metric, ratio)
+    """
+    sched, d, w = people
+    base = profile_table(sched, d, w, pi_d)
+    rows = []
+    for arm in RESTORE_ARMS:
+        for seed in DIAG_SEEDS:
+            res = load_restore(arm, seed, len(sched))
+            for k, t0 in enumerate(res["t0"]):
+                prof = profile_table(res["sched_out"][k].astype(np.int64), d, w, pi_d)
+                for a in FOCUS_ACTS:
+                    for m in METRICS:
+                        rows.append({"arm": arm, "seed": seed, "t0": int(t0), "activity": a,
+                                     "metric": m, "ratio": prof.loc[a, m] / base.loc[a, m]})
+    return pd.DataFrame(rows)
+
+
+def h5_first_t0(long: pd.DataFrame, floor: pd.DataFrame) -> pd.DataFrame:
+    """床（FLOOR_Z × 復元抽出の sd）を超える最小の t0（t*）と、その段階
+
+    Returns:
+        (arm, seed, activity, metric) ごとの floor, t_star（超えなければ NaN）,
+        ratio_at_max_t0, stage（"長さ" / "中間" / "行動者" / "床の内"）
+    """
+    rows = []
+    for arm in RESTORE_ARMS:
+        for seed in DIAG_SEEDS:
+            for a in FOCUS_ACTS:
+                for m in METRICS:
+                    g = _rows(long, arm=arm, seed=seed, activity=a, metric=m).sort_values("t0")
+                    rows.append(_first_t0_row(g, arm, seed, a, m, FLOOR_Z * float(floor.loc[a, m])))
+    return pd.DataFrame(rows)
+
+
+def _first_t0_row(g: pd.DataFrame, arm: str, seed: int, a: str, m: str, lim: float) -> dict[str, Any]:
+    """h5_first_t0 の 1 行（g は t0 の昇順）"""
+    t0 = g["t0"].to_numpy()
+    ratio = g["ratio"].to_numpy()
+    over = np.flatnonzero(np.abs(ratio - 1.0) > lim)
+    t_star = float(t0[over[0]]) if len(over) else float("nan")
+    if np.isnan(t_star):
+        stage = "床の内"
+    elif t_star <= H5_T_LOCAL:
+        stage = "長さ"
+    elif t_star >= H5_T_GLOBAL:
+        stage = "行動者"
+    else:
+        stage = "中間"
+    return {"arm": arm, "seed": seed, "activity": a, "metric": m, "floor": lim,
+            "t_star": t_star, "ratio_at_max_t0": float(ratio[-1]), "stage": stage}
+
+
+def h6_decoding(people: tuple[IntArr, IntArr, FloatArr], pi_d: FloatArr) -> pd.DataFrame:
+    """最大の t0（ほぼ純粋な雑音からの生成）で、argmax 前後の総量を比べる
+
+    Returns:
+        (arm, seed, activity) ごとの argmax_level（argmax 後）, soft_level（各スロットで和 1 に
+        正規化した連続値）, raw_level（連続値そのもの）, rel_diff = soft / argmax − 1, supports_h6
+    """
+    sched, d, w = people
+    rows = []
+    for arm in RESTORE_ARMS:
+        for seed in DIAG_SEEDS:
+            res = load_restore(arm, seed, len(sched))
+            k = int(np.argmax(res["t0"]))
+            out = res["sched_out"][k].astype(np.int64)
+            for a in FOCUS_ACTS:
+                c = cur.ACT_NAMES.index(a)
+                per_person = np.stack([(out == c).sum(axis=1), res["soft_sum"][k][:, c],
+                                       res["raw_sum"][k][:, c]], axis=1) / sm.NUM_SLOTS
+                am, soft, raw = group_weighted_mean(per_person.astype(np.float64), d, w, pi_d)
+                rel = soft / am - 1.0
+                rows.append({"arm": arm, "seed": seed, "activity": a, "argmax_level": am,
+                             "soft_level": soft, "raw_level": raw, "rel_diff": rel,
+                             "supports_h6": abs(rel) > H6_THRESHOLD})
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# H7 CFG
+# ============================================================
+def h7_guidance(real_prof: pd.DataFrame, pi_d: FloatArr, h1: pd.DataFrame) -> pd.DataFrame:
+    """clock_tf96 の guidance 1.0 と 1.25（同じ乱数の種）の総量の比を比べる
+
+    Note:
+        ★基準の「プール間の差」は H1 の値（学習時のプールと @g1.25、乱数が違う 2 本）。
+          g1 と g1.25 は同じ乱数なので、この基準は保守的（差が出にくい側）
+
+    Returns:
+        活動ごとの種別の比, guidance の差の平均, プール間の差, 実データへ寄ったか, supports_h7
+    """
+    rows = []
+    for a in FOCUS_ACTS:
+        r1, r125 = [], []
+        for seed in DIAG_SEEDS:
+            base = real_prof.loc[a, "level"]
+            r1.append(profile_table(*load_pool_people("clock_tf96@g1", seed), pi_d).loc[a, "level"] / base)
+            r125.append(profile_table(*load_pool_people("clock_tf96@g1.25", seed), pi_d).loc[a, "level"] / base)
+        g1, g125 = np.asarray(r1), np.asarray(r125)
+        diff = float(np.abs(g1 - g125).mean())
+        pool_diff = float(_rows(h1, arm="clock_tf96", activity=a)["pool_diff"].to_numpy()[0])
+        closer = float(np.abs(np.log(g1)).mean()) < float(np.abs(np.log(g125)).mean())
+        rows.append({"activity": a, "ratio_g1": "/".join(f"{v:.2f}" for v in g1),
+                     "ratio_g1.25": "/".join(f"{v:.2f}" for v in g125),
+                     "guidance_diff": diff, "pool_diff": pool_diff, "g1_closer_to_real": closer,
+                     "supports_h7": diff > pool_diff and closer})
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# H4 ckpt の選び方（epoch の軌跡）
+# ============================================================
+def h4_trajectory(real_prof: pd.DataFrame, pi_d: FloatArr,
+                  best_epochs: dict[int, int]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """途中の ckpt の小プールで、総量の比を epoch に沿って並べる
+
+    Note:
+        ★途中の ckpt は SQUID にだけあるので、ここでは mtime のガードをかけられない。
+          ガードは生成側（stage1_rare_diagnosis_gen の is_fresh）で行っている
+
+    Args:
+        real_prof: ATUS 実の profile_table
+        pi_d: 群の間の重み
+        best_epochs: 種 → 最良 epoch（学習ログの "restored best checkpoint: epoch N"）
+
+    Returns:
+        (縦持ち (seed, epoch, activity, is_best, ratio)。is_best=True の行は最良の ckpt で、
+         epoch は最良 epoch。活動ごとの要約:
+         within_sd = 最良 epoch ± H4_WINDOW の種内 sd の種平均,
+         between_sd = 最良の ckpt の小プールの比の種間 sd, supports_h4)
+    """
+    gen = _gen()
+    rows = []
+    best_rows = []
+    for seed in DIAG_SEEDS:
+        pools = gen.epoch_pools(H4_ARM, seed, EPOCH_POOL_N)
+        if not pools:
+            raise FileNotFoundError(f"途中の ckpt の小プールが無い ({H4_ARM}, seed={seed})")
+        for epoch, path in pools.items():
+            prof = profile_table(*pool_people(cur.load_sample_pool(path)), pi_d)
+            for a in FOCUS_ACTS:
+                rows.append({"seed": seed, "epoch": epoch, "activity": a, "is_best": False,
+                             "ratio": prof.loc[a, "level"] / real_prof.loc[a, "level"]})
+        best = gen.epoch_pool_path(H4_ARM, seed, None, EPOCH_POOL_N)
+        if not best.exists():
+            raise FileNotFoundError(f"最良の ckpt の小プールが無い: {best}")
+        prof = profile_table(*pool_people(cur.load_sample_pool(best)), pi_d)
+        for a in FOCUS_ACTS:
+            best_rows.append({"seed": seed, "epoch": best_epochs[seed], "activity": a, "is_best": True,
+                              "ratio": prof.loc[a, "level"] / real_prof.loc[a, "level"]})
+    long = pd.DataFrame(rows)
+    best_df = pd.DataFrame(best_rows)
+    summary = []
+    for a in FOCUS_ACTS:
+        within = []
+        for seed in DIAG_SEEDS:
+            g = _rows(long, activity=a, seed=seed)                 # 途中の ckpt だけ（最良は別表）
+            near = np.abs(g["epoch"].to_numpy() - best_epochs[seed]) <= H4_WINDOW
+            within.append(float(np.std(g["ratio"].to_numpy()[near], ddof=1)))
+        best_ratio = _rows(best_df, activity=a)["ratio"].to_numpy()
+        between = float(np.std(best_ratio, ddof=1))
+        summary.append({"activity": a, "within_sd": float(np.mean(within)),
+                        "within_sd_by_seed": "/".join(f"{v:.2f}" for v in within),
+                        "between_sd": between,
+                        "best_ratio_by_seed": "/".join(f"{v:.2f}" for v in best_ratio),
+                        "supports_h4": float(np.mean(within)) >= between})
+    return pd.concat([long, best_df], ignore_index=True), pd.DataFrame(summary)
+
+
+# ============================================================
+# H8 Transformer 型と長時間の介護（種 5 本）
+# ============================================================
+def h8_seeds(real_prof: pd.DataFrame, pi_d: FloatArr) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """K=4 と Transformer 型を種 5 本ずつで比べる（学習時のプール）
+
+    Returns:
+        (縦持ち (arm, seed, activity, metric, value, ratio),
+         (活動, 指標) ごとの 2 arm の範囲と完全分離の有無)
+    """
+    rows = []
+    for arm in RESTORE_ARMS:
+        for seed in H8_SEEDS:
+            prof = profile_table(*load_pool_people(arm, seed), pi_d)
+            for a in FOCUS_ACTS:
+                for m in METRICS:
+                    rows.append({"arm": arm, "seed": seed, "activity": a, "metric": m,
+                                 "value": prof.loc[a, m], "ratio": prof.loc[a, m] / real_prof.loc[a, m]})
+    long = pd.DataFrame(rows)
+    summary = []
+    for a in FOCUS_ACTS:
+        for m in METRICS:
+            summary.append(_separation_row(long, real_prof, a, m))
+    return long, pd.DataFrame(summary)
+
+
+def _separation_row(long: pd.DataFrame, real_prof: pd.DataFrame, a: str, m: str) -> dict[str, Any]:
+    """h8_seeds の 1 行: 2 arm の範囲と完全分離"""
+    k4 = _rows(long, arm="clock", activity=a, metric=m)["value"].to_numpy()
+    tf = _rows(long, arm="clock_tf96", activity=a, metric=m)["value"].to_numpy()
+    return {"activity": a, "metric": m, "real": float(real_prof.loc[a, m]),
+            "clock_min": float(k4.min()), "clock_max": float(k4.max()),
+            "tf96_min": float(tf.min()), "tf96_max": float(tf.max()),
+            "separated": bool(k4.max() < tf.min() or tf.max() < k4.min())}
+
+
+# ============================================================
+# 図（タイトルは名前だけ、数値は表で渡す）
+# ============================================================
+def _figure_module() -> Any:
+    """色と日本語フォントの設定を stage1_ablation_curves と共有する"""
+    return _load("rare_diag_curves",
+                 REPO_ROOT / "src" / "models" / "DDPM_Aggregate_Simple" / "stage1_ablation_curves.py")
+
+
+def plot_restore(long: pd.DataFrame, floor: pd.DataFrame, out: Path) -> None:
+    """t0 と総量の比の関係（arm ごとに種の平均と範囲、灰色の帯は床）"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fm = _figure_module()
+    fm.setup_fonts()
+    lv = _rows(long, metric="level")
+    t0s = sorted(int(t) for t in np.unique(lv["t0"].to_numpy()))
+    xs = np.arange(len(t0s))
+    fig, axes = plt.subplots(1, len(FOCUS_ACTS), figsize=(17, 3.9), sharey=False)
+    for ax, a in zip(axes, FOCUS_ACTS):
+        lim = FLOOR_Z * float(floor.loc[a, "level"])
+        ax.axhspan(1 - lim, 1 + lim, color="#d9d9d6", alpha=0.6, lw=0)
+        ax.axhline(1.0, color=fm.COLOR_ATUS, lw=1.2)
+        for color, arm in zip(fm.ARM_COLORS, RESTORE_ARMS):
+            g = _rows(lv, activity=a, arm=arm)
+            piv = g.pivot_table(index="t0", columns="seed", values="ratio").reindex(t0s)
+            ax.fill_between(xs, piv.min(axis=1), piv.max(axis=1), color=color, alpha=0.18, lw=0)
+            ax.plot(xs, piv.mean(axis=1), color=color, lw=2, marker="o", ms=4, label=ARM_LABELS[arm])
+        ax.set_xticks(xs, [str(t) for t in t0s], fontsize=8)
+        ax.set_title(f"{cur.ACT_JA[a]}（{a}）", fontsize=11)
+        ax.set_xlabel("雑音化の水準 t0", fontsize=9)
+        ax.grid(axis="y", color="#e6e6e3", lw=0.6)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+    axes[0].set_ylabel("総量の比（復元 / 実）", fontsize=10)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.93), ncol=len(labels),
+               frameon=False, fontsize=10)
+    fig.suptitle("部分ノイズ化からの復元", y=0.99, fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[rare_diag] 図: {out}")
+
+
+def plot_trajectory(long: pd.DataFrame, best_epochs: dict[int, int], out: Path) -> None:
+    """epoch と総量の比の関係（種ごとの線は途中の ckpt、丸は最良の ckpt を最良 epoch の位置に）"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fm = _figure_module()
+    fm.setup_fonts()
+    fig, axes = plt.subplots(1, len(FOCUS_ACTS), figsize=(17, 3.9))
+    for ax, a in zip(axes, FOCUS_ACTS):
+        ax.axhline(1.0, color=fm.COLOR_ATUS, lw=1.2)
+        for color, seed in zip(fm.ARM_COLORS, DIAG_SEEDS):
+            g = _rows(long, activity=a, seed=seed, is_best=False).sort_values("epoch")
+            ax.plot(g["epoch"], g["ratio"], color=color, lw=1.8, label=f"種 {seed}")
+            b = _rows(long, activity=a, seed=seed, is_best=True)
+            ax.plot([best_epochs[seed]], b["ratio"].to_numpy(), "o", color=color, ms=8,
+                    markeredgecolor="white", markeredgewidth=1.2)
+        ax.set_title(f"{cur.ACT_JA[a]}（{a}）", fontsize=11)
+        ax.set_xlabel("epoch", fontsize=9)
+        ax.grid(axis="y", color="#e6e6e3", lw=0.6)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+    axes[0].set_ylabel("総量の比（生成 / 実）", fontsize=10)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.93), ncol=len(labels),
+               frameon=False, fontsize=10)
+    fig.suptitle("学習の途中の ckpt", y=0.99, fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[rare_diag] 図: {out}")
+
+
+# ============================================================
 # 部の実行
 # ============================================================
 def run_existing() -> None:
@@ -337,14 +740,112 @@ def run_existing() -> None:
     print("\n[rare_diag] 書いた: stage1_rare_diag_{h1,h2,h3}.csv")
 
 
+def _japan_setup() -> tuple[FloatArr, pd.DataFrame]:
+    """日本人口の群の重みと、ATUS 実（load_atus_weekday の並び）の profile_table"""
+    tgt = cur.st.load_stula_targets()
+    sched_r, d_r, w_r = agr.load_atus_weekday()
+    pi_d = group_weights("japan", tgt, d_r, w_r)
+    return pi_d, profile_table(sched_r, d_r, w_r, pi_d)
+
+
+def _show(title: str, df: pd.DataFrame) -> None:
+    with pd.option_context("display.width", 250, "display.max_columns", 30, "display.max_rows", 400,
+                           "display.float_format", "{:.4f}".format):
+        print(f"\n=== {title} ===")
+        print(df.to_string(index=False))
+
+
+def run_restore() -> None:
+    """段 B の H5・H6 を集計し、表と図を書く"""
+    pi_d, _ = _japan_setup()
+    people = model_order_people()
+    floor = bootstrap_floor(people, pi_d)
+    long = h5_restore(people, pi_d)
+    first = h5_first_t0(long, floor)
+    dec = h6_decoding(people, pi_d)
+    _show(f"床（ATUS の復元抽出での比の sd × {FLOOR_Z:g}）",
+          (floor * FLOOR_Z).reset_index(names="activity"))
+    _show("H5 t0 ごとの総量の比（種の平均）",
+          _rows(long, metric="level").pivot_table(index=["activity", "arm"], columns="t0",
+                                                  values="ratio").reset_index())
+    _show(f"H5 床を超える最小の t0（t* ≤ {H5_T_LOCAL}: 長さ、t* ≥ {H5_T_GLOBAL}: 行動者）",
+          first.loc[first["metric"].isin(["level", "doer_share", "slots_per_doer",
+                                          "long_doer_share"]).to_numpy()])
+    _show(f"H6 argmax 前後の総量（支持: |相対差| > {H6_THRESHOLD:g}）", dec)
+    long.to_csv(OUT_DIR / "stage1_rare_diag_h5_long.csv", index=False)
+    first.to_csv(OUT_DIR / "stage1_rare_diag_h5_tstar.csv", index=False)
+    dec.to_csv(OUT_DIR / "stage1_rare_diag_h6.csv", index=False)
+    floor.to_csv(OUT_DIR / "stage1_rare_diag_floor.csv")
+    plot_restore(long, floor, FIG_DIR / "stage1_rare_restore.png")
+    print("[rare_diag] 書いた: stage1_rare_diag_{h5_long,h5_tstar,h6,floor}.csv")
+
+
+def run_guidance() -> None:
+    """H7 を集計する（段 A の H1 の CSV を基準に使う）"""
+    pi_d, real_prof = _japan_setup()
+    h1_path = OUT_DIR / "stage1_rare_diag_h1.csv"
+    if not h1_path.exists():
+        raise FileNotFoundError(f"先に --part existing を実行すること: {h1_path}")
+    h7 = h7_guidance(real_prof, pi_d, pd.read_csv(h1_path))
+    _show("H7 CFG（支持: guidance の差 > プール間の差 かつ g1 が実データに近い）", h7)
+    h7.to_csv(OUT_DIR / "stage1_rare_diag_h7.csv", index=False)
+
+
+def run_trajectory(best_epochs: dict[int, int]) -> None:
+    """段 C の H4 を集計し、表と図を書く"""
+    pi_d, real_prof = _japan_setup()
+    long, summary = h4_trajectory(real_prof, pi_d, best_epochs)
+    _show("H4 途中の ckpt ごとの総量の比",
+          _rows(long, is_best=False).pivot_table(index=["activity", "seed"], columns="epoch",
+                                                 values="ratio").reset_index())
+    _show(f"H4 ckpt の選び方（支持: 最良 epoch ±{H4_WINDOW} の種内 sd ≥ 種間 sd）", summary)
+    long.to_csv(OUT_DIR / "stage1_rare_diag_h4_long.csv", index=False)
+    summary.to_csv(OUT_DIR / "stage1_rare_diag_h4.csv", index=False)
+    plot_trajectory(long, best_epochs, FIG_DIR / "stage1_rare_trajectory.png")
+
+
+def run_seeds() -> None:
+    """段 C の H8 を集計する"""
+    pi_d, real_prof = _japan_setup()
+    long, summary = h8_seeds(real_prof, pi_d)
+    _show("H8 K=4 と Transformer 型（種 5 本の範囲、separated = 完全分離）", summary)
+    long.to_csv(OUT_DIR / "stage1_rare_diag_h8_long.csv", index=False)
+    summary.to_csv(OUT_DIR / "stage1_rare_diag_h8.csv", index=False)
+
+
+def parse_best_epochs(items: list[str]) -> dict[int, int]:
+    """["42:612", ...] → {42: 612, ...}。DIAG_SEEDS が全て揃っていること"""
+    out: dict[int, int] = {}
+    for item in items:
+        seed, _, epoch = item.partition(":")
+        out[int(seed)] = int(epoch)
+    missing = [s for s in DIAG_SEEDS if s not in out]
+    if missing:
+        raise ValueError(f"--best-epochs に無い種: {missing}")
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--part", choices=("existing",), required=True,
-                    help="existing: 段 A（H1〜H3、既存プールのみ）")
+    ap.add_argument("--part", choices=("existing", "restore", "guidance", "trajectory", "seeds"),
+                    required=True, help="集計する部（モジュールの説明を参照）")
+    ap.add_argument("--best-epochs", nargs="+", default=None,
+                    help="trajectory 用。種:最良 epoch（学習ログの restored best checkpoint）")
     args = ap.parse_args()
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     if args.part == "existing":
         run_existing()
+    elif args.part == "restore":
+        run_restore()
+    elif args.part == "guidance":
+        run_guidance()
+    elif args.part == "trajectory":
+        if args.best_epochs is None:
+            ap.error("--part trajectory には --best-epochs 42:E 43:E 44:E が要る")
+        run_trajectory(parse_best_epochs(args.best_epochs))
+    else:
+        run_seeds()
 
 
 if __name__ == "__main__":

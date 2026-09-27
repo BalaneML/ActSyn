@@ -11,6 +11,10 @@ stage1_rare_diagnosis_gen.py
                          逆過程のどの段階がずれを作るかを切り分ける
     --mode epoch-pools   H4。model.py --save-every が残した途中の ckpt ごとに小さなプールを作る。
                          どれも同じ乱数の種（pool_seed）から作るので、差は重みの差だけになる
+    --mode final-continuous
+                         H6 の補足。t0 = T_STEPS − 1（ほぼ純粋な雑音からの生成）だけを回し、argmax 前の
+                         連続値をスロットごとに保存する。restore の活動別の和では「僅差で argmax に
+                         負けたスロット」と「全チャネルに薄く乗った値（漏れ）」を区別できないため
 
 データフロー:
 
@@ -24,6 +28,11 @@ flowchart TD
         OUT --> SUM["raw_sum / soft_sum (T0, N, 12)"]
         AM --> NPZ["ddpm_simple_restore{接尾辞}.npz"]
         SUM --> NPZ
+    end
+    subgraph final["--mode final-continuous"]
+        LD2["model.load_data"] --> RS2["Diffusion.restore(model, x0, T_STEPS − 1, cond_idx)"]
+        RS2 --> XF["x_final (N, 12, 96) float32"]
+        XF --> NPZ2["ddpm_simple_restore{接尾辞}_final.npz"]
     end
     subgraph epoch["--mode epoch-pools"]
         EP["{ckpt の stem}_ep{epoch:04d}.pt"] --> GP["torch.manual_seed(pool_seed)<br/>group_pool(model, n_per_group)"]
@@ -93,11 +102,29 @@ def restore_path(arm: str, seed: int) -> Path:
     return sm.GEN_SAVE_PATH.with_name(f"ddpm_simple_restore{arms.arm_suffix(arm, seed)}.npz")
 
 
+def final_continuous_path(arm: str, seed: int) -> Path:
+    """(arm, seed) の t0 = T_STEPS − 1 の連続値（npz）のパス"""
+    return sm.GEN_SAVE_PATH.with_name(f"ddpm_simple_restore{arms.arm_suffix(arm, seed)}_final.npz")
+
+
 def epoch_pool_path(arm: str, seed: int, epoch: int | None, n_per_group: int) -> Path:
     """途中の ckpt（epoch=None なら最良の ckpt）から作った小プールの CSV のパス"""
     tag = "best" if epoch is None else f"ep{epoch:04d}"
     stem = sm.GEN_SAVE_PATH.stem
     return sm.GEN_SAVE_PATH.with_name(f"{stem}{arms.arm_suffix(arm, seed)}_{tag}_n{n_per_group}.csv")
+
+
+def epoch_pools(arm: str, seed: int, n_per_group: int) -> dict[int, Path]:
+    """epoch_pool_path の規則で保存された途中の ckpt の小プール, epoch → パス（手元の集計用）"""
+    probe = epoch_pool_path(arm, seed, 0, n_per_group)          # ..._ep0000_n{M}.csv
+    head, tail = probe.name.split("_ep0000_")
+    pattern = re.compile(re.escape(head) + r"_ep(\d{4})_" + re.escape(tail) + "$")
+    found: dict[int, Path] = {}
+    for p in probe.parent.glob(f"{head}_ep[0-9][0-9][0-9][0-9]_{tail}"):
+        m = pattern.search(p.name)
+        if m is not None:
+            found[int(m.group(1))] = p
+    return dict(sorted(found.items()))
 
 
 def epoch_ckpts(arm: str, seed: int) -> dict[int, Path]:
@@ -180,6 +207,47 @@ def run_restore(args: argparse.Namespace) -> None:
     print(f"[restore] {args.arm} seed={args.seed} -> {out}")
 
 
+@torch.no_grad()
+def final_continuous(model: Any, cond_idx: np.ndarray, sched: np.ndarray, guidance_scale: float,
+                     noise_seed: int) -> np.ndarray:
+    """t0 = T_STEPS − 1 から戻した argmax 前の連続値, (N, 12, 96) float32
+
+    Note:
+        ★restore_all の t0 = 999 と同じ種・同じ順で回すので、argmax は restore の最後の t0 と一致する。
+          float16 で保存すると僅差のスロットで順位が入れ替わる（2026-09-27 に確認、一致率 99.97%）ので
+          float32 のまま保存する
+    """
+    dev = next(model.parameters()).device
+    diffusion = sm.Diffusion(device=dev)
+    out = np.zeros((len(sched), sm.NUM_ACT, sm.NUM_SLOTS), dtype=np.float32)
+    torch.manual_seed(noise_seed)
+    for i in range(0, len(sched), sm.GEN_BATCH):
+        s = torch.as_tensor(sched[i:i + sm.GEN_BATCH], device=dev)
+        ci = torch.as_tensor(cond_idx[i:i + sm.GEN_BATCH], device=dev)
+        x = diffusion.restore(model, sm.sched_to_x0(s), sm.T_STEPS - 1, ci, guidance_scale)
+        out[i:i + len(s)] = x.cpu().numpy()
+    return out
+
+
+def run_final_continuous(args: argparse.Namespace) -> None:
+    ckpt = ckpt_path(args.arm, args.seed)
+    if not ckpt.exists():
+        raise FileNotFoundError(f"チェックポイントが無い ({args.arm}, seed={args.seed}): {ckpt}")
+    out = Path(args.out) if args.out else final_continuous_path(args.arm, args.seed)
+    if args.out is None and is_fresh(out, ckpt) and not args.force:
+        print(f"[final] skip（ckpt より新しい）: {out.name}")
+        return
+    cond_idx, sched, _, _ = sm.load_data()
+    if args.limit is not None:
+        cond_idx, sched = cond_idx[:args.limit], sched[:args.limit]
+    start = time.time()
+    x = final_continuous(sm.load_pretrained(ckpt), cond_idx, sched, args.guidance, args.pool_seed)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out, x_final=x, guidance=np.float64(args.guidance),
+                        noise_seed=np.int64(args.pool_seed), n_rows=np.int64(len(sched)))
+    print(f"[final] {args.arm} seed={args.seed} -> {out} ({time.time() - start:.0f}s)")
+
+
 # ============================================================
 # --mode epoch-pools（H4）
 # ============================================================
@@ -212,7 +280,7 @@ def run_epoch_pools(args: argparse.Namespace) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=("restore", "epoch-pools"), required=True)
+    ap.add_argument("--mode", choices=("restore", "epoch-pools", "final-continuous"), required=True)
     ap.add_argument("--arm", required=True, help="stage1_arms.ARMS のキー")
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--guidance", type=float, default=sm.GUIDANCE_SCALE)
@@ -222,7 +290,8 @@ def main() -> None:
     # restore
     ap.add_argument("--t0", type=int, nargs="+", default=list(DEFAULT_T0), help="雑音化する水準")
     ap.add_argument("--limit", type=int, default=None, help="先頭の N 人だけ使う（動作確認用）")
-    ap.add_argument("--out", default=None, help="restore の出力先（既定は outputs/generated の決まった名前）")
+    ap.add_argument("--out", default=None,
+                    help="restore / final-continuous の出力先（既定は outputs/generated の決まった名前）")
     # epoch-pools
     ap.add_argument("--every", type=int, default=100, help="この倍数の epoch の ckpt だけ使う")
     ap.add_argument("--epochs", type=int, nargs="*", default=None,
@@ -236,6 +305,8 @@ def main() -> None:
         ap.error(f"--every は正: {args.every}")
     if args.mode == "restore":
         run_restore(args)
+    elif args.mode == "final-continuous":
+        run_final_continuous(args)
     else:
         run_epoch_pools(args)
 
