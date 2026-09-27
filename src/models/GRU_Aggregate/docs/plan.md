@@ -140,7 +140,8 @@ flowchart LR
 | `src/models/GRU_Aggregate/model.py`（新設） | 定数、`GRUScheduler`（nn.Module）、`train`、`sample`、`group_pool`、`teacher_forced_rates`、保存と読み込み、CLI（`--seed` `--epochs` `--save-every` `--guidance` `--no-pool` `--smoke`） |
 | `src/models/GRU_Aggregate/test_model.py`（新設） | §7 の単体テスト |
 | `src/eval/diagnostics/stage1_gru_compare.py`（新設） | §4 の評価。`us_weighted_slot_rates` を置く |
-| `src/models/GRU_Aggregate/docs/`（新設） | この計画書、結果の報告書、図 |
+| `src/models/GRU_Aggregate/docs/`（新設） | この計画書、結果の報告書 |
+| `src/models/GRU_Aggregate/figures/`（新設、docs と同じ階層） | 図 |
 
 import して再利用するもの（写し書きしない）:
 
