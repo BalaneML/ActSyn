@@ -26,6 +26,9 @@ GRU_Aggregate（再帰型＋交差エントロピー）と DDPM の Stage 1 を�
                 group_mse_atus              : 28 群ごとの値 vs ATUS 実（セルの単純平均）
                 rate_mse_astar              : 28 群ごとの値 vs 日本の教師 A*（論文の rate_mse と同じ定義）
                 床: 完全なモデルでも出る MSE は floor_pool 〜 floor_real + floor_pool の間
+    groups      群別（判定には使わない）。28 群ごとの MSE vs ATUS 実と群ごとの床、群の分離（separation_ratio）
+    cfg         gru_cal の CFG の強さ g を CFG_SWEEP で振り、群別・総量・切替の指標を並べる（判定には使わない）
+                ★gru_cal の補正は g = 1.0 で行ったので、g ≠ 1 では総量が補正からずれうる
 
 判定（計画書 §4.3。結果を見る前に固定）。候補 CANDIDATES（gru / gru_cal）のそれぞれにかける:
 
@@ -64,7 +67,8 @@ flowchart TD
     .venv/bin/python src/eval/diagnostics/stage1_gru_compare.py --part curves --gru-seeds 42   # 途中経過
 
 出力: data/processed/aggregates/stage1_gru_{totals_long,totals,trajectory_long,trajectory,teacher,guard_long,
-      guard,curves,mse_long,mse}.csv と src/models/GRU_Aggregate/figures/stage1_gru_{totals,trajectory,curves}.png
+      guard,curves,mse_long,mse,groups_long,groups,cfg_long,cfg}.csv と
+      src/models/GRU_Aggregate/figures/stage1_gru_{totals,trajectory,curves,groups,cfg}.png
 """
 import argparse
 import contextlib
@@ -155,6 +159,12 @@ GRU_WINDOW: int = gm.EARLY_STOP_PATIENCE         # 最良 epoch ± 30（早期�
 # MSE の床: 完全なモデルの生成プール（ATUS 実から群ごとに POOL_N 本を引く）を作る回数
 N_FLOOR_POOL = 50
 MSE_METRICS: tuple[str, ...] = ("curve_mse_us", "curve_mse_jp", "group_mse_atus", "rate_mse_astar")
+# 群別と CFG の強さ（判定には使わない）
+GROUP_FLOOR_SIMS = 50                            # 群ごとの床の見積もりの反復回数
+CFG_SWEEP: tuple[float, ...] = (1.0, 1.25, 1.5, 2.0)
+DDPM_TRAIN_G = 1.25                              # DDPM の学習時のプールの CFG の強さ
+DDPM_G1_SEEDS: tuple[int, ...] = (42, 43, 44)    # DDPM の g = 1.0 のプールがある種（H7 で作成）
+AGE_LABELS: tuple[str, ...] = ("15-24", "25-34", "35-44", "45-54", "55-64", "65-74", "75+")
 # 小プールの生成の乱数だけによる揺れを測る種の数（GRU 種 42 の最良の ckpt で引き直す）
 NOISE_DRAWS = 8
 
@@ -731,6 +741,255 @@ def mse_summary(long: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
+# 群別と CFG の強さ（判定には使わない）
+# ============================================================
+def group_label(d: int) -> str:
+    """群 d の名前（例: 男25-34有業）。sm.cond_grid の (性, 年齢 7 区分, 就業)"""
+    g, a, e = (int(v) for v in sm.cond_grid()[d])
+    return f"{'男' if g == 0 else '女'}{AGE_LABELS[a]}{'有業' if e == 1 else '無業'}"
+
+
+def weighted_rates(sched: IntArr, w: FloatArr) -> FloatArr:
+    """個票の加重の時刻別行動者率, (N, 96) -> (12, 96)"""
+    onehot = sched[:, None, :] == np.arange(sm.NUM_ACT)[None, :, None]            # (N, 12, 96)
+    return np.asarray(np.einsum("n,ncs->cs", w / w.sum(), onehot), dtype=np.float64)
+
+
+def group_floor(real: People, n_sims: int = GROUP_FLOOR_SIMS, seed: int = 0) -> FloatArr:
+    """群ごとの MSE の床 (28,) = 実データ側の標本誤差 + 生成プール（gm.POOL_N 本）の揺れ
+
+    Note:
+        ★群の中で回答者を復元抽出した群別の値（人数は群の人数のまま）と、群の中から TUFINLWGT で
+          gm.POOL_N 本を引いたプール（完全なモデルの生成）の値を、それぞれ ATUS 実の群別の値と比べた
+          MSE の平均の和。完全なモデルでも、ATUS 実と比べればこの程度の MSE が出る
+        ★回答者の少ない群ほど床は大きい（ATUS 平日の群の人数は 17〜329 人）
+
+    Returns:
+        群ごとの床, (28,)
+    """
+    sched, d, w = real
+    atus = np.asarray(agr.group_rates(sched, d, w), dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    out = np.zeros(sm.D_GROUPS, dtype=np.float64)
+    for g in range(sm.D_GROUPS):
+        ix = np.flatnonzero(d == g)
+        acc = 0.0
+        for _ in range(n_sims):
+            i = rng.choice(ix, len(ix), replace=True)
+            acc += float(np.mean((weighted_rates(sched[i], w[i]) - atus[g]) ** 2))
+            j = rng.choice(ix, gm.POOL_N, p=w[ix] / w[ix].sum())
+            acc += float(np.mean((weighted_rates(sched[j], np.ones(len(j))) - atus[g]) ** 2))
+        out[g] = acc / n_sims
+    return out
+
+
+def separation_reference(real: People, n_sims: int = 20, seed: int = 0) -> FloatArr:
+    """完全なモデル（ATUS 実から群ごとに gm.POOL_N 本を TUFINLWGT で引いたプール）の separation_ratio, (n_sims,)
+
+    Note:
+        ★ATUS の群の人数は少ないので、群の間の距離には標本の揺れが乗る。完全なモデルのプールも同じ回答者から
+          引くので同じ揺れを持ち、比はほぼ 1 になる（2026-09-27 の実測で 0.99〜1.06）。生成の比はこの値と比べる
+    """
+    sched, d, w = real
+    rng = np.random.default_rng(seed)
+    by_d = [np.flatnonzero(d == g) for g in range(sm.D_GROUPS)]
+    gen_d = np.repeat(np.arange(sm.D_GROUPS), gm.POOL_N)
+    w_gen = sel.im.group_reweight(gen_d, w, d, sm.D_GROUPS)
+    out = []
+    for _ in range(n_sims):
+        pool = np.stack([sched[rng.choice(ix, gm.POOL_N, p=w[ix] / w[ix].sum())] for ix in by_d])
+        out.append(float(sel.cd.separation_summary(sched, pool.reshape(-1, sm.NUM_SLOTS), d, gen_d, sm.NUM_ACT,
+                                                   sm.D_GROUPS, w, w_gen)["separation_ratio"]))
+    return np.asarray(out, dtype=np.float64)
+
+
+def pool_csv_g(arm: str, seed: int, g: float) -> Path:
+    """arm・種・CFG の強さ g の生成プール CSV（存在は確かめない）"""
+    if arm == "gru":
+        return gm.pool_path(seed, g)
+    if arm == "gru_cal":
+        return gm.pool_path(seed, g, calibrated=True)
+    label = DDPM_ARMS[arm] if g == DDPM_TRAIN_G else f"{DDPM_ARMS[arm]}@g{g:g}"
+    return rep.pool_csv(label, seed)
+
+
+def load_pool_g(arm: str, seed: int, g: float) -> IntArr:
+    """pool_csv_g のプールを読む（ckpt より古いプールは取り違えとして止める）, -> (28, M, 96)"""
+    path = pool_csv_g(arm, seed, g)
+    if not path.exists():
+        raise FileNotFoundError(f"生成プールが無い ({arm}, seed={seed}, g={g:g}): {path}")
+    rep.check_fresh(path, ckpt_file(arm, seed))
+    return np.asarray(cur.load_sample_pool(path), dtype=np.int64)
+
+
+def group_runs() -> list[tuple[str, float, int]]:
+    """群別・CFG の部で読む (arm, g, 種) の並び"""
+    runs = [("gru", 1.0, s) for s in ARM_SEEDS["gru"]]
+    runs += [("gru_cal", g, s) for g in CFG_SWEEP for s in ARM_SEEDS["gru_cal"]]
+    runs += [("ddpm_tf96", DDPM_TRAIN_G, s) for s in ARM_SEEDS["ddpm_tf96"]]
+    runs += [("ddpm_tf96", 1.0, s) for s in DDPM_G1_SEEDS]
+    return runs
+
+
+def make_cfg_pools() -> None:
+    """gru_cal の g ≠ 1.0 のプール（28 群 × gm.POOL_N 本、種 gm.POOL_SEED）を作る。ckpt より新しければ作らない"""
+    for g in CFG_SWEEP:
+        if g == gm.GUIDANCE_SCALE:
+            continue
+        for seed in ARM_SEEDS["gru_cal"]:
+            ckpt = gm.ckpt_path(seed, calibrated=True)
+            out = gm.pool_path(seed, g, calibrated=True)
+            if out.exists() and out.stat().st_mtime > ckpt.stat().st_mtime:
+                continue
+            gm.write_pool(gm.load_model(ckpt), out, g)
+
+
+def group_long(real: People, pi_atus: FloatArr, real_prof: pd.DataFrame,
+               floor: FloatArr) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(arm, g, 種) ごとの群別の MSE と、群別・総量・切替の要約
+
+    Returns:
+        (群ごとの縦持ち: arm / g / seed / group / mse / floor / ratio,
+         (arm, g, 種) ごと: group_mse_mean / ratio_median / separation_ratio / spearman_pairs /
+         curve_mse_us / rare_abs_dev（5 活動の |総量の比 − 1| の平均）/ switch_emd)
+    """
+    sched_r, d_r, w_r = real
+    atus = np.asarray(agr.group_rates(sched_r, d_r, w_r), dtype=np.float64)
+    ref_us = us_weighted_slot_rates(atus, pi_atus)
+    rows, runs = [], []
+    for arm, g, seed in group_runs():
+        pool = load_pool_g(arm, seed, g)
+        rates = np.asarray(cur.pool_to_slot_rates(pool), dtype=np.float64)
+        mse = ((rates - atus) ** 2).mean(axis=(1, 2))                            # (28,)
+        for dd in range(sm.D_GROUPS):
+            rows.append({"arm": arm, "g": g, "seed": seed, "group": dd, "mse": float(mse[dd]),
+                         "floor": float(floor[dd]), "ratio": float(mse[dd] / floor[dd])})
+        n_d, m, n_s = pool.shape
+        gen = pool.reshape(n_d * m, n_s)
+        gen_d = np.repeat(np.arange(n_d), m)
+        w_gen = sel.im.group_reweight(gen_d, w_r, d_r, sm.D_GROUPS)
+        sep = sel.cd.separation_summary(sched_r, gen, d_r, gen_d, sm.NUM_ACT, sm.D_GROUPS, w_r, w_gen)
+        prof = rd.profile_table(*rd.pool_people(pool), pi_atus)
+        ratio = prof["level"].to_numpy(dtype=np.float64) / real_prof["level"].to_numpy(dtype=np.float64)
+        runs.append({"arm": arm, "g": g, "seed": seed, "group_mse_mean": float(mse.mean()),
+                     "ratio_median": float(np.median(mse / floor)),
+                     "separation_ratio": float(sep["separation_ratio"]),
+                     "spearman_pairs": float(sep["spearman_pairs"]),
+                     "curve_mse_us": float(np.mean((ref_us - us_weighted_slot_rates(rates, pi_atus)) ** 2)),
+                     "rare_abs_dev": float(np.mean(np.abs(ratio - 1.0))),
+                     "switch_emd": float(sel.im.switch_dist_compare(sched_r, gen, w_r, w_gen)["emd"])})
+    return pd.DataFrame(rows), pd.DataFrame(runs)
+
+
+def _by_g(df: pd.DataFrame, metric: str) -> tuple[FloatArr, FloatArr, FloatArr, FloatArr]:
+    """列 g の値ごとに metric の (g, 平均, 最小, 最大)"""
+    g_all = df["g"].to_numpy(dtype=np.float64)
+    gs = np.unique(g_all)
+    vals = [df[metric].to_numpy(dtype=np.float64)[g_all == g] for g in gs]
+    return (gs, np.array([v.mean() for v in vals]), np.array([v.min() for v in vals]),
+            np.array([v.max() for v in vals]))
+
+
+def group_table(long: pd.DataFrame, real: People, floor: FloatArr) -> pd.DataFrame:
+    """群ごとに、ATUS の人数・床・主な arm の MSE（種平均）と床との比
+
+    Returns:
+        行 = 群。列 group / label / n_atus / floor / {arm@g}_mse / {arm@g}_ratio
+    """
+    n_atus = np.bincount(real[1], minlength=sm.D_GROUPS)
+    out = pd.DataFrame({"group": np.arange(sm.D_GROUPS), "label": [group_label(dd) for dd in range(sm.D_GROUPS)],
+                        "n_atus": n_atus, "floor": floor})
+    for arm, g in (("gru", 1.0), ("gru_cal", 1.0), ("ddpm_tf96", DDPM_TRAIN_G)):
+        sub = _rows(long, arm=arm, g=g)
+        idx = sub["group"].to_numpy(dtype=np.int64)
+        m = (np.bincount(idx, weights=sub["mse"].to_numpy(dtype=np.float64), minlength=sm.D_GROUPS)
+             / np.bincount(idx, minlength=sm.D_GROUPS))
+        out[f"{arm}@g{g:g}_mse"] = m
+        out[f"{arm}@g{g:g}_ratio"] = m / floor
+    return out
+
+
+def cfg_table(runs: pd.DataFrame) -> pd.DataFrame:
+    """(arm, g) ごとに要約の種平均・最小・最大"""
+    metrics = ["group_mse_mean", "ratio_median", "separation_ratio", "spearman_pairs", "curve_mse_us",
+               "rare_abs_dev", "switch_emd"]
+    agg = runs.groupby(["arm", "g"], sort=False)[metrics].agg(["mean", "min", "max"])
+    agg.columns = [f"{m}_{k}" for m, k in agg.columns]
+    return agg.reset_index()
+
+
+def plot_groups(table: pd.DataFrame, out: Path) -> None:
+    """群ごとの MSE / 床（種平均）。横軸は群、灰色の線は床（比 = 1）"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fm = rd._figure_module()
+    fm.setup_fonts()
+    fig, ax = plt.subplots(figsize=(15, 5.2))
+    xs = np.arange(len(table))
+    ax.axhline(1.0, color="#8f8f8b", lw=1.2)
+    for k, (arm, g) in enumerate((("gru", 1.0), ("gru_cal", 1.0), ("ddpm_tf96", DDPM_TRAIN_G))):
+        ax.plot(xs + (k - 1) * 0.22, table[f"{arm}@g{g:g}_ratio"], "o", color=ARM_COLOR[arm], ms=7,
+                markeredgecolor="white", markeredgewidth=0.8, label=ARM_LABELS[arm])
+    ax.set_xticks(xs, [f"{lab}（{n}）" for lab, n in zip(table["label"], table["n_atus"])],
+                  rotation=60, ha="right", fontsize=8)
+    ax.set_ylabel("群ごとの MSE / 床", fontsize=10)
+    ax.set_ylim(bottom=0.0)
+    ax.grid(axis="y", color="#e6e6e3", lw=0.6)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.13), ncol=3, frameon=False, fontsize=10)
+    fig.suptitle("群ごとの MSE", y=1.02, fontsize=13)
+    fig.tight_layout()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[gru_compare] 図: {out}")
+
+
+def plot_cfg(runs: pd.DataFrame, sep_ref: FloatArr, out: Path) -> None:
+    """CFG の強さ g と指標（gru_cal は種平均の線と種の範囲、DDPM Transformer 型は種平均の点）
+
+    Args:
+        runs: group_long の 2 つ目の戻り値
+        sep_ref: separation_reference の戻り値（群の分離のパネルに灰色の帯で描く）
+        out: 保存先
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fm = rd._figure_module()
+    fm.setup_fonts()
+    panels = [("group_mse_mean", "群ごとの MSE（28 群の平均）"), ("separation_ratio", "群の分離（生成 / 実）"),
+              ("rare_abs_dev", "少ない活動の |総量の比 − 1|"), ("switch_emd", "切替回数の分布の距離")]
+    fig, axes = plt.subplots(1, len(panels), figsize=(17, 3.9))
+    for ax, (metric, title) in zip(axes, panels):
+        gs, mean, lo, hi = _by_g(_rows(runs, arm="gru_cal"), metric)
+        ax.fill_between(gs, lo, hi, color=ARM_COLOR["gru_cal"], alpha=0.18, lw=0)
+        ax.plot(gs, mean, "-o", color=ARM_COLOR["gru_cal"], lw=2, ms=5, label="GRU 補正後")
+        gd, mean_d, _, _ = _by_g(_rows(runs, arm="ddpm_tf96"), metric)
+        ax.plot(gd, mean_d, "s", color=ARM_COLOR["ddpm_tf96"], ms=7, label="DDPM Transformer 型")
+        if metric == "separation_ratio":
+            ax.axhspan(float(sep_ref.min()), float(sep_ref.max()), color="#d9d9d6", alpha=0.8, lw=0,
+                       label="完全なモデル")
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel("CFG の強さ g", fontsize=9)
+        ax.set_xticks(list(CFG_SWEEP))
+        ax.grid(axis="y", color="#e6e6e3", lw=0.6)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+    handles, labels = axes[1].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.93), ncol=len(labels),
+               frameon=False, fontsize=10)
+    fig.suptitle("CFG の強さ", y=0.99, fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[gru_compare] 図: {out}")
+
+
+# ============================================================
 # 部の実行
 # ============================================================
 def run_totals() -> None:
@@ -819,8 +1078,32 @@ def run_mse() -> None:
     summary.to_csv(OUT_DIR / "stage1_gru_mse.csv", index=False)
 
 
+def run_groups_and_cfg() -> None:
+    """群別と CFG の強さ（groups と cfg は同じ読み込みを共有するので 1 回で両方を出す）"""
+    real, pi_atus, real_prof = setup()
+    make_cfg_pools()
+    floor = group_floor(real)
+    long, runs = group_long(real, pi_atus, real_prof, floor)
+    table = group_table(long, real, floor)
+    cfg = cfg_table(runs)
+    sep_ref = separation_reference(real)
+    with pd.option_context("display.width", 240, "display.max_columns", 30, "display.float_format", "{:.4g}".format):
+        print("\n=== 群ごとの MSE（種平均）と床 ===")
+        print(table.to_string(index=False))
+        print("\n=== CFG の強さ（(arm, g) ごとの種平均・最小・最大）===")
+        print(cfg.to_string(index=False))
+    print(f"完全なモデルの separation_ratio: 平均 {sep_ref.mean():.3f}（{sep_ref.min():.3f}〜{sep_ref.max():.3f}）")
+    long.to_csv(OUT_DIR / "stage1_gru_groups_long.csv", index=False)
+    table.to_csv(OUT_DIR / "stage1_gru_groups.csv", index=False)
+    runs.to_csv(OUT_DIR / "stage1_gru_cfg_long.csv", index=False)
+    cfg.to_csv(OUT_DIR / "stage1_gru_cfg.csv", index=False)
+    plot_groups(table, FIG_DIR / "stage1_gru_groups.png")
+    plot_cfg(runs, sep_ref, FIG_DIR / "stage1_gru_cfg.png")
+
+
 PARTS = {"totals": run_totals, "trajectory": run_trajectory, "teacher": run_teacher,
-         "guard": run_guard, "curves": run_curves, "mse": run_mse}
+         "guard": run_guard, "curves": run_curves, "mse": run_mse,
+         "groups": run_groups_and_cfg}
 
 
 def main() -> None:
