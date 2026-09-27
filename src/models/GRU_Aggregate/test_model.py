@@ -218,8 +218,11 @@ def test_save_load() -> None:
     assert gm.count_params(gm.GRUScheduler()) == 1_829_064
     assert gm.ckpt_path(42).name == "gru_aggregate.pt" and gm.ckpt_path(43).name == "gru_aggregate_s43.pt"
     assert gm.pool_path(42, 1.25).name == "gru_aggregate_samples_g1.25.csv"
-    assert gm.ckpt_path(43, calibrated=True).name == "gru_aggregate_s43_cal.pt"
-    assert gm.pool_path(42, calibrated=True).name == "gru_aggregate_samples_cal.csv"
+    assert gm.ckpt_path(43, calib_guidance=1.0).name == "gru_aggregate_s43_cal.pt"
+    assert gm.pool_path(42, calib_guidance=1.0).name == "gru_aggregate_samples_cal.csv"
+    assert gm.ckpt_path(43, calib_guidance=1.25).name == "gru_aggregate_s43_calg1.25.pt"
+    assert gm.pool_path(42, 1.25, calib_guidance=1.25).name == "gru_aggregate_samples_calg1.25_g1.25.csv"
+    assert gm.pool_path(42, 1.25, calib_guidance=1.0).name == "gru_aggregate_samples_cal_g1.25.csv"
     print("  g. 保存と読み込み・パラメータ数・保存先: OK")
 
 
@@ -245,7 +248,7 @@ def test_calibration() -> None:
 
     m = _model()
     before = {k: v.clone() for k, v in m.state_dict().items()}
-    hist = gm.calibrate_slot_bias(m, manual, pi, iters=2, n_per_group=2, seed=0, verbose=False)
+    hist = gm.calibrate_slot_bias(m, manual, pi, 1.25, iters=2, n_per_group=2, seed=0, verbose=False)
     after = m.state_dict()
     changed = {k for k in before if not torch.equal(before[k], after[k])}
     assert changed == {"slot_bias"}, f"slot_bias 以外が変わった: {changed}"

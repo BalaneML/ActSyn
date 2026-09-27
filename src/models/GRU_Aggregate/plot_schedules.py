@@ -3,7 +3,7 @@ plot_schedules.py
 =================
 生成した活動スケジュールを個票レベルで描く（1 人 1 行、横軸 04:00 → 翌 04:00、色 = 活動）。
 
-ATUS 実データ・GRU 補正後（gru_cal）・DDPM Transformer 型を横に 3 列並べる。
+ATUS 実データ・GRU 補正後（gru_calg125: g = 1.25 で補正・生成）・DDPM Transformer 型を横に 3 列並べる。
 
     stage1_gru_schedules.png         米国加重の母集団から N_POPULATION 人ずつ
     stage1_gru_schedules_groups.png  EXAMPLE_GROUPS の群ごとに N_GROUP 人ずつ
@@ -67,8 +67,8 @@ cur: Any = cmp.cur
 sm: Any = cmp.sm
 
 # 並べるもの: (arm, CFG の強さ g, 種)。"atus" は ATUS 実データ
-SOURCES: tuple[tuple[str, float, int], ...] = (("atus", 0.0, 0), ("gru_cal", 1.0, 42), ("ddpm_tf96", 1.25, 42))
-SOURCE_TITLES: dict[str, str] = {"atus": "ATUS 実データ", "gru_cal": "GRU 補正後（g=1.0、種 42）",
+SOURCES: tuple[tuple[str, float, int], ...] = (("atus", 0.0, 0), ("gru_calg125", 1.25, 42), ("ddpm_tf96", 1.25, 42))
+SOURCE_TITLES: dict[str, str] = {"atus": "ATUS 実データ", "gru_calg125": "GRU 補正後（g=1.25、種 42）",
                                  "ddpm_tf96": "DDPM Transformer 型（g=1.25、種 42）"}
 N_POPULATION = 100
 N_GROUP = 30

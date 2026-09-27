@@ -10,7 +10,8 @@ GRU_Aggregate（再帰型＋交差エントロピー）と DDPM の Stage 1 を�
 比べるもの（ARM_SEEDS）:
 
     gru           本計画のモデル（g = 1.0）                       種 42〜46
-    gru_cal       gru の slot_bias を学習後に補正（計画書 §9）   種 42〜46
+    gru_cal       gru の slot_bias を学習後に g = 1.0 で補正し、g = 1.0 で生成（計画書 §9）   種 42〜46
+    gru_calg125   gru の slot_bias を学習後に g = 1.25 で補正し、g = 1.25 で生成（計画書 §9.5） 種 42〜46
     ddpm_tf96     clock_tf96（学習時のプール、g = 1.25）          種 42〜46
     ddpm_noclock  時刻符号なしの DDPM（ガードレールの外側の基準）  種 42〜44
 
@@ -30,7 +31,7 @@ GRU_Aggregate（再帰型＋交差エントロピー）と DDPM の Stage 1 を�
     cfg         gru_cal の CFG の強さ g を CFG_SWEEP で振り、群別・総量・切替の指標を並べる（判定には使わない）
                 ★gru_cal の補正は g = 1.0 で行ったので、g ≠ 1 では総量が補正からずれうる
 
-判定（計画書 §4.3。結果を見る前に固定）。候補 CANDIDATES（gru / gru_cal）のそれぞれにかける:
+判定（計画書 §4.3。結果を見る前に固定）。候補 CANDIDATES（gru / gru_cal / gru_calg125）のそれぞれにかける:
 
     C1  5 活動のうち C_MIN_ACTS 以上で、候補の総量の比の種間 sd ≤ ddpm_tf96 の種間 sd × C1_SD_RATIO
     C2  5 活動のうち C_MIN_ACTS 以上で、|候補の総量の比の種平均 − 1| ≤ 床
@@ -121,6 +122,7 @@ FLOOR_Z: float = rd.FLOOR_Z
 ARM_SEEDS: dict[str, tuple[int, ...]] = {
     "gru": (42, 43, 44, 45, 46),
     "gru_cal": (42, 43, 44, 45, 46),
+    "gru_calg125": (42, 43, 44, 45, 46),
     "ddpm_tf96": (42, 43, 44, 45, 46),
     "ddpm_noclock": (42, 43, 44),
 }
@@ -129,19 +131,26 @@ ARM_LABELS: dict[str, str] = {
     "gru": "GRU（g=1.0）",
     "gru_g1.25": "GRU（g=1.25）",
     "gru_cal": "GRU 補正後（g=1.0）",
+    "gru_calg125": "GRU 補正後（g=1.25）",
     "ddpm_tf96": "DDPM Transformer 型（g=1.25）",
     "ddpm_noclock": "DDPM 時刻符号なし（g=1.25）",
 }
 # 図の横軸の短い名前
-SHORT_LABELS: dict[str, str] = {"gru": "GRU", "gru_cal": "GRU\n補正後", "ddpm_tf96": "DDPM\nTransformer\n型",
+SHORT_LABELS: dict[str, str] = {"gru": "GRU", "gru_cal": "GRU\n補正後\ng=1.0", "gru_calg125": "GRU\n補正後\ng=1.25",
+                                "ddpm_tf96": "DDPM\nTransformer\n型",
                                 "ddpm_noclock": "DDPM\n時刻符号\nなし"}
 # ★色は arm ごとに固定する（図によって系列の数が違っても同じ arm は同じ色）。
 #   gru / ddpm_tf96 / ddpm_noclock は stage1_ablation_curves.ARM_COLORS の 1〜3 番目と同じ。
 #   gru_cal の赤紫は、この 4 色の並びで validate_palette（色覚の検査）を通った色
-ARM_COLOR: dict[str, str] = {"gru": "#2a78d6", "gru_cal": "#b5179e", "ddpm_tf96": "#eb6834",
-                             "ddpm_noclock": "#1baf7a"}
+#   ★5 色目は検査を通る色が無かったので、GRU 補正後は g によらず同じ赤紫にし、印で分ける
+#     （ARM_HOLLOW の arm は白抜きの印。色 = モデルの種類、印 = 補正の g）
+ARM_COLOR: dict[str, str] = {"gru": "#2a78d6", "gru_cal": "#b5179e", "gru_calg125": "#b5179e",
+                             "ddpm_tf96": "#eb6834", "ddpm_noclock": "#1baf7a"}
+ARM_HOLLOW: frozenset[str] = frozenset({"gru_cal"})
+# GRU 補正後の arm → (補正に使った g, 生成の g)
+GRU_CALIB: dict[str, tuple[float, float]] = {"gru_cal": (1.0, 1.0), "gru_calg125": (1.25, 1.25)}
 # 判定をかける候補
-CANDIDATES: tuple[str, ...] = ("gru", "gru_cal")
+CANDIDATES: tuple[str, ...] = ("gru", "gru_cal", "gru_calg125")
 # CFG の比較（種 42 のみ。判定には使わない）
 GRU_CFG_COMPARE = 1.25
 
@@ -164,6 +173,9 @@ GROUP_FLOOR_SIMS = 50                            # 群ごとの床の見積も�
 CFG_SWEEP: tuple[float, ...] = (1.0, 1.25, 1.5, 2.0)
 DDPM_TRAIN_G = 1.25                              # DDPM の学習時のプールの CFG の強さ
 DDPM_G1_SEEDS: tuple[int, ...] = (42, 43, 44)    # DDPM の g = 1.0 のプールがある種（H7 で作成）
+# 群ごとの表と図に並べる (arm, g)
+GROUP_ARMS: tuple[tuple[str, float], ...] = (("gru", 1.0), ("gru_cal", 1.0), ("gru_calg125", 1.25),
+                                             ("ddpm_tf96", 1.25))
 AGE_LABELS: tuple[str, ...] = ("15-24", "25-34", "35-44", "45-54", "55-64", "65-74", "75+")
 # 小プールの生成の乱数だけによる揺れを測る種の数（GRU 種 42 の最良の ckpt で引き直す）
 NOISE_DRAWS = 8
@@ -178,15 +190,18 @@ def pool_csv(arm: str, seed: int) -> Path:
         return gm.pool_path(seed)
     if arm == "gru_g1.25":
         return gm.pool_path(seed, GRU_CFG_COMPARE)
-    if arm == "gru_cal":
-        return gm.pool_path(seed, calibrated=True)
+    if arm in GRU_CALIB:
+        calib_g, sample_g = GRU_CALIB[arm]
+        return gm.pool_path(seed, sample_g, calib_guidance=calib_g)
     return rep.pool_csv(DDPM_ARMS[arm], seed)
 
 
 def ckpt_file(arm: str, seed: int) -> Path:
     """arm と種の最良の ckpt"""
+    if arm in GRU_CALIB:
+        return gm.ckpt_path(seed, calib_guidance=GRU_CALIB[arm][0])
     if arm.startswith("gru"):
-        return gm.ckpt_path(seed, calibrated=arm == "gru_cal")
+        return gm.ckpt_path(seed)
     return rep.ckpt_path(DDPM_ARMS[arm], seed)
 
 
@@ -314,7 +329,9 @@ def plot_totals(long: pd.DataFrame, summary: pd.DataFrame, out: Path) -> None:
         for k, arm in enumerate(arms):
             r = _rows(long, arm=arm, activity=a)["ratio"].to_numpy(dtype=np.float64)
             ax.plot(np.full(len(r), k), r, "o", color=ARM_COLOR[arm], ms=7, alpha=0.85,
-                    markeredgecolor="white", markeredgewidth=0.8, label=ARM_LABELS[arm])
+                    markerfacecolor="white" if arm in ARM_HOLLOW else ARM_COLOR[arm],
+                    markeredgecolor=ARM_COLOR[arm] if arm in ARM_HOLLOW else "white",
+                    markeredgewidth=1.4 if arm in ARM_HOLLOW else 0.8, label=ARM_LABELS[arm])
             ax.plot([k - 0.25, k + 0.25], [r.mean()] * 2, color=ARM_COLOR[arm], lw=2.2)
         ax.set_xticks(range(len(arms)), [SHORT_LABELS[a] for a in arms], fontsize=7.5)
         ax.set_xlim(-0.6, len(arms) - 0.4)
@@ -480,12 +497,12 @@ def plot_trajectory(long: pd.DataFrame, out: Path) -> None:
 # Q2 teacher forcing と自分で生成した総量
 # ============================================================
 def teacher_table(pi_atus: FloatArr) -> pd.DataFrame:
-    """候補（gru / gru_cal）の種ごとに、5 活動の総量を 4 通りで並べる
+    """候補（CANDIDATES）の種ごとに、5 活動の総量を 4 通りで並べる
 
     Note:
         ★tf_train は §3.2 の一致の左辺（学習分割の履歴で条件付けた予測確率の加重平均）で、real_train と
           一致するはず。generated − tf_train が「自分の出力で履歴を作ったことによるずれ」（Q2）
-        ★gru_cal は slot_bias を生成の総量に合わせたので、tf_train は real_train からずれる
+        ★gru_cal / gru_calg125 は slot_bias を生成の総量に合わせたので、tf_train は real_train からずれる
 
     Returns:
         列 arm / seed / activity / real_train / tf_train / real_val / tf_val / generated / real_all /
@@ -603,7 +620,7 @@ def curve_table(curves: dict[str, list[FloatArr]], real_curve: FloatArr) -> pd.D
 
 
 def plot_curves(curves: dict[str, list[FloatArr]], real_curve: FloatArr, out: Path) -> None:
-    """12 活動の米国加重の時刻別行動者率（実・GRU・GRU 補正後・DDPM Transformer 型）
+    """12 活動の米国加重の時刻別行動者率（実・GRU・GRU 補正後 g = 1.25・DDPM Transformer 型）
 
     Note:
         ★線は種平均、薄い帯は種の最小〜最大（種が 2 本以上のときだけ）。凡例に種の本数を出す
@@ -614,7 +631,7 @@ def plot_curves(curves: dict[str, list[FloatArr]], real_curve: FloatArr, out: Pa
     import matplotlib.pyplot as plt
     fm = rd._figure_module()
     fm.setup_fonts()
-    arms = [a for a in ("gru", "gru_cal", "ddpm_tf96") if a in curves]
+    arms = [a for a in ("gru", "gru_calg125", "ddpm_tf96") if a in curves]
     stacks = [np.asarray(curves[a], dtype=np.float64) for a in arms]            # (種, 12, 96)
     labels = [f"{ARM_LABELS[a]}・種 {len(st)} 本" for a, st in zip(arms, stacks)]
     hours = cur.slot_hours()
@@ -807,8 +824,8 @@ def pool_csv_g(arm: str, seed: int, g: float) -> Path:
     """arm・種・CFG の強さ g の生成プール CSV（存在は確かめない）"""
     if arm == "gru":
         return gm.pool_path(seed, g)
-    if arm == "gru_cal":
-        return gm.pool_path(seed, g, calibrated=True)
+    if arm in GRU_CALIB:
+        return gm.pool_path(seed, g, calib_guidance=GRU_CALIB[arm][0])
     label = DDPM_ARMS[arm] if g == DDPM_TRAIN_G else f"{DDPM_ARMS[arm]}@g{g:g}"
     return rep.pool_csv(label, seed)
 
@@ -826,6 +843,7 @@ def group_runs() -> list[tuple[str, float, int]]:
     """群別・CFG の部で読む (arm, g, 種) の並び"""
     runs = [("gru", 1.0, s) for s in ARM_SEEDS["gru"]]
     runs += [("gru_cal", g, s) for g in CFG_SWEEP for s in ARM_SEEDS["gru_cal"]]
+    runs += [("gru_calg125", 1.25, s) for s in ARM_SEEDS["gru_calg125"]]
     runs += [("ddpm_tf96", DDPM_TRAIN_G, s) for s in ARM_SEEDS["ddpm_tf96"]]
     runs += [("ddpm_tf96", 1.0, s) for s in DDPM_G1_SEEDS]
     return runs
@@ -837,8 +855,8 @@ def make_cfg_pools() -> None:
         if g == gm.GUIDANCE_SCALE:
             continue
         for seed in ARM_SEEDS["gru_cal"]:
-            ckpt = gm.ckpt_path(seed, calibrated=True)
-            out = gm.pool_path(seed, g, calibrated=True)
+            ckpt = gm.ckpt_path(seed, calib_guidance=1.0)
+            out = gm.pool_path(seed, g, calib_guidance=1.0)
             if out.exists() and out.stat().st_mtime > ckpt.stat().st_mtime:
                 continue
             gm.write_pool(gm.load_model(ckpt), out, g)
@@ -899,7 +917,7 @@ def group_table(long: pd.DataFrame, real: People, floor: FloatArr) -> pd.DataFra
     n_atus = np.bincount(real[1], minlength=sm.D_GROUPS)
     out = pd.DataFrame({"group": np.arange(sm.D_GROUPS), "label": [group_label(dd) for dd in range(sm.D_GROUPS)],
                         "n_atus": n_atus, "floor": floor})
-    for arm, g in (("gru", 1.0), ("gru_cal", 1.0), ("ddpm_tf96", DDPM_TRAIN_G)):
+    for arm, g in GROUP_ARMS:
         sub = _rows(long, arm=arm, g=g)
         idx = sub["group"].to_numpy(dtype=np.int64)
         m = (np.bincount(idx, weights=sub["mse"].to_numpy(dtype=np.float64), minlength=sm.D_GROUPS)
@@ -928,9 +946,11 @@ def plot_groups(table: pd.DataFrame, out: Path) -> None:
     fig, ax = plt.subplots(figsize=(15, 5.2))
     xs = np.arange(len(table))
     ax.axhline(1.0, color="#8f8f8b", lw=1.2)
-    for k, (arm, g) in enumerate((("gru", 1.0), ("gru_cal", 1.0), ("ddpm_tf96", DDPM_TRAIN_G))):
-        ax.plot(xs + (k - 1) * 0.22, table[f"{arm}@g{g:g}_ratio"], "o", color=ARM_COLOR[arm], ms=7,
-                markeredgecolor="white", markeredgewidth=0.8, label=ARM_LABELS[arm])
+    for k, (arm, g) in enumerate(GROUP_ARMS):
+        ax.plot(xs + (k - 1.5) * 0.18, table[f"{arm}@g{g:g}_ratio"], "o", color=ARM_COLOR[arm], ms=7,
+                markerfacecolor="white" if arm in ARM_HOLLOW else ARM_COLOR[arm],
+                markeredgecolor=ARM_COLOR[arm] if arm in ARM_HOLLOW else "white",
+                markeredgewidth=1.4 if arm in ARM_HOLLOW else 0.8, label=ARM_LABELS[arm])
     ax.set_xticks(xs, [f"{lab}（{n}）" for lab, n in zip(table["label"], table["n_atus"])],
                   rotation=60, ha="right", fontsize=8)
     ax.set_ylabel("群ごとの MSE / 床", fontsize=10)
@@ -938,7 +958,7 @@ def plot_groups(table: pd.DataFrame, out: Path) -> None:
     ax.grid(axis="y", color="#e6e6e3", lw=0.6)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.13), ncol=3, frameon=False, fontsize=10)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.13), ncol=len(GROUP_ARMS), frameon=False, fontsize=10)
     fig.suptitle("群ごとの MSE", y=1.02, fontsize=13)
     fig.tight_layout()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -966,7 +986,11 @@ def plot_cfg(runs: pd.DataFrame, sep_ref: FloatArr, out: Path) -> None:
     for ax, (metric, title) in zip(axes, panels):
         gs, mean, lo, hi = _by_g(_rows(runs, arm="gru_cal"), metric)
         ax.fill_between(gs, lo, hi, color=ARM_COLOR["gru_cal"], alpha=0.18, lw=0)
-        ax.plot(gs, mean, "-o", color=ARM_COLOR["gru_cal"], lw=2, ms=5, label="GRU 補正後")
+        ax.plot(gs, mean, "-o", color=ARM_COLOR["gru_cal"], lw=2, ms=6, markerfacecolor="white",
+                markeredgewidth=1.4, label="GRU 補正後（g=1.0 で補正）")
+        g125 = _rows(runs, arm="gru_calg125")[metric].to_numpy(dtype=np.float64)
+        ax.plot([1.25], [g125.mean()], "D", color=ARM_COLOR["gru_calg125"], ms=8, markeredgecolor="white",
+                label="GRU 補正後（g=1.25 で補正）")
         gd, mean_d, _, _ = _by_g(_rows(runs, arm="ddpm_tf96"), metric)
         ax.plot(gd, mean_d, "s", color=ARM_COLOR["ddpm_tf96"], ms=7, label="DDPM Transformer 型")
         if metric == "separation_ratio":
