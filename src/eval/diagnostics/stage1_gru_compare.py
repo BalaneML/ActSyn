@@ -10,6 +10,7 @@ GRU_Aggregate（再帰型＋交差エントロピー）と DDPM の Stage 1 を�
 比べるもの（ARM_SEEDS）:
 
     gru           本計画のモデル（g = 1.0）                       種 42〜46
+    gru_cal       gru の slot_bias を学習後に補正（計画書 §9）   種 42〜46
     ddpm_tf96     clock_tf96（学習時のプール、g = 1.25）          種 42〜46
     ddpm_noclock  時刻符号なしの DDPM（ガードレールの外側の基準）  種 42〜44
 
@@ -26,13 +27,13 @@ GRU_Aggregate（再帰型＋交差エントロピー）と DDPM の Stage 1 を�
                 rate_mse_astar              : 28 群ごとの値 vs 日本の教師 A*（論文の rate_mse と同じ定義）
                 床: 完全なモデルでも出る MSE は floor_pool 〜 floor_real + floor_pool の間
 
-判定（計画書 §4.3。結果を見る前に固定）:
+判定（計画書 §4.3。結果を見る前に固定）。候補 CANDIDATES（gru / gru_cal）のそれぞれにかける:
 
-    C1  5 活動のうち C_MIN_ACTS 以上で、gru の総量の比の種間 sd ≤ ddpm_tf96 の種間 sd × C1_SD_RATIO
-    C2  5 活動のうち C_MIN_ACTS 以上で、|gru の総量の比の種平均 − 1| ≤ 床
+    C1  5 活動のうち C_MIN_ACTS 以上で、候補の総量の比の種間 sd ≤ ddpm_tf96 の種間 sd × C1_SD_RATIO
+    C2  5 活動のうち C_MIN_ACTS 以上で、|候補の総量の比の種平均 − 1| ≤ 床
         床 = ATUS の回答者を復元抽出したときの比の sd × FLOOR_Z（米国加重で作り直す）
-    C3  4 指標それぞれで「gru の種の最大値 ≤ ddpm_noclock の種の最大値」、かつ暗記の判定が 0 本
-        ★計画書の「ddpm_noclock の種の最大値を超えない」を、gru のすべての種に課す形で読む
+    C3  4 指標それぞれで「候補の種の最大値 ≤ ddpm_noclock の種の最大値」、かつ暗記の判定が 0 本
+        ★計画書の「ddpm_noclock の種の最大値を超えない」を、候補のすべての種に課す形で読む
 
 データフロー:
 
@@ -115,6 +116,7 @@ FLOOR_Z: float = rd.FLOOR_Z
 # 比べるもの
 ARM_SEEDS: dict[str, tuple[int, ...]] = {
     "gru": (42, 43, 44, 45, 46),
+    "gru_cal": (42, 43, 44, 45, 46),
     "ddpm_tf96": (42, 43, 44, 45, 46),
     "ddpm_noclock": (42, 43, 44),
 }
@@ -122,9 +124,20 @@ DDPM_ARMS: dict[str, str] = {"ddpm_tf96": "clock_tf96", "ddpm_noclock": "noclock
 ARM_LABELS: dict[str, str] = {
     "gru": "GRU（g=1.0）",
     "gru_g1.25": "GRU（g=1.25）",
+    "gru_cal": "GRU 補正後（g=1.0）",
     "ddpm_tf96": "DDPM Transformer 型（g=1.25）",
     "ddpm_noclock": "DDPM 時刻符号なし（g=1.25）",
 }
+# 図の横軸の短い名前
+SHORT_LABELS: dict[str, str] = {"gru": "GRU", "gru_cal": "GRU\n補正後", "ddpm_tf96": "DDPM\nTransformer\n型",
+                                "ddpm_noclock": "DDPM\n時刻符号\nなし"}
+# ★色は arm ごとに固定する（図によって系列の数が違っても同じ arm は同じ色）。
+#   gru / ddpm_tf96 / ddpm_noclock は stage1_ablation_curves.ARM_COLORS の 1〜3 番目と同じ。
+#   gru_cal の赤紫は、この 4 色の並びで validate_palette（色覚の検査）を通った色
+ARM_COLOR: dict[str, str] = {"gru": "#2a78d6", "gru_cal": "#b5179e", "ddpm_tf96": "#eb6834",
+                             "ddpm_noclock": "#1baf7a"}
+# 判定をかける候補
+CANDIDATES: tuple[str, ...] = ("gru", "gru_cal")
 # CFG の比較（種 42 のみ。判定には使わない）
 GRU_CFG_COMPARE = 1.25
 
@@ -155,13 +168,15 @@ def pool_csv(arm: str, seed: int) -> Path:
         return gm.pool_path(seed)
     if arm == "gru_g1.25":
         return gm.pool_path(seed, GRU_CFG_COMPARE)
+    if arm == "gru_cal":
+        return gm.pool_path(seed, calibrated=True)
     return rep.pool_csv(DDPM_ARMS[arm], seed)
 
 
 def ckpt_file(arm: str, seed: int) -> Path:
     """arm と種の最良の ckpt"""
     if arm.startswith("gru"):
-        return gm.ckpt_path(seed)
+        return gm.ckpt_path(seed, calibrated=arm == "gru_cal")
     return rep.ckpt_path(DDPM_ARMS[arm], seed)
 
 
@@ -249,7 +264,7 @@ def totals_summary(long: pd.DataFrame, floor: pd.DataFrame) -> pd.DataFrame:
         floor: rd.bootstrap_floor の戻り値（米国加重）
 
     Returns:
-        行 = 活動。{arm}_mean / {arm}_sd、floor（= sd × FLOOR_Z）、c1_pass、c2_pass
+        行 = 活動。{arm}_mean / {arm}_sd、floor（= sd × FLOOR_Z）、候補ごとの {候補}_c1_pass / {候補}_c2_pass
     """
     rows = []
     for a in FOCUS_ACTS:
@@ -260,16 +275,17 @@ def totals_summary(long: pd.DataFrame, floor: pd.DataFrame) -> pd.DataFrame:
             row[f"{arm}_sd"] = float(r.std(ddof=1))
             row[f"{arm}_by_seed"] = "/".join(f"{v:.2f}" for v in r)
         row["floor"] = FLOOR_Z * float(floor.loc[a, "level"])
-        row["c1_pass"] = row["gru_sd"] <= C1_SD_RATIO * row["ddpm_tf96_sd"]
-        row["c2_pass"] = abs(row["gru_mean"] - 1.0) <= row["floor"]
+        for cand in CANDIDATES:
+            row[f"{cand}_c1_pass"] = row[f"{cand}_sd"] <= C1_SD_RATIO * row["ddpm_tf96_sd"]
+            row[f"{cand}_c2_pass"] = abs(row[f"{cand}_mean"] - 1.0) <= row["floor"]
         rows.append(row)
     return pd.DataFrame(rows)
 
 
-def judge_totals(summary: pd.DataFrame) -> dict[str, bool]:
-    """C1・C2 の判定（5 活動のうち C_MIN_ACTS 以上で合格）"""
-    return {"C1": _count(summary, "c1_pass") >= C_MIN_ACTS,
-            "C2": _count(summary, "c2_pass") >= C_MIN_ACTS}
+def judge_totals(summary: pd.DataFrame, cand: str) -> dict[str, bool]:
+    """候補 cand の C1・C2 の判定（5 活動のうち C_MIN_ACTS 以上で合格）"""
+    return {"C1": _count(summary, f"{cand}_c1_pass") >= C_MIN_ACTS,
+            "C2": _count(summary, f"{cand}_c2_pass") >= C_MIN_ACTS}
 
 
 def plot_totals(long: pd.DataFrame, summary: pd.DataFrame, out: Path) -> None:
@@ -280,17 +296,17 @@ def plot_totals(long: pd.DataFrame, summary: pd.DataFrame, out: Path) -> None:
     fm = rd._figure_module()
     fm.setup_fonts()
     arms = list(ARM_SEEDS)
-    fig, axes = plt.subplots(1, len(FOCUS_ACTS), figsize=(17, 4.2))
+    fig, axes = plt.subplots(1, len(FOCUS_ACTS), figsize=(22, 4.4))
     for ax, a in zip(axes, FOCUS_ACTS):
         lim = float(_rows(summary, activity=a)["floor"].iloc[0])
         ax.axhspan(1 - lim, 1 + lim, color="#d9d9d6", alpha=0.6, lw=0)
         ax.axhline(1.0, color=fm.COLOR_ATUS, lw=1.2)
         for k, arm in enumerate(arms):
             r = _rows(long, arm=arm, activity=a)["ratio"].to_numpy(dtype=np.float64)
-            ax.plot(np.full(len(r), k), r, "o", color=fm.ARM_COLORS[k], ms=7, alpha=0.85,
+            ax.plot(np.full(len(r), k), r, "o", color=ARM_COLOR[arm], ms=7, alpha=0.85,
                     markeredgecolor="white", markeredgewidth=0.8, label=ARM_LABELS[arm])
-            ax.plot([k - 0.25, k + 0.25], [r.mean()] * 2, color=fm.ARM_COLORS[k], lw=2.2)
-        ax.set_xticks(range(len(arms)), ["GRU", "DDPM\nTransformer 型", "DDPM\n時刻符号なし"], fontsize=8)
+            ax.plot([k - 0.25, k + 0.25], [r.mean()] * 2, color=ARM_COLOR[arm], lw=2.2)
+        ax.set_xticks(range(len(arms)), [SHORT_LABELS[a] for a in arms], fontsize=7.5)
         ax.set_xlim(-0.6, len(arms) - 0.4)
         ax.set_title(f"{cur.ACT_JA[a]}（{a}）", fontsize=11)
         ax.grid(axis="y", color="#e6e6e3", lw=0.6)
@@ -454,14 +470,15 @@ def plot_trajectory(long: pd.DataFrame, out: Path) -> None:
 # Q2 teacher forcing と自分で生成した総量
 # ============================================================
 def teacher_table(pi_atus: FloatArr) -> pd.DataFrame:
-    """GRU の種ごとに、5 活動の総量を 4 通りで並べる
+    """候補（gru / gru_cal）の種ごとに、5 活動の総量を 4 通りで並べる
 
     Note:
         ★tf_train は §3.2 の一致の左辺（学習分割の履歴で条件付けた予測確率の加重平均）で、real_train と
           一致するはず。generated − tf_train が「自分の出力で履歴を作ったことによるずれ」（Q2）
+        ★gru_cal は slot_bias を生成の総量に合わせたので、tf_train は real_train からずれる
 
     Returns:
-        列 seed / activity / real_train / tf_train / real_val / tf_val / generated / real_all /
+        列 arm / seed / activity / real_train / tf_train / real_val / tf_val / generated / real_all /
         gen_minus_tf（generated − tf_train）/ gen_over_tf
     """
     train_part, val_part = gm.load_split()
@@ -470,14 +487,14 @@ def teacher_table(pi_atus: FloatArr) -> pd.DataFrame:
     sched_r, d_r, w_r = rd.model_order_people()
     real_all = us_weighted_slot_rates(agr.group_rates(sched_r, d_r, w_r), pi_atus)
     rows = []
-    for seed in ARM_SEEDS["gru"]:
-        model = gm.load_model(gm.ckpt_path(seed))
+    for arm, seed in [(a, s) for a in CANDIDATES for s in ARM_SEEDS[a]]:
+        model = gm.load_model(ckpt_file(arm, seed))
         tf_train = gm.teacher_forced_rates(model, train_part.sched, train_part.cond_idx, train_part.weight)
         tf_val = gm.teacher_forced_rates(model, val_part.sched, val_part.cond_idx, val_part.weight)
-        generated = us_weighted_slot_rates(cur.pool_to_slot_rates(load_pool("gru", seed)), pi_atus)
+        generated = us_weighted_slot_rates(cur.pool_to_slot_rates(load_pool(arm, seed)), pi_atus)
         for a in FOCUS_ACTS:
             c = cur.ACT_NAMES.index(a)
-            row = {"seed": seed, "activity": a,
+            row = {"arm": arm, "seed": seed, "activity": a,
                    **{k: float(v[c].mean()) for k, v in (("real_train", real_train), ("tf_train", tf_train),
                                                          ("real_val", real_val), ("tf_val", tf_val),
                                                          ("generated", generated), ("real_all", real_all))}}
@@ -518,11 +535,12 @@ def guard_long(real: People) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def guard_summary(long: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
-    """指標ごとに arm の種の最大値を並べ、C3 を判定する
+def guard_summary(long: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, bool]]:
+    """指標ごとに arm の種の最大値を並べ、候補ごとに C3 を判定する
 
     Returns:
-        (行 = 指標。{arm}_max / {arm}_mean / pass（gru_max ≤ ddpm_noclock_max）, C3 の判定)
+        (行 = 指標。{arm}_max / {arm}_mean / {候補}_pass（{候補}_max ≤ ddpm_noclock_max）,
+         候補 → C3 の判定)
     """
     rows = []
     for k in GUARD_METRICS:
@@ -531,11 +549,13 @@ def guard_summary(long: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
             v = _rows(long, arm=arm)[k].to_numpy(dtype=np.float64)
             row[f"{arm}_mean"] = float(v.mean())
             row[f"{arm}_max"] = float(v.max())
-        row["pass"] = row["gru_max"] <= row["ddpm_noclock_max"]
+        for cand in CANDIDATES:
+            row[f"{cand}_pass"] = row[f"{cand}_max"] <= row["ddpm_noclock_max"]
         rows.append(row)
     summary = pd.DataFrame(rows)
-    n_mem = _count(_rows(long, arm="gru"), "memorized")
-    return summary, bool(summary["pass"].all()) and n_mem == 0
+    c3 = {cand: _count(summary, f"{cand}_pass") == len(GUARD_METRICS)
+          and _count(_rows(long, arm=cand), "memorized") == 0 for cand in CANDIDATES}
+    return summary, c3
 
 
 # ============================================================
@@ -573,7 +593,7 @@ def curve_table(curves: dict[str, list[FloatArr]], real_curve: FloatArr) -> pd.D
 
 
 def plot_curves(curves: dict[str, list[FloatArr]], real_curve: FloatArr, out: Path) -> None:
-    """12 活動の米国加重の時刻別行動者率（実・GRU・DDPM Transformer 型）
+    """12 活動の米国加重の時刻別行動者率（実・GRU・GRU 補正後・DDPM Transformer 型）
 
     Note:
         ★線は種平均、薄い帯は種の最小〜最大（種が 2 本以上のときだけ）。凡例に種の本数を出す
@@ -584,18 +604,20 @@ def plot_curves(curves: dict[str, list[FloatArr]], real_curve: FloatArr, out: Pa
     import matplotlib.pyplot as plt
     fm = rd._figure_module()
     fm.setup_fonts()
-    arms = ["gru", "ddpm_tf96"]
+    arms = [a for a in ("gru", "gru_cal", "ddpm_tf96") if a in curves]
     stacks = [np.asarray(curves[a], dtype=np.float64) for a in arms]            # (種, 12, 96)
     labels = [f"{ARM_LABELS[a]}・種 {len(st)} 本" for a, st in zip(arms, stacks)]
     hours = cur.slot_hours()
     fig, axes = plt.subplots(4, 3, figsize=(15, 13.2))
     for c, name in enumerate(cur.ACT_NAMES):
         ax = axes[c // 3][c % 3]
-        for k, st in enumerate(stacks):
+        ax.plot(hours, real_curve[c], color=fm.COLOR_ATUS, lw=2.6, label=fm.LABEL_ATUS, solid_capstyle="round")
+        for arm, st, label in zip(arms, stacks, labels):
             if len(st) >= 2:
                 ax.fill_between(hours, st[:, c].min(axis=0), st[:, c].max(axis=0),
-                                color=fm.ARM_COLORS[k], alpha=0.16, lw=0)
-        fm.plot_lines(ax, hours, real_curve[c], [st[:, c].mean(axis=0) for st in stacks], labels)
+                                color=ARM_COLOR[arm], alpha=0.14, lw=0)
+            ax.plot(hours, st[:, c].mean(axis=0), color=ARM_COLOR[arm], lw=1.6, label=label,
+                    solid_capstyle="round", solid_joinstyle="round")
         fm.style_axis(ax, 4.0, 28.0, 4.0)
         ax.set_ylim(bottom=0.0)
         ax.set_title(f"{cur.ACT_JA[name]}（{name}）", fontsize=11)
@@ -717,15 +739,17 @@ def run_totals() -> None:
     floor = rd.bootstrap_floor(real, pi_atus)
     long = totals_long(pi_atus, real_prof)
     summary = totals_summary(long, floor)
-    verdict = judge_totals(summary)
+    verdicts = {cand: judge_totals(summary, cand) for cand in CANDIDATES}
     _show("ATUS 実（米国加重）", real_prof.reset_index(names="activity"))
     _show("Q1 総量の比（生成 / 実）の種平均・種間 sd と C1・C2", summary)
     g125 = _rows(long, arm="gru_g1.25")
     if len(g125):
         _show("参考: GRU 種 42 の g = 1.25（判定に使わない）", g125)
-    print(f"\nC1（sd ≤ DDPM × {C1_SD_RATIO}、{_count(summary, 'c1_pass')}/5 活動）: "
-          f"{'合格' if verdict['C1'] else '不合格'}")
-    print(f"C2（|比 − 1| ≤ 床、{_count(summary, 'c2_pass')}/5 活動）: {'合格' if verdict['C2'] else '不合格'}")
+    for cand, verdict in verdicts.items():
+        print(f"\n[{cand}] C1（sd ≤ DDPM × {C1_SD_RATIO}、{_count(summary, f'{cand}_c1_pass')}/5 活動）: "
+              f"{'合格' if verdict['C1'] else '不合格'}")
+        print(f"[{cand}] C2（|比 − 1| ≤ 床、{_count(summary, f'{cand}_c2_pass')}/5 活動）: "
+              f"{'合格' if verdict['C2'] else '不合格'}")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     long.to_csv(OUT_DIR / "stage1_gru_totals_long.csv", index=False)
     summary.to_csv(OUT_DIR / "stage1_gru_totals.csv", index=False)
@@ -749,7 +773,7 @@ def run_teacher() -> None:
     _, pi_atus, _ = setup()
     table = teacher_table(pi_atus)
     _show("Q2 総量: 実データの履歴で条件付けた予測（tf）と自分で生成した値", table)
-    agg = table.groupby("activity", sort=False)[["gen_minus_tf", "gen_over_tf"]].agg(["mean", "std"])
+    agg = table.groupby(["arm", "activity"], sort=False)[["gen_minus_tf", "gen_over_tf"]].agg(["mean", "std"])
     print(agg.to_string())
     table.to_csv(OUT_DIR / "stage1_gru_teacher.csv", index=False)
 
@@ -761,7 +785,8 @@ def run_guard() -> None:
     summary, c3 = guard_summary(long)
     _show("Q3 ガードレール（種ごと）", long)
     _show("Q3 種の最大値と C3", summary)
-    print(f"\nC3（4 指標で gru の最大 ≤ noclock の最大、暗記 0 本）: {'合格' if c3 else '不合格'}")
+    for cand, ok in c3.items():
+        print(f"[{cand}] C3（4 指標で候補の最大 ≤ noclock の最大、暗記 0 本）: {'合格' if ok else '不合格'}")
     long.to_csv(OUT_DIR / "stage1_gru_guard_long.csv", index=False)
     summary.to_csv(OUT_DIR / "stage1_gru_guard.csv", index=False)
 

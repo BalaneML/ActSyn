@@ -15,7 +15,12 @@ model.py
     ∂L/∂slot_bias[s, c] = Σ_i w_i (p_θ[i, s, c] − 1[a_{i,s} = c]) / (96 · Σ_i w_i)
     → 勾配が 0 の点では Σ_i w_i p_θ[i, s, c] = Σ_i w_i 1[a_{i,s} = c]（全スロット s・全活動 c）
     ★厳密には、学習で条件を落とした行（確率 P_UNCOND）の予測を含めた混合で成り立つ。
-      学習後の実測は calibration_gap で出す
+      学習後の実測は teacher_forced_gap で出す（ckpt の config では calib_gap_max / calib_gap_mean）
+
+学習後の slot_bias の補正（計画書 §9、--calibrate）:
+    交差エントロピーが縛るのは「実データの履歴で予測した総量」だけで、自分で生成した総量は種ごとに揺れる。
+    そこで学習後に、生成した総量 gen が学習分割の行動者率 target に合うよう slot_bias だけを反復で動かす:
+        slot_bias += CALIB_STEP · log((target + CALIB_EPS) / (gen + CALIB_EPS)).T
 
 構造:
 
@@ -40,6 +45,8 @@ flowchart TD
     CK --> GP["group_pool(model, POOL_N, guidance_scale)<br/>pool (28, 256, 96)"]
     GP --> CSV["pool_path(seed, guidance_scale)<br/>sm.write_pool_csv"]
     CK --> TF["teacher_forced_rates<br/>予測確率の加重平均 (12, 96)"]
+    CK --> CAL["calibrate_slot_bias（--calibrate）<br/>group_pool → generated_rates → bias_update"]
+    CAL --> CCK["ckpt_path(seed, calibrated=True)<br/>pool_path(seed, calibrated=True)"]
 ```
 
 使い方:
@@ -52,6 +59,9 @@ flowchart TD
     # 保存済みの ckpt から CFG の強さを変えたプールだけを作る
     .venv/bin/python src/models/GRU_Aggregate/model.py --seed 42 --pool-only --guidance 1.25
 
+    # 保存済みの ckpt の slot_bias を補正し、_cal の ckpt と生成プールを書く
+    .venv/bin/python src/models/GRU_Aggregate/model.py --seed 42 --calibrate
+
     フラグ:
         --seed S       : 学習の乱数の種（既定 42）。分割は変えない。42 以外は保存先に _s{S}
         --epochs N     : 学習 epoch の上限（既定 EPOCHS=300）
@@ -59,12 +69,15 @@ flowchart TD
         --guidance G   : 生成プールの CFG の強さ（既定 1.0 = CFG なし）。既定以外は保存先に _g{G}
         --no-pool      : 学習後の生成プールを作らない
         --pool-only    : 学習せず、保存済みの ckpt から生成プールだけを作る
+        --calibrate    : 学習せず、保存済みの ckpt の slot_bias を補正して _cal の ckpt と生成プールを書く
         --smoke        : 短時間の動作確認
 
 出力:
     outputs/checkpoints/gru_aggregate{接尾辞}.pt               最良の ckpt（config に学習曲線 history）
     outputs/checkpoints/gru_aggregate{接尾辞}_ep{epoch:04d}.pt 途中の ckpt
     outputs/generated/gru_aggregate_samples{接尾辞}.csv        生成プール（28 群 × 256 本）
+    outputs/checkpoints/gru_aggregate{接尾辞}_cal.pt           slot_bias を補正した ckpt（config に補正の記録）
+    outputs/generated/gru_aggregate_samples{接尾辞}_cal.csv    補正した ckpt の生成プール
 """
 import argparse
 import copy
@@ -143,6 +156,16 @@ SEED: int = sm.SEED                  # 42。学習の乱数の既定値（分割
 POOL_N = 256                         # 群あたりの本数（DDPM の学習時プールと同じ）
 POOL_SEED = 12345                    # DDPM の共通乱数プールと同じ値
 GEN_BATCH = 1024
+
+# 学習後の slot_bias の補正（計画書 §9。結果を見る前に固定）
+CALIB_ITERS = 8                      # 反復の回数（最後の補正の後にもう 1 回測る）
+CALIB_POOL_N = 1024                  # 1 回の反復のプールの群あたりの本数
+CALIB_SEED = 20000                   # 反復 k のプールの種は CALIB_SEED + k（評価の POOL_SEED とは別）
+# ★更新の幅。1.0 は履歴に依らない分布なら 1 回で目標に一致する幅だが、GRU では振動した（計画書 §9.3）。
+#   1 回が長い活動では slot_bias の変化が「始める」と「続ける」の両方に効き、総量が約 2 倍動くため
+CALIB_STEP = 0.5
+CALIB_EPS = 1e-4                     # 行動者率 0 のセルで log を発散させない値
+CALIB_TAG = "_cal"                   # 補正した ckpt・プールの接尾辞
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu"
 
@@ -416,7 +439,7 @@ def train(epochs: int = EPOCHS, seed: int = SEED, save_path: Path | None = MODEL
 
     assert best_state is not None
     model.load_state_dict(best_state)
-    gap = calibration_gap(model, train_part)
+    gap = teacher_forced_gap(model, train_part)
     print(f"restored best: epoch {best_epoch} (val {best_val:.5f}) | "
           f"calibration gap on train: max {gap['max']:.2e}, mean {gap['mean']:.2e}", flush=True)
     if save_path is not None:
@@ -574,7 +597,7 @@ def teacher_forced_rates(model: GRUScheduler, sched: IntArr, cond_idx: IntArr, w
     return (acc / weight.sum()).T
 
 
-def calibration_gap(model: GRUScheduler, part: SplitPart) -> dict[str, float]:
+def teacher_forced_gap(model: GRUScheduler, part: SplitPart) -> dict[str, float]:
     """|teacher_forced_rates − 行動者率| の最大と平均（§3.2 の一致がどこまで成り立っているか）"""
     tf = teacher_forced_rates(model, part.sched, part.cond_idx, part.weight)
     real = sm.population_rates(part.sched, part.weight).numpy().astype(np.float64)
@@ -583,22 +606,122 @@ def calibration_gap(model: GRUScheduler, part: SplitPart) -> dict[str, float]:
 
 
 # ============================================================
-# 6. 保存先
+# 6. 学習後の slot_bias の補正（計画書 §9）
+# ============================================================
+def split_group_weights(part: SplitPart) -> FloatArr:
+    """分割の TUFINLWGT を群ごとに足して正規化した群の重み, -> (28,)"""
+    d = sm.cond_to_d(part.cond_idx)
+    tot = np.bincount(d, weights=part.weight, minlength=D_GROUPS).astype(np.float64)
+    return tot / tot.sum()
+
+
+def generated_rates(pool: IntArr, pi_d: FloatArr) -> FloatArr:
+    """群別プールの時刻別行動者率を、群の重み pi_d で 1 本にする, (28, M, 96) -> (12, 96)
+
+    Args:
+        pool: 群別サンプルプール, (D_GROUPS, M, NUM_SLOTS)
+        pi_d: 群の重み, (D_GROUPS,)。和が 1
+
+    Returns:
+        加重平均の時刻別行動者率, dtype=float64, (NUM_ACT, NUM_SLOTS)
+    """
+    rates = (pool[..., None] == np.arange(NUM_ACT)).mean(axis=1)            # (28, 96, 12)
+    return np.asarray(np.einsum("d,dsc->cs", pi_d, rates), dtype=np.float64)
+
+
+def bias_update(gen: FloatArr, target: FloatArr, step: float = CALIB_STEP,
+                eps: float = CALIB_EPS) -> FloatArr:
+    """slot_bias に足す量 step · log((target + eps) / (gen + eps)), (12, 96) -> (96, 12)
+
+    Note:
+        ★logits が履歴に依らない分布（softmax(slot_bias) そのもの）なら、step = 1・eps = 0 の 1 回で
+          softmax の出力が target に一致する。GRU は履歴に依るので、反復して近づける
+
+    Args:
+        gen: 生成した時刻別行動者率, (NUM_ACT, NUM_SLOTS)
+        target: 目標の時刻別行動者率, (NUM_ACT, NUM_SLOTS)
+        step: 更新の幅, default=CALIB_STEP=0.5
+        eps: 分母と分子に足す値, default=CALIB_EPS=1e-4
+
+    Returns:
+        slot_bias と同じ形の更新量, (NUM_SLOTS, NUM_ACT)
+    """
+    return np.asarray(step * np.log((target + eps) / (gen + eps)), dtype=np.float64).T
+
+
+def calibrate_slot_bias(model: GRUScheduler, target: FloatArr, pi_d: FloatArr,
+                        iters: int = CALIB_ITERS, n_per_group: int = CALIB_POOL_N,
+                        seed: int = CALIB_SEED, verbose: bool = True) -> list[dict[str, Any]]:
+    """生成した時刻別行動者率が target に合うよう、slot_bias だけを反復で動かす（model を書き換える）
+
+    Note:
+        1. 反復 k では、種 seed + k のプール（g = 1.0）を作り、generated_rates で 1 本にしてから bias_update を足す
+        2. 最後の補正の後にもう 1 回プールを作って測る（戻り値の最後の要素。slot_bias は変えない）
+
+    Args:
+        model: 学習済みのモデル
+        target: 目標の時刻別行動者率, (NUM_ACT, NUM_SLOTS)。学習分割の sm.population_rates
+        pi_d: 生成側の群の重み, (D_GROUPS,)。目標と同じ群構成（split_group_weights(学習分割)）
+        iters: 補正の回数, default=CALIB_ITERS=8
+        n_per_group: 1 回のプールの群あたりの本数, default=CALIB_POOL_N=1024
+        seed: 1 回目のプールの種, default=CALIB_SEED=20000
+        verbose: 反復ごとに差を print するか
+
+    Returns:
+        反復ごとの記録 [{"iter", "max_abs_gap", "mean_abs_gap", "total_ratio"（12 活動の 生成 / 目標）}]。
+        長さは iters + 1
+    """
+    history: list[dict[str, Any]] = []
+    for k in range(iters + 1):
+        gen = generated_rates(group_pool(model, n_per_group, GUIDANCE_SCALE, seed=seed + k), pi_d)
+        gap = np.abs(gen - target)
+        ratio = gen.mean(axis=1) / target.mean(axis=1)
+        history.append({"iter": k, "max_abs_gap": float(gap.max()), "mean_abs_gap": float(gap.mean()),
+                        "total_ratio": [float(v) for v in ratio]})
+        if verbose:
+            print(f"calib {k} | max |gen - target| {gap.max():.4f} | mean {gap.mean():.5f} | total ratio "
+                  + " ".join(f"{sm.ACT_NAMES[c][:4]}={ratio[c]:.3f}" for c in range(NUM_ACT)), flush=True)
+        if k == iters:
+            break
+        with torch.no_grad():
+            model.slot_bias.add_(torch.as_tensor(bias_update(gen, target)).to(model.slot_bias))
+    return history
+
+
+def run_calibration(seed: int) -> None:
+    """保存済みの最良の ckpt の slot_bias を補正し、_cal の ckpt と生成プール（g = 1.0）を書く"""
+    source = ckpt_path(seed)
+    model = load_model(source)
+    train_part, _ = load_split()
+    target = sm.population_rates(train_part.sched, train_part.weight).numpy().astype(np.float64)
+    history = calibrate_slot_bias(model, target, split_group_weights(train_part))
+    out = ckpt_path(seed, calibrated=True)
+    save_ckpt(model, out, seed, extra={"calibrated_from": source.name, "calibration": {
+        "iters": CALIB_ITERS, "pool_n": CALIB_POOL_N, "seed": CALIB_SEED, "step": CALIB_STEP,
+        "eps": CALIB_EPS, "history": history}})
+    print(f"saved calibrated model to {out}")
+    write_pool(model, pool_path(seed, GUIDANCE_SCALE, calibrated=True), GUIDANCE_SCALE)
+
+
+# ============================================================
+# 7. 保存先
 # ============================================================
 def run_suffix(seed: int) -> str:
     """保存先の接尾辞。種 42 は空、それ以外は _s{seed}（DDPM と同じ規則）"""
     return "" if seed == SEED else f"_s{seed}"
 
 
-def ckpt_path(seed: int) -> Path:
-    """最良の ckpt のパス"""
-    return MODEL_SAVE_PATH.with_name(f"{MODEL_SAVE_PATH.stem}{run_suffix(seed)}{MODEL_SAVE_PATH.suffix}")
+def ckpt_path(seed: int, calibrated: bool = False) -> Path:
+    """最良の ckpt のパス。calibrated=True なら slot_bias を補正した ckpt（_cal）"""
+    cal = CALIB_TAG if calibrated else ""
+    return MODEL_SAVE_PATH.with_name(f"{MODEL_SAVE_PATH.stem}{run_suffix(seed)}{cal}{MODEL_SAVE_PATH.suffix}")
 
 
-def pool_path(seed: int, guidance_scale: float = GUIDANCE_SCALE) -> Path:
-    """生成プールの CSV のパス。CFG の強さが既定以外なら _g{G} を付ける"""
+def pool_path(seed: int, guidance_scale: float = GUIDANCE_SCALE, calibrated: bool = False) -> Path:
+    """生成プールの CSV のパス。補正した ckpt なら _cal、CFG の強さが既定以外なら _g{G} を付ける"""
+    cal = CALIB_TAG if calibrated else ""
     tag = "" if guidance_scale == GUIDANCE_SCALE else f"_g{guidance_scale:g}"
-    return GEN_SAVE_PATH.with_name(f"{GEN_SAVE_PATH.stem}{run_suffix(seed)}{tag}{GEN_SAVE_PATH.suffix}")
+    return GEN_SAVE_PATH.with_name(f"{GEN_SAVE_PATH.stem}{run_suffix(seed)}{cal}{tag}{GEN_SAVE_PATH.suffix}")
 
 
 def write_pool(model: GRUScheduler, path: Path, guidance_scale: float) -> None:
@@ -632,10 +755,13 @@ def main() -> None:
     ap.add_argument("--guidance", type=float, default=GUIDANCE_SCALE)
     ap.add_argument("--no-pool", action="store_true")
     ap.add_argument("--pool-only", action="store_true")
+    ap.add_argument("--calibrate", action="store_true")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     if args.no_pool and args.pool_only:
         ap.error("--no-pool と --pool-only は併用できない")
+    if args.calibrate and (args.pool_only or args.no_pool or args.guidance != GUIDANCE_SCALE):
+        ap.error("--calibrate は --pool-only / --no-pool / --guidance と併用できない（補正は g = 1.0 で行う）")
 
     ckpt = ckpt_path(args.seed)
     pool = pool_path(args.seed, args.guidance)
@@ -644,6 +770,9 @@ def main() -> None:
     print(f"[config] ckpt={ckpt.name}  pool={pool.name}")
     if args.smoke:
         smoke()
+        return
+    if args.calibrate:
+        run_calibration(args.seed)
         return
     if args.pool_only:
         model = load_model(ckpt)

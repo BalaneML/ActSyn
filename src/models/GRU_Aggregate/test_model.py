@@ -10,6 +10,8 @@ GRU_Aggregate の単体テスト（計画書 §7）
                      write_pool_csv → load_sample_pool で往復する
     f. teacher forcing の行動者率 : teacher_forced_rates が手で計算した加重平均と一致する（分割して通しても同じ）
     g. 保存と読み込み : 同じ構造・同じ出力が戻る。本番の幅でパラメータ数が 1,829,064
+    h. slot_bias の補正（§9） : 履歴に依らない分布なら bias_update の 1 回で目標に一致する。
+                     generated_rates が手計算と一致する。calibrate_slot_bias は slot_bias だけを変える
 
 ★ out_proj は零初期化なので、そのままでは logits が slot_bias だけになり a・d が何も測れない。
   _wake_up で out_proj を小さな乱数で埋めてから測る（テスト用の細工で、学習経路は変えない）。
@@ -216,7 +218,39 @@ def test_save_load() -> None:
     assert gm.count_params(gm.GRUScheduler()) == 1_829_064
     assert gm.ckpt_path(42).name == "gru_aggregate.pt" and gm.ckpt_path(43).name == "gru_aggregate_s43.pt"
     assert gm.pool_path(42, 1.25).name == "gru_aggregate_samples_g1.25.csv"
+    assert gm.ckpt_path(43, calibrated=True).name == "gru_aggregate_s43_cal.pt"
+    assert gm.pool_path(42, calibrated=True).name == "gru_aggregate_samples_cal.csv"
     print("  g. 保存と読み込み・パラメータ数・保存先: OK")
+
+
+def test_calibration() -> None:
+    """h. bias_update の 1 回で目標に一致する（履歴に依らない分布）。補正は slot_bias だけを変える"""
+    g = torch.Generator().manual_seed(0)
+    bias = torch.randn(gm.NUM_SLOTS, gm.NUM_ACT, generator=g, dtype=torch.float64)
+    gen = torch.softmax(bias, dim=-1).T.numpy()                                   # (12, 96)
+    target = torch.softmax(torch.randn(gm.NUM_SLOTS, gm.NUM_ACT, generator=g, dtype=torch.float64),
+                           dim=-1).T.numpy()
+    new = torch.softmax(bias + torch.as_tensor(gm.bias_update(gen, target, step=1.0, eps=0.0)), dim=-1).T
+    assert np.allclose(new.numpy(), target, atol=1e-12), "1 回の更新で目標に一致しない"
+
+    rng = np.random.default_rng(0)
+    pool = rng.integers(0, gm.NUM_ACT, size=(gm.D_GROUPS, 5, gm.NUM_SLOTS))
+    pi = rng.random(gm.D_GROUPS)
+    pi /= pi.sum()
+    manual = np.zeros((gm.NUM_ACT, gm.NUM_SLOTS))
+    for d in range(gm.D_GROUPS):
+        for c in range(gm.NUM_ACT):
+            manual[c] += pi[d] * (pool[d] == c).mean(axis=0)
+    assert np.allclose(gm.generated_rates(pool, pi), manual), "generated_rates が手計算と違う"
+
+    m = _model()
+    before = {k: v.clone() for k, v in m.state_dict().items()}
+    hist = gm.calibrate_slot_bias(m, manual, pi, iters=2, n_per_group=2, seed=0, verbose=False)
+    after = m.state_dict()
+    changed = {k for k in before if not torch.equal(before[k], after[k])}
+    assert changed == {"slot_bias"}, f"slot_bias 以外が変わった: {changed}"
+    assert len(hist) == 3 and [h["iter"] for h in hist] == [0, 1, 2]
+    print("  h. slot_bias の補正（1 回で目標に一致・slot_bias だけを変える）: OK")
 
 
 if __name__ == "__main__":
@@ -228,4 +262,5 @@ if __name__ == "__main__":
     test_sampling()
     test_teacher_forced_rates()
     test_save_load()
+    test_calibration()
     print("test_model: OK")
