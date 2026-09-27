@@ -517,8 +517,12 @@ def draw_categorical(logits: torch.Tensor, generator: torch.Generator | None) ->
 
 @torch.no_grad()
 def sample(model: GRUScheduler, cond_idx: torch.Tensor, guidance_scale: float = GUIDANCE_SCALE,
-           generator: torch.Generator | None = None) -> torch.Tensor:
+           generator: torch.Generator | None = None, extra_bias: torch.Tensor | None = None) -> torch.Tensor:
     """s = 0..95 の順に 1 スロットずつ引いて 1 日を作る（温度 1.0）
+
+    Note:
+        ★extra_bias は CFG の後の logits に 1 回だけ足す。条件付き・条件なしの両方に足すのと同じ
+          （(l_u + δ) + g·((l_c + δ) − (l_u + δ)) = l_u + g·(l_c − l_u) + δ）
 
     Args:
         model: 学習済みのモデル
@@ -526,6 +530,7 @@ def sample(model: GRUScheduler, cond_idx: torch.Tensor, guidance_scale: float = 
         guidance_scale: logits の CFG の強さ g, default=GUIDANCE_SCALE=1.0。
             1.0 では条件なしの経路を計算しない
         generator: CPU の torch.Generator, default=None
+        extra_bias: 行ごと・スロットごとに logits へ足す値, (B, 96, 12)。None なら足さない（Stage 2 の δ）
 
     Returns:
         生成スケジュール, dtype=int64, (B, 96)。CPU 上、値域 [0, 12)
@@ -544,6 +549,8 @@ def sample(model: GRUScheduler, cond_idx: torch.Tensor, guidance_scale: float = 
             if u_emb is not None:
                 l_uncond, state_u = model.step(a_prev, s, u_emb, state_u)
                 logits = guided_logits(logits, l_uncond, guidance_scale)
+            if extra_bias is not None:
+                logits = logits + extra_bias[:, s].to(logits)
             a = draw_categorical(logits, generator)
             out[:, s] = a
             a_prev = a.to(dev)
@@ -551,7 +558,7 @@ def sample(model: GRUScheduler, cond_idx: torch.Tensor, guidance_scale: float = 
 
 
 def group_pool(model: GRUScheduler, n_per_group: int = POOL_N, guidance_scale: float = GUIDANCE_SCALE,
-               seed: int = POOL_SEED) -> IntArr:
+               seed: int = POOL_SEED, group_bias: FloatArr | None = None) -> IntArr:
     """群別サンプルプールを作る, -> (28, M, 96)。行 d は sm.cond_grid()[d] の条件
 
     Args:
@@ -559,15 +566,20 @@ def group_pool(model: GRUScheduler, n_per_group: int = POOL_N, guidance_scale: f
         n_per_group: 群あたりの本数 M, default=POOL_N=256
         guidance_scale: CFG の強さ, default=GUIDANCE_SCALE=1.0
         seed: 生成の乱数の種, default=POOL_SEED=12345
+        group_bias: 群ごとに logits へ足す値, (D_GROUPS, 96, 12)。None なら足さない（Stage 2 の δ）
 
     Returns:
         群別サンプルプール, dtype=int64, (D_GROUPS, M, NUM_SLOTS)
     """
     grid = torch.as_tensor(sm.cond_grid(), dtype=torch.long)
     flat = grid.repeat_interleave(n_per_group, dim=0)                          # (28·M, 3)
+    flat_d = np.repeat(np.arange(D_GROUPS), n_per_group)                        # (28·M,)
     gen = torch.Generator().manual_seed(seed)
-    outs = [sample(model, flat[i:i + GEN_BATCH], guidance_scale, gen)
-            for i in range(0, flat.size(0), GEN_BATCH)]
+    outs = []
+    for i in range(0, flat.size(0), GEN_BATCH):
+        bias = None if group_bias is None else torch.as_tensor(
+            group_bias[flat_d[i:i + GEN_BATCH]], dtype=torch.float32)        # (B, 96, 12)
+        outs.append(sample(model, flat[i:i + GEN_BATCH], guidance_scale, gen, bias))
     return torch.cat(outs).numpy().astype(np.int64).reshape(D_GROUPS, n_per_group, NUM_SLOTS)
 
 
