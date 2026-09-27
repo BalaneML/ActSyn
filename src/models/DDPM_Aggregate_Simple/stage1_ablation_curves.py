@@ -181,9 +181,10 @@ def main() -> None:
                 ax.set_xlabel("時刻", fontsize=10)
     fig.suptitle(args.title, fontsize=15, y=0.995)
     handles, labels = axes[0][0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False,
-               bbox_to_anchor=(0.5, 0.968), fontsize=10)
-    fig.tight_layout(rect=(0, 0, 1, 0.955))
+    # ★凡例は 3 列まで（arm の名前が長いと 1 行に収まらず左右が切れる）
+    fig.legend(handles, labels, loc="upper center", ncol=min(len(labels), 3), frameon=False,
+               bbox_to_anchor=(0.5, 0.972), fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     out = FIG_DIR / f"stage1_ablation_{args.tag}.png"
     fig.savefig(out, dpi=150)
