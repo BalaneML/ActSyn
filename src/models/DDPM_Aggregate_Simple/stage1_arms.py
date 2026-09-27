@@ -21,6 +21,7 @@ Stage 1 アブレーションの arm の表（唯一の出所）
     clock_tf96_grouprate3   Transformer 型                                  ε + 3·L_rate (group)
     clock_tf96_tbinrate3    Transformer 型                                  ε + 3·L_rate (tbin)
     clock_tf96_poprate3     Transformer 型                                  ε + 3·L_rate (pop)
+    clock_tf96_traj         Transformer 型（clock_tf96 と同じ。途中の ckpt を残す再学習）  ε のみ
 
 段 2・3 の arm は、前の段の判定で土台が決まってから下の ARMS に足す。
 
@@ -106,6 +107,11 @@ ARMS: dict[str, ArmSpec] = {
     "clock_tf96_poprate3": ArmSpec(arch=TF96, rate_lam=3.0, rate_mode="pop",
                                    suffix="_clock_tf96_poprate3",
                                    note="Transformer 型 + L_rate(pop: 目標 r̄、素の二乗) λ=3"),
+    # --- 診断: 少ない活動の総量が ckpt の選び方（最良 epoch）で決まるか（計画 H4） ---
+    # 構造と損失は clock_tf96 と同じ。--save-every で途中の ckpt を残して再学習するため、
+    # 本編の clock_tf96 の ckpt を上書きしないよう接尾辞だけ分ける
+    "clock_tf96_traj": ArmSpec(arch=TF96, suffix="_clock_tf96_traj",
+                               note="Transformer 型 96 次元（途中の ckpt を残す再学習）"),
 }
 
 

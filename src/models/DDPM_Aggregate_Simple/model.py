@@ -24,6 +24,8 @@ model.py
         --no-pool      : 学習後の生成（sanity_check）を飛ばす。生成は stage1_guidance_pool.py で行う
         --arm NAME     : stage1_arms.ARMS の arm を学習する（構造・損失・保存先を表から決める。
                          上の構造・損失のフラグとは併用できない）
+        --save-every N : N epoch ごとに途中の ckpt を {ckpt の stem}_ep{epoch:04d}.pt へ保存する
+                         （診断用。最良の ckpt は変わらない）
 
 出力:
     outputs/checkpoints/ddpm_simple_pretrain_common12_weekday.pt   Stage1 の重み
@@ -38,7 +40,7 @@ import sys
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal, NamedTuple, overload
+from typing import Any, Literal, NamedTuple, overload
 
 import numpy as np
 import numpy.typing as npt
@@ -1394,6 +1396,37 @@ class Diffusion:
         x_K = self._sample_head(model, cond_idx, K, guidance_scale)
         return self._sample_tail(model, x_K, K, cond_idx, guidance_scale, zs)
 
+    @torch.no_grad()
+    def restore(self, model: UNet1D, x0: torch.Tensor, t0: int, cond_idx: torch.Tensor,
+                guidance_scale: float = GUIDANCE_SCALE) -> torch.Tensor:
+        """x0 を雑音水準 t0 まで前向きに進めてから、逆過程で t=0 まで戻す（部分ノイズ化の診断）
+
+        t0 が小さければ x0 の細部（エピソードの長さ）だけを作り直し、大きければ
+        「誰がどの活動をするか」まで作り直す。どの t0 から実データとずれるかで、
+        逆過程のどの段階が生成のずれを作るかを切り分ける。
+
+        Note:
+            ★q_sample(x0, t0) は雑音水準 t0 の状態で、_reverse_step(ti=t0) がそこから
+              1 段戻す。よって _sample_tail の K は t0 + 1（ti = t0 .. 0）。
+              t0 = T_STEPS − 1 はほぼ純粋な雑音からの生成と同じ逆過程になる
+
+        Args:
+            model: UNet1D, ε を予測する denoiser
+            x0: 実データの one-hot, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96), 値域{0,1}
+            t0: 雑音化する水準, 値域[0, T_STEPS-1]
+            cond_idx: 条件インデックス, dtype=int64, (B, 3)
+            guidance_scale: CFGの強さ, default=GUIDANCE_SCALE=1.25
+
+        Returns:
+            逆過程 t=0 の出力, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)。
+            argmax しない連続値（離散化は関数外で行う）
+        """
+        if not 0 <= t0 < T_STEPS:
+            raise ValueError(f"t0 は [0, {T_STEPS - 1}] の整数: {t0}")
+        t = torch.full((x0.size(0),), t0, dtype=torch.long, device=x0.device)
+        x_t = self.q_sample(x0, t, torch.randn_like(x0))
+        return self._sample_tail(model, x_t, t0 + 1, cond_idx, guidance_scale)
+
 
 def straight_through(x0: torch.Tensor, tau: float=1.0) -> torch.Tensor:
     """連続値 (B,12,96) を微分可能に one-hot 化
@@ -1476,7 +1509,8 @@ def train(epochs: int = EPOCHS,
             seed: int = SEED,
             rate_lam: float = RATE_LAM,
             rate_gamma: float = RATE_SNR_GAMMA,
-            rate_mode: RateMode = RATE_MODE) -> UNet1D:
+            rate_mode: RateMode = RATE_MODE,
+            save_every: int = 0) -> UNet1D:
     """Stage1の学習を実行, val 損失が最良だった重みのモデルを返す
 
     ATUS実個票を教師に, 条件付きノイズ予測器 ε_θ(x_t, t, c)を学習
@@ -1498,6 +1532,9 @@ def train(epochs: int = EPOCHS,
         rate_gamma: L_rate の重み v(t) の頭打ち, default=RATE_SNR_GAMMA=1.0
         rate_mode: L_rate の偏りをどの単位で平均するか, default=RATE_MODE="batch"。
             "pop" の目標 r̄ は学習分割 (split_indices) だけから作る
+        save_every: 正なら N epoch ごとにその時点の重みを epoch_ckpt_path(save_path, ep) へ保存する,
+            default=0 (保存しない)。最良 epoch の選び方と save_path の中身は変えない。
+            ckpt の選び方が生成に効くかを epoch の軌跡で見るための診断用
 
     Returns:
         best_stateを復元済みのUNet1D, 必ずしも最終エポックのおもみではない
@@ -1506,6 +1543,10 @@ def train(epochs: int = EPOCHS,
         raise ValueError(f"rate_lam は 0 以上でなければならない: {rate_lam}")
     if rate_mode != "batch" and rate_lam == 0.0:
         raise ValueError(f"rate_mode={rate_mode!r} は rate_lam > 0 のときだけ意味を持つ")
+    if save_every < 0:
+        raise ValueError(f"save_every は 0 以上でなければならない: {save_every}")
+    if save_every > 0 and save_path is None:
+        raise ValueError("save_every > 0 には save_path が要る（epoch ごとの保存先を作るため）")
     run = None
     if use_wandb:
         import wandb
@@ -1566,6 +1607,11 @@ def train(epochs: int = EPOCHS,
                      **{f"train/{k}": v for k, v in tr_terms.items()},
                      **{f"val/{k}": v for k, v in va_terms.items()}})
 
+        if save_every > 0 and ep % save_every == 0:
+            assert save_path is not None
+            save_ckpt(model, epoch_ckpt_path(save_path, ep), arch, seed, rate_lam, rate_gamma,
+                      rate_mode, epoch=ep)
+
         if va < best_val - EARLY_STOP_MIN_DELTA:
             best_val = va
             epochs_no_improve = 0
@@ -1589,19 +1635,42 @@ def train(epochs: int = EPOCHS,
         run.summary["stopped_epoch"] = ep
 
     if save_path is not None:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        # ★config["arch"] は構造の復元に使う（arch_spec_from_ckpt）。時刻の特徴 φ は保存しない
-        #   buffer なので、倍音 K=48 と Transformer 型 96 次元は重みの形だけでは区別できない
-        torch.save({"model": model.state_dict(),
-                    "config": {"kernel_size": KERNEL_SIZE, "clock": arch.has_clock,
-                               "arch": asdict(arch), "seed": seed,
-                               "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma,
-                               "rate_mode": rate_mode}}, save_path)
+        save_ckpt(model, save_path, arch, seed, rate_lam, rate_gamma, rate_mode)
         print(f"saved model to {save_path}")
     if run is not None:
         run.finish()
 
     return model
+
+
+def epoch_ckpt_path(save_path: Path, epoch: int) -> Path:
+    """途中の epoch の ckpt の保存先 {save_path の stem}_ep{epoch:04d}.pt"""
+    return save_path.with_name(f"{save_path.stem}_ep{epoch:04d}{save_path.suffix}")
+
+
+def save_ckpt(model: UNet1D, path: Path, arch: ArchSpec, seed: int, rate_lam: float,
+              rate_gamma: float, rate_mode: RateMode, epoch: int | None = None) -> None:
+    """重みと出所の記録（config）を保存する
+
+    Note:
+        ★config["arch"] は構造の復元に使う（arch_spec_from_ckpt）。時刻の特徴 φ は保存しない
+          buffer なので、倍音 K=48 と Transformer 型 96 次元は重みの形だけでは区別できない
+
+    Args:
+        model: 保存する UNet1D
+        path: 保存先
+        arch / seed / rate_lam / rate_gamma / rate_mode: train の引数（出所の記録）
+        epoch: 途中の epoch の ckpt ならその epoch。None なら config に "epoch" を書かない
+            （最良の ckpt。従来の保存物と同じキーにする）
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    config: dict[str, Any] = {"kernel_size": KERNEL_SIZE, "clock": arch.has_clock,
+                              "arch": asdict(arch), "seed": seed,
+                              "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma,
+                              "rate_mode": rate_mode}
+    if epoch is not None:
+        config["epoch"] = epoch
+    torch.save({"model": model.state_dict(), "config": config}, path)
 
 
 def state_has_clock(state: dict[str, torch.Tensor]) -> bool:
@@ -2054,6 +2123,9 @@ if __name__ == "__main__":
     ap.add_argument("--arm", default=None,
                     help="stage1_arms.ARMS の arm 名。構造・損失・保存先の接尾辞を表から決める。"
                          "--kernel / --clock / --rate-* とは併用できない")
+    ap.add_argument("--save-every", type=int, default=0,
+                    help="N epoch ごとに途中の ckpt を {ckpt の stem}_ep{epoch:04d}.pt へ保存する"
+                         "（既定 0 = 保存しない）。最良の ckpt は従来どおり")
     ap.add_argument("--rate-mode", choices=RATE_MODES, default=RATE_MODE,
                     help="L_rate の偏り m を平均する単位（Diffusion.rate_objective）。"
                          "batch 以外は保存先の _rate{λ} が _{mode}rate{λ} になる。"
@@ -2115,6 +2187,7 @@ if __name__ == "__main__":
     print(f"[config] arch={arch}")
     print(f"[config] seed={seed}")
     print(f"[config] rate_lam={rate_lam:g} rate_gamma={rate_gamma:g} rate_mode={rate_mode}")
+    print(f"[config] save_every={args.save_every}")
     print(f"[config] ckpt={MODEL_SAVE_PATH.name}")
     print(f"[config] gen ={GEN_SAVE_PATH.name}")
 
@@ -2130,7 +2203,8 @@ if __name__ == "__main__":
         #   束縛済みで、上の再代入では差し替わらないため。
         model = train(epochs=args.epochs, use_wandb=not args.no_wandb,
                       save_path=MODEL_SAVE_PATH, arch=arch, seed=seed,
-                      rate_lam=rate_lam, rate_gamma=rate_gamma, rate_mode=rate_mode)
+                      rate_lam=rate_lam, rate_gamma=rate_gamma, rate_mode=rate_mode,
+                      save_every=args.save_every)
         if args.no_pool:
             print("[config] --no-pool: sanity_check（生成と暗記チェック）を飛ばした")
         else:

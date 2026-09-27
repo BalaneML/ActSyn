@@ -19,11 +19,15 @@
 #   for s in 42 43 44; do ARM=clock_h48 SEED=$s jobs/submit.sh -v ARM,SEED jobs/train_ddpm_simple_arm.sh; done
 #   学習だけ（生成は jobs/guidance_pool_simple.sh で別に行う）:
 #   ARM=clock_tf96 SEED=43 NO_POOL=1 jobs/submit.sh -v ARM,SEED,NO_POOL jobs/train_ddpm_simple_arm.sh
+#   途中の ckpt を 50 epoch ごとに残す（少ない活動の診断 H4）:
+#   ARM=clock_tf96_traj SEED=43 NO_POOL=1 SAVE_EVERY=50 \
+#       jobs/submit.sh -v ARM,SEED,NO_POOL,SAVE_EVERY jobs/train_ddpm_simple_arm.sh
 #
 # 出力（${REPO} 配下）:
 #   outputs/checkpoints/ddpm_simple_pretrain_common12_weekday{接尾辞}.pt
 #   outputs/generated/ddpm_simple_pretrain_samples{接尾辞}.csv
 #   接尾辞 = ARMS[ARM].suffix + (_s{SEED}、SEED != 42 のとき)
+#   SAVE_EVERY > 0 のとき outputs/checkpoints/ddpm_simple_pretrain_common12_weekday{接尾辞}_ep{epoch:04d}.pt
 #
 # elapstim_req=00:10:00（DBG の上限）の根拠:
 #   時刻符号つき（K=4）の Stage 1 は学習と 7,168 本の生成で実測 8 分。
@@ -39,12 +43,18 @@ EPOCHS="${EPOCHS:-1000}"
 # 1 なら学習後の生成（sanity_check）を飛ばす。96 解像度の attention などで学習と生成が 10 分に収まらない
 # arm のため（2026-09-27: clock_tf96_rope_attn96 は生成の途中で打ち切られた）
 NO_POOL="${NO_POOL:-0}"
+# 正なら N epoch ごとに途中の ckpt を残す（model.py --save-every）。0 は残さない
+SAVE_EVERY="${SAVE_EVERY:-0}"
 EXTRA=()
 [ "${NO_POOL}" = "1" ] && EXTRA+=(--no-pool)
 
 case "${SEED}" in
     ''|*[!0-9]*) echo "ERROR: SEED は非負の整数（指定値: ${SEED}）" >&2; exit 1 ;;
 esac
+case "${SAVE_EVERY}" in
+    ''|*[!0-9]*) echo "ERROR: SAVE_EVERY は非負の整数（指定値: ${SAVE_EVERY}）" >&2; exit 1 ;;
+esac
+[ "${SAVE_EVERY}" -gt 0 ] && EXTRA+=(--save-every "${SAVE_EVERY}")
 
 # 保存先の接尾辞を arm の表から引く。未知の arm はここで止まる
 SUFFIX="$(singularity exec "${SIF}" python -c "
@@ -59,7 +69,7 @@ POOL="${REPO}/outputs/generated/ddpm_simple_pretrain_samples${SUFFIX}.csv"
 DATA="${REPO}/data/processed/atus2024/atus2024_stula_common12_dataset.csv"
 LOG="${WORK}/logs/simple_arm_${ARM}_s${SEED}_${PBS_JOBID:-manual}.log"
 
-echo "arm: ${ARM}  seed: ${SEED}  epochs: ${EPOCHS}  suffix: ${SUFFIX}"
+echo "arm: ${ARM}  seed: ${SEED}  epochs: ${EPOCHS}  suffix: ${SUFFIX}  save_every: ${SAVE_EVERY}"
 echo "log:   ${LOG}"
 echo "ckpt:  ${CKPT}"
 echo "pool:  ${POOL}"
@@ -79,7 +89,7 @@ BASE_STAMP=""
 
 # 再投入は過去の結果を退避してから（ckpt と生成プールの組を同じ時刻印で退避する）
 STAMP="$(date +%Y%m%d_%H%M%S)"
-for f in "${CKPT}" "${POOL}"; do
+for f in "${CKPT}" "${POOL}" "${CKPT%.pt}"_ep[0-9][0-9][0-9][0-9].pt; do
     if [ -f "${f}" ]; then
         mv "${f}" "${f%.*}_${STAMP}.${f##*.}"
         echo "backed up existing -> ${f%.*}_${STAMP}.${f##*.}"
@@ -91,7 +101,7 @@ done
     echo "=== job ${PBS_JOBID:-manual}  $(date '+%Y-%m-%d %H:%M:%S') ==="
     echo "commit: $(git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "dirty : $(git status --porcelain 2>/dev/null | wc -l) file(s)"
-    echo "arm=${ARM}  seed=${SEED}  epochs=${EPOCHS}  suffix=${SUFFIX}"
+    echo "arm=${ARM}  seed=${SEED}  epochs=${EPOCHS}  suffix=${SUFFIX}  save_every=${SAVE_EVERY}"
     nvidia-smi
     echo "==="
 } > "${LOG}" 2>&1

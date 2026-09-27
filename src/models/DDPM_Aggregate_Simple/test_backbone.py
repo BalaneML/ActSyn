@@ -32,6 +32,9 @@ DDPM_Aggregate からずれていないか」を検証する:
                      条件×時刻のバイアスは零初期化で一致し、学習前から勾配が流れること
    14. L_rate の単位 (--rate-mode) : 層・区間が 1 つなら batch と一致すること、層の割り当て、
                      pop は r̄ をバッチ平均に置くと batch と一致すること、loss() が不変なこと
+   15. 診断 (--save-every / Diffusion.restore) : 途中の ckpt が学習中の重みで、保存が乱数を
+                     消費しないこと、restore が ti = t0 から戻ること（添字のずれを固定）、
+                     t0 = 0 で入力の x0 が戻ること
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは出力が恒等的に 0 になり
@@ -183,14 +186,18 @@ def test_no_ddim_no_ema():
             assert b not in params, f"{fn.__name__} に {b} 引数が残っている"
 
     # チェックポイントの契約: 重みはキー "model"、出所の記録はキー "config"。EMA の重みは持たない
-    src = inspect.getsource(sm.train)
-    assert '{"model": model.state_dict(),' in src, "保存するチェックポイントの形が変わっている"
-    # ★保存する dict のリテラルを丸ごと固定する（EMA の重みなど第3のキーが入ると落ちる）。
+    # 保存は save_ckpt が一手に行う（最良の ckpt も途中の epoch の ckpt も）
+    assert "save_ckpt(model, save_path, arch, seed, rate_lam, rate_gamma, rate_mode)" \
+        in inspect.getsource(sm.train), "train が save_ckpt を通さずに保存している"
+    src = inspect.getsource(sm.save_ckpt)
+    assert 'torch.save({"model": model.state_dict(), "config": config}, path)' in src, \
+        "保存するチェックポイントの形が変わっている"
+    # ★config のリテラルを丸ごと固定する（EMA の重みなど第3のキーが入ると落ちる）。
     #   '"ema"' の有無では判定できない。wandb の config に "ema": False があるため
-    assert ('"config": {"kernel_size": KERNEL_SIZE, "clock": arch.has_clock,\n'
-            '                               "arch": asdict(arch), "seed": seed,\n'
-            '                               "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma,\n'
-            '                               "rate_mode": rate_mode}}'
+    assert ('config: dict[str, Any] = {"kernel_size": KERNEL_SIZE, "clock": arch.has_clock,\n'
+            '                              "arch": asdict(arch), "seed": seed,\n'
+            '                              "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma,\n'
+            '                              "rate_mode": rate_mode}'
             ) in src, "チェックポイントの config が変わっている"
     print("  5. DDIM / EMA を持たない: OK")
 
@@ -667,6 +674,77 @@ def test_rate_loss():
     print("  11. 行動者率の項 (loss 不変・λ=0 の更新一致・v(t) の境目 t=258・x0 換算・0 の検算): OK")
 
 
+def test_diagnostics():
+    """★少ない活動の診断に使う 2 つの経路の契約。
+
+    (a) save_every: 途中の ckpt は学習中の実際の重みで、最良の ckpt はそのどれかと一致する。
+        保存は乱数を消費しない。途中の ckpt の config にだけ "epoch" が入る
+    (b) restore: 雑音化した x_t から ti = t0 .. 0 の順に _reverse_step を当てたものと
+        ビット単位で一致する（K = t0 + 1 のずれを固定する）
+    (c) restore: t0 = 0 なら入力の x0 が argmax でそのまま戻る
+    """
+    import tempfile
+
+    # (a) 途中の ckpt は学習中の実際の重みで、最良の ckpt はそのどれかと一致する。
+    #     ★2 回学習して比べる形にしないのは、train が model.DEVICE（MPS / CUDA）で走り、
+    #       2 回の学習がビット単位で一致する保証が無いため
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "traj.pt"
+        sm.train(epochs=2, use_wandb=False, save_path=path, save_every=1)
+        best = torch.load(path, map_location="cpu")
+        per_epoch = [torch.load(sm.epoch_ckpt_path(path, e), map_location="cpu") for e in (1, 2)]
+        assert "epoch" not in best["config"], "最良の ckpt の config に epoch が入った"
+        for e, ck in zip((1, 2), per_epoch):
+            assert ck["config"] == {**best["config"], "epoch": e}
+        same = [all(torch.equal(best["model"][k], ck["model"][k]) for k in best["model"])
+                for ck in per_epoch]
+        assert any(same), "最良の重みがどの epoch の ckpt とも一致しない"
+
+        # save_ckpt は乱数を消費しない（save_every の有無で学習の乱数列が変わらない）
+        fresh = sm.UNet1D()                     # 初期化は乱数を使うので、状態を取る前に作る
+        state = torch.get_rng_state()
+        sm.save_ckpt(fresh, Path(tmp) / "x.pt", sm.ArchSpec(), 0, 0.0, 1.0, "batch", epoch=3)
+        assert torch.equal(state, torch.get_rng_state()), "save_ckpt が乱数を消費した"
+    import inspect
+    assert "if save_every > 0 and ep % save_every == 0:" in inspect.getsource(sm.train)
+
+    # (b) restore の添字。T を短くして全段を比べる
+    m = _model()
+    orig_t = sm.T_STEPS
+    try:
+        sm.T_STEPS = 6
+        d = sm.Diffusion(device=DEVICE)
+        sched = torch.randint(0, sm.NUM_ACT, (4, sm.NUM_SLOTS), generator=torch.Generator().manual_seed(3))
+        x0 = sm.sched_to_x0(sched)
+        ci = torch.as_tensor(sm.cond_grid()[:4], dtype=torch.long)
+        for t0 in (0, 2, sm.T_STEPS - 1):
+            torch.manual_seed(7)
+            got = d.restore(m, x0, t0, ci)
+            torch.manual_seed(7)
+            t = torch.full((4,), t0, dtype=torch.long)
+            x = d.q_sample(x0, t, torch.randn_like(x0))
+            with torch.no_grad():
+                for ti in reversed(range(t0 + 1)):
+                    x = d._reverse_step(m, x, ti, ci, sm.GUIDANCE_SCALE)
+            assert torch.equal(got, x), f"restore が ti = {t0} から戻っていない"
+        for bad in (-1, sm.T_STEPS):
+            try:
+                d.restore(m, x0, bad, ci)
+            except ValueError:
+                continue
+            raise AssertionError(f"範囲外の t0 を弾かなかった: {bad}")
+    finally:
+        sm.T_STEPS = orig_t
+
+    # (c) t0 = 0 は 1 段だけ戻す（post_coef_x0[0] = 1）ので x0 がそのまま戻る
+    d = sm.Diffusion(device=DEVICE)
+    torch.manual_seed(0)
+    back = d.restore(m, x0, 0, ci).argmax(dim=1)
+    agree = float((back == sched).float().mean())
+    assert agree > 0.99, f"t0 = 0 で x0 が戻らない（一致率 {agree:.3f}）"
+    print(f"  15. 診断 (途中の ckpt・restore は ti = t0 から・t0 = 0 の一致率 {agree:.3f}): OK")
+
+
 if __name__ == "__main__":
     print("DDPM_Aggregate_Simple backbone tests")
     test_shapes()
@@ -683,4 +761,5 @@ if __name__ == "__main__":
     test_arch_spec()
     test_blocks()
     test_rate_modes()
+    test_diagnostics()
     print("test_backbone: OK")
