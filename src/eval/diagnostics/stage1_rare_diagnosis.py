@@ -28,6 +28,8 @@ Stage 1 で少ない活動（買い物・介護・育児・移動・スポーツ
                H5 実個票を t0 まで雑音化して戻したとき、床を超える最小の t0（t*）で段階を分ける
                   （t* ≤ 100: エピソードの長さ、t* ≥ 500: 誰が行動者か）
                H6 最大の t0 で argmax 前の連続値の総量と argmax 後の総量を比べる
+    final      H6 の補足。t0 = 999 のスロットごとの連続値から、僅差で argmax を取れなかった分と
+               全チャネルに薄く乗った値（漏れ）を分ける（連続値の和では両者を区別できないため）
     guidance   H7 CFG: clock_tf96 の guidance 1.0 と 1.25（同じ乱数）の差を、H1 のプール間の差と比べる
     trajectory 段 C。H4 ckpt の選び方: 途中の ckpt の小プールで、最良 epoch 前後の種内の揺れと
                種間の揺れを比べる（--best-epochs に学習ログの最良 epoch を渡す）
@@ -52,6 +54,7 @@ flowchart TD
     SPLIT["model.split_indices<br/>train / holdout"] --> H3
     NPZ["ddpm_simple_restore{接尾辞}.npz<br/>sched_out / soft_sum / raw_sum"] --> H5["h5_restore / h5_first_t0<br/>t0 ごとの比と t*"]
     NPZ --> H6["h6_decoding<br/>argmax 前後の総量"]
+    FIN["ddpm_simple_restore{接尾辞}_final.npz<br/>x_final (N, 12, 96)"] --> H6B["h6_near_ties<br/>僅差の負け / 漏れ"]
     BOOT["bootstrap_floor<br/>復元抽出の sd"] --> H5
     EPP["gen.epoch_pools<br/>_ep{epoch:04d}_n64.csv"] --> H4["h4_trajectory<br/>種内 sd vs 種間 sd"]
     AP --> H7["h7_guidance<br/>@g1 vs @g1.25"]
@@ -61,6 +64,7 @@ flowchart TD
 使い方:
     .venv/bin/python src/eval/diagnostics/stage1_rare_diagnosis.py --part existing
     .venv/bin/python src/eval/diagnostics/stage1_rare_diagnosis.py --part restore
+    .venv/bin/python src/eval/diagnostics/stage1_rare_diagnosis.py --part final
     .venv/bin/python src/eval/diagnostics/stage1_rare_diagnosis.py --part guidance
     .venv/bin/python src/eval/diagnostics/stage1_rare_diagnosis.py --part trajectory \\
         --best-epochs 42:612 43:658 44:700
@@ -102,6 +106,10 @@ H5_T_LOCAL = 100
 H5_T_GLOBAL = 500
 # H6: argmax 前の連続値の総量と argmax 後の総量の相対差がこれを超えたら離散化のずれ
 H6_THRESHOLD = 0.10
+# H6 の補足（final）: その活動の値がこれ以上なのに argmax を取れなかったスロットを「僅差の負け」、
+# LEAK_VALUE 未満の値を「漏れ」と呼ぶ
+H6_TIE_VALUE = 0.3
+LEAK_VALUE = 0.1
 # H4: 最良 epoch の前後この幅の epoch で種内の揺れを測る
 H4_WINDOW = 200
 H4_ARM = "clock_tf96_traj"
@@ -496,6 +504,56 @@ def h6_decoding(people: tuple[IntArr, IntArr, FloatArr], pi_d: FloatArr) -> pd.D
     return pd.DataFrame(rows)
 
 
+def load_final(arm: str, seed: int, n_rows: int) -> FloatArr:
+    """stage1_rare_diagnosis_gen --mode final-continuous の連続値, (N, 12, 96)"""
+    path = _gen().final_continuous_path(arm, seed)
+    if not path.exists():
+        raise FileNotFoundError(f"t0 = 999 の連続値が無い ({arm}, seed={seed}): {path}")
+    rep.check_fresh(path, rep.ckpt_path(arm, seed))
+    with np.load(path) as z:
+        if int(z["n_rows"]) != n_rows:
+            raise ValueError(f"入力の行数が違う: {int(z['n_rows'])} != {n_rows}")
+        return np.asarray(z["x_final"], dtype=np.float64)
+
+
+def h6_near_ties(people: tuple[IntArr, IntArr, FloatArr], pi_d: FloatArr) -> pd.DataFrame:
+    """argmax で失われる分を「僅差の負け」と「漏れ」に分ける（H6 の測り方の補足）
+
+    Note:
+        ★h6_decoding の連続値の和は、全チャネルに薄く乗った値（漏れ）も数えるので、
+          argmax が少ない活動を落としているかを直接は測れない。ここではスロットごとの値から、
+          その活動の値が H6_TIE_VALUE 以上なのに argmax を取れなかったスロット（僅差の負け）を数える。
+          判定は「僅差の負け / argmax 後の総量 > H6_THRESHOLD」
+
+    Returns:
+        (arm, seed, activity) ごとの real_level（入力の実個票）, argmax_level, tie_loss_level,
+        leak_level, tie_over_argmax, ratio_argmax（argmax / 実）, ratio_with_ties
+        （(argmax + 僅差の負け) / 実）, supports_h6
+    """
+    sched, d, w = people
+    rows = []
+    for arm in RESTORE_ARMS:
+        for seed in DIAG_SEEDS:
+            x = load_final(arm, seed, len(sched))                  # (N, 12, 96)
+            am = x.argmax(axis=1)                                  # (N, 96)
+            for a in FOCUS_ACTS:
+                c = cur.ACT_NAMES.index(a)
+                xc = x[:, c, :]
+                per_person = np.stack([
+                    (sched == c).sum(axis=1),                              # 入力の実個票
+                    (am == c).sum(axis=1),                                 # argmax 後
+                    ((am != c) & (xc >= H6_TIE_VALUE)).sum(axis=1),        # 僅差の負け
+                    np.where(xc < LEAK_VALUE, np.clip(xc, 0.0, None), 0.0).sum(axis=1),   # 漏れ
+                ], axis=1).astype(np.float64) / sm.NUM_SLOTS
+                real, won, lost, leak = group_weighted_mean(per_person, d, w, pi_d)
+                rows.append({"arm": arm, "seed": seed, "activity": a, "real_level": real,
+                             "argmax_level": won, "tie_loss_level": lost, "leak_level": leak,
+                             "tie_over_argmax": lost / won, "ratio_argmax": won / real,
+                             "ratio_with_ties": (won + lost) / real,
+                             "supports_h6": lost / won > H6_THRESHOLD})
+    return pd.DataFrame(rows)
+
+
 # ============================================================
 # H7 CFG
 # ============================================================
@@ -780,6 +838,15 @@ def run_restore() -> None:
     print("[rare_diag] 書いた: stage1_rare_diag_{h5_long,h5_tstar,h6,floor}.csv")
 
 
+def run_final() -> None:
+    """H6 の補足（僅差の負けと漏れ）を集計する"""
+    pi_d, _ = _japan_setup()
+    ties = h6_near_ties(model_order_people(), pi_d)
+    _show(f"H6 補足: 僅差の負け（値 ≥ {H6_TIE_VALUE:g} で argmax を取れない）と漏れ（値 < {LEAK_VALUE:g}）"
+          f"（支持: 僅差の負け / argmax > {H6_THRESHOLD:g}）", ties)
+    ties.to_csv(OUT_DIR / "stage1_rare_diag_h6_ties.csv", index=False)
+
+
 def run_guidance() -> None:
     """H7 を集計する（段 A の H1 の CSV を基準に使う）"""
     pi_d, real_prof = _japan_setup()
@@ -828,7 +895,7 @@ def parse_best_epochs(items: list[str]) -> dict[int, int]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--part", choices=("existing", "restore", "guidance", "trajectory", "seeds"),
+    ap.add_argument("--part", choices=("existing", "restore", "final", "guidance", "trajectory", "seeds"),
                     required=True, help="集計する部（モジュールの説明を参照）")
     ap.add_argument("--best-epochs", nargs="+", default=None,
                     help="trajectory 用。種:最良 epoch（学習ログの restored best checkpoint）")
@@ -838,6 +905,8 @@ def main() -> None:
         run_existing()
     elif args.part == "restore":
         run_restore()
+    elif args.part == "final":
+        run_final()
     elif args.part == "guidance":
         run_guidance()
     elif args.part == "trajectory":
