@@ -3,13 +3,15 @@ plot_stage2_curves.py
 =====================
 GRU_Aggregate の Stage 2 の時刻別行動者率を描く（計画書 docs/stage2_plan.md）。
 
-    stage2_gru_curves.png         全国（28 群を日本人口で加重）の 12 活動
-    stage2_gru_curves_groups.png  GROUP_EXAMPLES の 4 群 × GROUP_ACTS の 4 活動。GRU Stage 2 は
-                                  その群を教師から外した fold（E2）の δ で生成した曲線（教師に使っていない群）
+    stage2_gru_curves.png                 全国（28 群を日本人口で加重）の 12 活動
+    stage2_gru_curves_groups.png          GROUP_EXAMPLES の 4 群 × GROUP_ACTS の 4 活動。GRU Stage 2 は
+                                          その群を教師から外した fold（E2）の δ で生成した曲線（教師に使っていない群）
+    stage2_gru_methods.png                全国の 12 活動で、δ を足す版と重みを更新する版（stage2_finetune.py）を並べる
+    stage2_gru_methods_groups.png         同じく群ごと（その群を教師から外した fold）
 
-★評価（stage2.evaluate）は生成した率を保存しないので、保存した δ（stage2.shift_path）から、
-  評価と同じ乱数（stage2.EVAL_SEED）・同じ本数（stage2.EVAL_N）で生成し直す。
-  生成し直した率は RATES_DIR にキャッシュし、δ の npz より古ければ作り直す。
+★評価（stage2.evaluate）は生成した率を保存しないので、保存した δ（stage2.shift_path）または微調整した
+  重み（stage2_finetune.ft_ckpt_path）から、評価と同じ乱数（stage2.EVAL_SEED）・同じ本数（stage2.EVAL_N）で
+  生成し直す。生成し直した率は RATES_DIR にキャッシュし、出所のファイルより古ければ作り直す。
 
 データフロー:
 
@@ -57,6 +59,7 @@ def _load(name: str, path: Path) -> Any:
 
 
 s2: Any = _load("gru_stage2", Path(__file__).resolve().parent / "stage2.py")
+ft: Any = _load("gru_stage2_finetune", Path(__file__).resolve().parent / "stage2_finetune.py")
 gm: Any = s2.gm
 sm: Any = s2.sm
 cur: Any = s2.cur
@@ -66,11 +69,14 @@ agr: Any = cmp.agr
 # 色（stage1_gru_compare.ARM_COLOR と同じ対応。GRU 補正後は赤紫、DDPM Transformer 型は橙）。
 # ★Stage 2 の前後は線の種類で分ける（Pre-trained = 破線、Fine-tuned = 実線）
 COLOR_GRU = cmp.ARM_COLOR["gru_calg125"]
+COLOR_GRU_FT = cmp.ARM_COLOR["gru"]          # 重みを更新する版（青）
 COLOR_DDPM = cmp.ARM_COLOR["ddpm_tf96"]
 COLOR_TEACHER = "#1a1a19"
 COLOR_ATUS = "#9a9a94"
 LABEL_TEACHER = "日本の教師（社会生活基本調査）"
 LABEL_ATUS = "ATUS 実データ（米国）"
+LABEL_SHIFT = "GRU Fine-tuned（δ を足す）"
+LABEL_FT = "GRU Fine-tuned（重みを更新）"
 # 群ごとの図の群と活動（日米差の大きい活動）
 # 群は plot_schedules.EXAMPLE_GROUPS と同じ 4 群（男 35-44 有業・女 35-44 無業・女 15-24 無業・男 75+ 無業）
 GROUP_EXAMPLES: tuple[int, ...] = (sm.d_index(0, 2, 1), sm.d_index(1, 2, 0), sm.d_index(1, 0, 0), sm.d_index(0, 6, 0))
@@ -83,20 +89,26 @@ def load_shift(seed: int, run: str) -> Any:
         return s2.JapanShift(base=z["base"], sex=z["sex"], age=z["age"], emp=z["emp"])
 
 
-def stage2_rates(seed: int, run: str) -> FloatArr:
+def stage2_rates(seed: int, run: str, method: str = "shift") -> FloatArr:
     """評価と同じ乱数・本数で生成し直した群別の時刻別行動者率, -> (28, 12, 96)
 
     Args:
         seed: 学習の種
-        run: "zeroshot"（δ = 0）/ "all" / "fold{K}"
+        run: "zeroshot"（Stage 1 のまま）/ "all" / "fold{K}"
+        method: "shift"（δ を足す版）/ "finetune"（重みを更新する版）。zeroshot では使わない
     """
-    cache = RATES_DIR / f"gru_stage2{gm.run_suffix(seed)}_{run}_rates.npz"
-    src = gm.ckpt_path(seed, calib_guidance=s2.CALIB_G) if run == "zeroshot" else s2.shift_path(seed, run)
+    tag = "" if run == "zeroshot" else s2.METHOD_TAG[method]
+    cache = RATES_DIR / f"gru_stage2{tag}{gm.run_suffix(seed)}_{run}_rates.npz"
+    if run == "zeroshot":
+        src = gm.ckpt_path(seed, calib_guidance=s2.CALIB_G)
+    else:
+        src = ft.ft_ckpt_path(seed, run) if method == "finetune" else s2.shift_path(seed, run)
     if cache.exists() and cache.stat().st_mtime > src.stat().st_mtime:
         with np.load(cache) as z:
             return np.asarray(z["rates"], dtype=np.float64)
-    model = gm.load_model(gm.ckpt_path(seed, calib_guidance=s2.CALIB_G))
-    bias = None if run == "zeroshot" else load_shift(seed, run).to_group_bias()
+    use_ft = run != "zeroshot" and method == "finetune"
+    model = gm.load_model(src if use_ft else gm.ckpt_path(seed, calib_guidance=s2.CALIB_G))
+    bias = None if run == "zeroshot" or use_ft else load_shift(seed, run).to_group_bias()
     pool = gm.group_pool(model, s2.EVAL_N, s2.GUIDANCE, seed=s2.EVAL_SEED, group_bias=bias)
     rates = np.asarray(cur.pool_to_slot_rates(pool), dtype=np.float64)
     np.savez_compressed(cache, rates=rates)
@@ -187,13 +199,97 @@ def plot_groups(tgt: dict, out: Path) -> None:
     print(f"[stage2 curves] 図: {out}")
 
 
+def plot_methods(tgt: dict, out: Path) -> None:
+    """全国の 12 活動で、δ を足す版と重みを更新する版を並べる（どちらも種 5 本の平均）"""
+    import matplotlib.pyplot as plt
+    fm = cmp.rd._figure_module()
+    fm.setup_fonts()
+    hours = cur.slot_hours()
+    teacher = cur.weighted_slot_rates(tgt["group_rates_tbl"], tgt)
+    curves = {
+        "zs": np.mean([cur.weighted_slot_rates(stage2_rates(s, "zeroshot"), tgt) for s in s2.SEEDS], axis=0),
+        "shift": np.mean([cur.weighted_slot_rates(stage2_rates(s, "all"), tgt) for s in s2.SEEDS], axis=0),
+        "finetune": np.mean([cur.weighted_slot_rates(stage2_rates(s, "all", "finetune"), tgt)
+                             for s in s2.SEEDS], axis=0),
+    }
+    fig, axes = plt.subplots(4, 3, figsize=(15, 13.2))
+    for c, name in enumerate(cur.ACT_NAMES):
+        ax = axes[c // 3][c % 3]
+        ax.plot(hours, teacher[c], color=COLOR_TEACHER, lw=2.6, label=LABEL_TEACHER, solid_capstyle="round")
+        ax.plot(hours, curves["zs"][c], color=COLOR_GRU, lw=1.4, ls=(0, (3, 2)), label="GRU Pre-trained")
+        ax.plot(hours, curves["shift"][c], color=COLOR_GRU, lw=1.8, label=LABEL_SHIFT)
+        ax.plot(hours, curves["finetune"][c], color=COLOR_GRU_FT, lw=1.8, label=LABEL_FT)
+        fm.style_axis(ax, 4.0, 28.0, 4.0)
+        ax.set_ylim(bottom=0.0)
+        ax.set_title(f"{cur.ACT_JA[name]}（{name}）", fontsize=11)
+        if c // 3 == 3:
+            ax.set_xlabel("時刻", fontsize=10)
+        if c % 3 == 0:
+            ax.set_ylabel("行動者率", fontsize=10)
+    fig.suptitle("Stage 2 の 2 つの方法による日本全国の時刻別行動者率", fontsize=15, y=0.995)
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False,
+               bbox_to_anchor=(0.5, 0.972), fontsize=9.5)
+    fig.tight_layout(rect=(0, 0, 1, 0.945))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"[stage2 curves] 図: {out}")
+
+
+def plot_methods_groups(tgt: dict, out: Path) -> None:
+    """GROUP_EXAMPLES × GROUP_ACTS で 2 つの方法を並べる。どちらもその群を教師から外した fold（種 42）"""
+    import matplotlib.pyplot as plt
+    fm = cmp.rd._figure_module()
+    fm.setup_fonts()
+    hours = cur.slot_hours()
+    a_star = tgt["group_rates_tbl"]
+    zs = stage2_rates(s2.LGO_SEED, "zeroshot")
+    folds = fold_of(tgt)
+    fig, axes = plt.subplots(len(GROUP_EXAMPLES), len(GROUP_ACTS), figsize=(17, 3.3 * len(GROUP_EXAMPLES) + 1.0))
+    for i, d in enumerate(GROUP_EXAMPLES):
+        held_shift = stage2_rates(s2.LGO_SEED, f"fold{folds[d]}")
+        held_ft = stage2_rates(s2.LGO_SEED, f"fold{folds[d]}", "finetune")
+        for j, act in enumerate(GROUP_ACTS):
+            c = cur.ACT_NAMES.index(act)
+            ax = axes[i][j]
+            ax.plot(hours, a_star[d, c], color=COLOR_TEACHER, lw=2.4, label=LABEL_TEACHER)
+            ax.plot(hours, zs[d, c], color=COLOR_GRU, lw=1.4, ls=(0, (3, 2)), label="GRU Pre-trained")
+            ax.plot(hours, held_shift[d, c], color=COLOR_GRU, lw=1.8, label=LABEL_SHIFT)
+            ax.plot(hours, held_ft[d, c], color=COLOR_GRU_FT, lw=1.8, label=LABEL_FT)
+            fm.style_axis(ax, 4.0, 28.0, 4.0)
+            ax.set_ylim(bottom=0.0)
+            if i == 0:
+                ax.set_title(f"{cur.ACT_JA[act]}（{act}）", fontsize=11)
+            if j == 0:
+                ax.set_ylabel(f"{cmp.group_label(d)}\n行動者率", fontsize=10)
+            if i == len(GROUP_EXAMPLES) - 1:
+                ax.set_xlabel("時刻", fontsize=10)
+    fig.suptitle("Stage 2 の 2 つの方法による群ごとの時刻別行動者率", fontsize=15, y=0.995)
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False,
+               bbox_to_anchor=(0.5, 0.965), fontsize=9.5)
+    fig.tight_layout(rect=(0, 0, 1, 0.935))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"[stage2 curves] 図: {out}")
+
+
 def main() -> None:
-    """2 枚の図を描く"""
+    """図を描く。--methods で 2 つの方法を並べた 2 枚も描く"""
+    import argparse
     import matplotlib
     matplotlib.use("Agg")
+    ap = argparse.ArgumentParser(description="GRU_Aggregate の Stage 2 の時刻別行動者率の図")
+    ap.add_argument("--methods", action="store_true", help="δ を足す版と重みを更新する版を並べた図も描く")
+    args = ap.parse_args()
     tgt = s2.st.load_stula_targets()
     plot_national(tgt, FIG_DIR / "stage2_gru_curves.png")
     plot_groups(tgt, FIG_DIR / "stage2_gru_curves_groups.png")
+    if args.methods:
+        plot_methods(tgt, FIG_DIR / "stage2_gru_methods.png")
+        plot_methods_groups(tgt, FIG_DIR / "stage2_gru_methods_groups.png")
 
 
 if __name__ == "__main__":

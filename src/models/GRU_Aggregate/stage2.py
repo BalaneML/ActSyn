@@ -114,6 +114,10 @@ DDPM_SELECTION_CSV = OUT_DIR / "stage2_lam0.003_selection.csv"
 DDPM_FOLD_CSV = "stage2_lam0.003_fold{k}_selection.csv"
 DDPM_STEP200_RATES = REPO_ROOT / "outputs" / "generated" / "stage2_step200_rates.npz"
 DDPM_STEP = 200
+# Stage 2 の方法 → 保存先の接尾辞。"shift" は δ を足す版（本ファイル）、"finetune" は重みを更新する版
+# （stage2_finetune.py）、"finetune_v1" はその最初の版（リハーサルを g = 1.25 で引いた。結果の保存のみ）。
+# E0（zero-shot）は Stage 1 のモデルそのものなので、どの方法でも "shift" の CSV を使う
+METHOD_TAG: dict[str, str] = {"shift": "", "finetune": "_ft", "finetune_v1": "_ftv1"}
 
 
 # ============================================================
@@ -323,9 +327,15 @@ def run_name(zero_shot: bool, fold: int | None) -> str:
     return "all" if fold is None else f"fold{fold}"
 
 
-def csv_path(seed: int, run: str) -> Path:
-    """評価の CSV のパス"""
-    return OUT_DIR / f"stage2_gru{gm.run_suffix(seed)}_{run}.csv"
+def csv_path(seed: int, run: str, method: str = "shift") -> Path:
+    """評価の CSV のパス
+
+    Args:
+        seed: 学習の種
+        run: zeroshot / all / fold{K}
+        method: METHOD_TAG のキー（"shift" = δ を足す版、"finetune" = 重みを更新する版）
+    """
+    return OUT_DIR / f"stage2_gru{METHOD_TAG[method]}{gm.run_suffix(seed)}_{run}.csv"
 
 
 def shift_path(seed: int, run: str) -> Path:
@@ -400,13 +410,17 @@ def ddpm_references(tgt: dict) -> dict[str, Any]:
     return ref
 
 
-def judge() -> pd.DataFrame:
-    """E0〜E2 の CSV から J1〜J6 を判定して表を返す（CSV にも書く）"""
+def judge(method: str = "shift") -> pd.DataFrame:
+    """E0〜E2 の CSV から J1〜J6 を判定して表を返す（CSV にも書く）
+
+    Args:
+        method: METHOD_TAG のキー。E1・E2 の CSV をこの方法のものから読む（E0 は共通）
+    """
     tgt = st.load_stula_targets()
     ref = ddpm_references(tgt)
     zs = {s: pd.read_csv(csv_path(s, "zeroshot")) for s in SEEDS}
-    e1 = {s: pd.read_csv(csv_path(s, "all")) for s in SEEDS}
-    e2 = {k: pd.read_csv(csv_path(LGO_SEED, f"fold{k}")) for k in range(lgo.N_FOLDS)}
+    e1 = {s: pd.read_csv(csv_path(s, "all", method)) for s in SEEDS}
+    e2 = {k: pd.read_csv(csv_path(LGO_SEED, f"fold{k}", method)) for k in range(lgo.N_FOLDS)}
     rows: list[dict[str, Any]] = []
 
     # J1・J2: held-out の rate_mse_split（種 42）
@@ -470,7 +484,7 @@ def judge() -> pd.DataFrame:
                  "zero_shot": med(zs, "dev_rmse", eval_kind="in-teacher", mask="12act", mask_name="all"),
                  "ddpm": ref["dev_rmse"], "pass": g6d < ref["dev_rmse"]})
     out = pd.DataFrame(rows)
-    out.to_csv(OUT_DIR / "stage2_gru_judge.csv", index=False)
+    out.to_csv(OUT_DIR / f"stage2_gru{METHOD_TAG[method]}_judge.csv", index=False)
     return out
 
 
