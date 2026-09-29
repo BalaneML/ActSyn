@@ -60,7 +60,11 @@ flowchart TD
 使い方:
     .venv/bin/python src/models/GRU_Aggregate/stage2_finetune.py --seed 42            # E1
     .venv/bin/python src/models/GRU_Aggregate/stage2_finetune.py --seed 42 --fold 3   # E2
+    .venv/bin/python src/models/GRU_Aggregate/stage2_finetune.py --seed 42 --no-tilt  # 対照（傾けなし）
     .venv/bin/python src/models/GRU_Aggregate/stage2_finetune.py --judge
+
+★対照 --no-tilt: STEP = 0 で同じ手続きを回す（目標 = gen_1 なので重みは一様、日本の教師を使わない）。
+  リハーサル（自分の生成で学習し直すこと）そのものが系列の形をどれだけ変えるかを測る。run 名は {run}_notilt
     .venv/bin/python src/models/GRU_Aggregate/stage2_finetune.py --smoke
 """
 import argparse
@@ -216,7 +220,7 @@ def rehearsal_part(pool: IntArr, w: FloatArr, teacher_mask: BoolArr) -> Any:
 def finetune_to_teacher(model: Any, tgt: dict, teacher_mask: BoolArr, seed: int, iters: int = ITERS,
                         n_per_group: int = FIT_POOL_N, fit_seed: int = FIT_SEED,
                         rehearsal_seed: int = REHEARSAL_SEED, lr: float = FT_LR,
-                        epochs: int = FT_EPOCHS, verbose: bool = True) -> list[dict[str, float]]:
+                        epochs: int = FT_EPOCHS, step: float = STEP, verbose: bool = True) -> list[dict[str, float]]:
     """傾けたリハーサルで model の重みを A* へ微調整する（model をその場で書き換える）
 
     Args:
@@ -230,6 +234,7 @@ def finetune_to_teacher(model: Any, tgt: dict, teacher_mask: BoolArr, seed: int,
         rehearsal_seed: 反復 0 のリハーサルのプール（g = 1.0）の種, default=REHEARSAL_SEED=40000
         lr: 学習率, default=FT_LR=1e-4
         epochs: 反復 1 回あたりの周回数, default=FT_EPOCHS=1
+        step: 歩幅, default=STEP=0.5。0 なら傾けない（対照）
         verbose: 反復ごとに print するか
 
     Returns:
@@ -245,7 +250,7 @@ def finetune_to_teacher(model: Any, tgt: dict, teacher_mask: BoolArr, seed: int,
         gen_g = np.asarray(cur.pool_to_slot_rates(pool_g), dtype=np.float64)      # (28, 12, 96)
         pool = gm.group_pool(model, n_per_group, REHEARSAL_GUIDANCE, seed=rehearsal_seed + k)
         gen_1 = np.asarray(cur.pool_to_slot_rates(pool), dtype=np.float64)
-        target = rehearsal_target(gen_1, gen_g, a_star)
+        target = rehearsal_target(gen_1, gen_g, a_star, step)
         w = rake_weights(pool, target)
         ess = ess_fraction(w)[teacher_mask]
         rake_mse = float(np.mean((weighted_slot_rates(pool, w) - target)[teacher_mask] ** 2))
@@ -272,20 +277,27 @@ def ft_ckpt_path(seed: int, run: str) -> Path:
     return s2.SHIFT_DIR / f"gru_stage2ft{gm.run_suffix(seed)}_{run}.pt"
 
 
-def run(seed: int, fold: int | None) -> None:
-    """E1 / E2 を 1 本回して、ckpt と評価の CSV を書く（E0 は stage2.py --zero-shot と共通）"""
+def run(seed: int, fold: int | None, no_tilt: bool = False) -> None:
+    """E1 / E2 を 1 本回して、ckpt と評価の CSV を書く（E0 は stage2.py --zero-shot と共通）
+
+    Args:
+        seed: 学習の種
+        fold: 教師から外す fold。None なら 28 群すべて
+        no_tilt: True なら STEP = 0 の対照（run 名に _notilt を付ける）
+    """
     tgt = st.load_stula_targets()
     model = gm.load_model(gm.ckpt_path(seed, calib_guidance=s2.CALIB_G))
-    name = s2.run_name(False, fold)
+    name = s2.run_name(False, fold) + ("_notilt" if no_tilt else "")
+    step = 0.0 if no_tilt else STEP
     teacher = np.ones(sm.D_GROUPS, dtype=bool) if fold is None else s2.fold_masks(tgt)[f"fold{fold}"]
-    history = finetune_to_teacher(model, tgt, teacher, seed)
+    history = finetune_to_teacher(model, tgt, teacher, seed, step=step)
     gm.save_ckpt(model, ft_ckpt_path(seed, name), seed, extra={
-        "stage2": "finetune", "version": 2, "run": name, "iters": ITERS, "step": STEP, "lr": FT_LR,
+        "stage2": "finetune", "version": 2, "run": name, "iters": ITERS, "step": step, "lr": FT_LR,
         "epochs": FT_EPOCHS, "fit_pool_n": FIT_POOL_N, "fit_seed": FIT_SEED, "guidance": s2.GUIDANCE,
         "rehearsal_guidance": REHEARSAL_GUIDANCE, "rehearsal_seed": REHEARSAL_SEED, "history": history})
     base: dict[str, Any] = {"model": MODEL_NAME, "seed": seed, "run": name, "iters": ITERS,
                             "guidance_scale": s2.GUIDANCE, "n_per_group": s2.EVAL_N, "pool_seed": s2.EVAL_SEED}
-    rows = s2.evaluate(model, None, tgt, {name: teacher}, base)
+    rows = s2.evaluate(model, None, tgt, {s2.run_name(False, fold): teacher}, base)
     out = s2.csv_path(seed, name, "finetune")
     out.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(out, index=False)
@@ -310,6 +322,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=s2.LGO_SEED)
     ap.add_argument("--fold", type=int, default=None, help="教師から外す LGO の fold（0〜6）。省略で 28 群すべて")
     ap.add_argument("--judge", action="store_true", help="E0〜E2 の CSV から J1〜J6 を出す")
+    ap.add_argument("--no-tilt", action="store_true", help="STEP = 0 の対照（日本の教師を使わないリハーサル）")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     if args.fold is not None and not 0 <= args.fold < s2.lgo.N_FOLDS:
@@ -320,7 +333,7 @@ def main() -> None:
         with pd.option_context("display.width", 200, "display.float_format", "{:.4g}".format):
             print(s2.judge(method="finetune").to_string(index=False))
     else:
-        run(args.seed, args.fold)
+        run(args.seed, args.fold, args.no_tilt)
 
 
 if __name__ == "__main__":

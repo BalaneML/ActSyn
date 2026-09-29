@@ -4,6 +4,7 @@
 - **計画書：** [stage2_plan.md](stage2_plan.md)（判定 J1〜J6 は §6 で結果を見る前に固定）
 - **コード：** [stage2.py](../stage2.py)・[plot_stage2_curves.py](../plot_stage2_curves.py)
 - **状態：** J3 が不合格。採用するかどうかは**判断待ち**（§5.1）
+- **重みを更新する版：** 同じ評価での比較は [Stage2_finetune_results.md](Stage2_finetune_results.md)
 
 ## 1. 要約
 
