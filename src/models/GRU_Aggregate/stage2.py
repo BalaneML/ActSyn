@@ -49,6 +49,7 @@ import contextlib
 import importlib.util
 import io
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -108,7 +109,7 @@ J3_RATIO = 1.2
 # J3 で「実 ATUS との距離」を測る指標。bigram_jsd と switch_emd は実 ATUS との距離そのもの
 J3_DISTANCE_METRICS: tuple[str, ...] = ("bigram_jsd", "switch_emd")
 J3_GAP_METRICS: tuple[str, ...] = ("switch_mean", "single_slot_ratio", "wrap_closure_rate",
-                                   "night_intrusion_rate", "pairwise_hamming_std")
+                                    "night_intrusion_rate", "pairwise_hamming_std")
 # DDPM の Stage 2（λ = 0.003・step 200）の出力（計画書 §6 の注）
 DDPM_SELECTION_CSV = OUT_DIR / "stage2_lam0.003_selection.csv"
 DDPM_FOLD_CSV = "stage2_lam0.003_fold{k}_selection.csv"
@@ -282,6 +283,32 @@ def evaluate(model: Any, shift: JapanShift | None, tgt: dict, masks: dict[str, B
         raise ValueError(f"rate_mse_split には偶数の本数が要る: {n_per_group}")
     bias = None if shift is None else shift.to_group_bias()
     pool = gm.group_pool(model, n_per_group, GUIDANCE, seed=EVAL_SEED, group_bias=bias)
+    return score_pool(pool, tgt, masks, base, full)
+
+
+def score_pool(pool: npt.NDArray[np.int64], tgt: dict, masks: dict[str, BoolArr], base: dict[str, Any],
+               full: bool = True) -> list[dict[str, Any]]:
+    """評価のプールを 3 つの軸で採点した縦持ちの行を返す（stage2_select と同じ形式）
+
+    Note:
+        ★モデルに依存しない。LSTM_Aggregate/stage2_agg.py も自分のプールをここへ渡して、同じ形式の CSV を書く
+
+    Args:
+        pool: 評価のプール, dtype=int64, (28, n, 96)。n は偶数（rate_mse_split で半分ずつに分ける）
+        tgt: 教師
+        masks: 名前 → 教師の群 (28,)。名前ごとに in-teacher / held-out の行を作る（列 mask_name）
+        base: 全行に付ける識別列
+        full: False なら軸 1 だけ（--smoke 用）
+
+    Returns:
+        行 list[dict]
+
+    Raises:
+        ValueError: 群あたりの本数が奇数のとき
+    """
+    n_per_group = pool.shape[1]
+    if n_per_group % 2 != 0:
+        raise ValueError(f"rate_mse_split には偶数の本数が要る: {n_per_group}")
     half = n_per_group // 2
     rates, rates_a, rates_b = (sm.pool_to_rates(p) for p in (pool, pool[:, :half], pool[:, half:]))
     rows: list[dict[str, Any]] = []
@@ -410,17 +437,31 @@ def ddpm_references(tgt: dict) -> dict[str, Any]:
     return ref
 
 
-def judge(method: str = "shift") -> pd.DataFrame:
+def judge(method: str = "shift", path_of: Callable[[int, str], Path] | None = None,
+          out_path: Path | None = None, label: str = "gru") -> pd.DataFrame:
     """E0〜E2 の CSV から J1〜J6 を判定して表を返す（CSV にも書く）
 
+    Note:
+        ★LSTM_Aggregate/stage2_agg.py は path_of・out_path・label を渡して、自分の CSV を同じ規則で判定する
+
     Args:
-        method: METHOD_TAG のキー。E1・E2 の CSV をこの方法のものから読む（E0 は共通）
+        method: METHOD_TAG のキー。E1・E2 の CSV をこの方法のものから読む（E0 は共通）。path_of を渡すと使わない
+        path_of: (種, 実行の名前 zeroshot / all / fold{K}) → 評価の CSV のパス。None なら csv_path（GRU）
+        out_path: 判定の表の保存先。None なら stage2_gru{METHOD_TAG[method]}_judge.csv
+        label: 判定するモデルの値を入れる列の名前, default="gru"
+
+    Returns:
+        判定の表（列 item・{label}・zero_shot・ddpm・pass）
     """
+    def gru_path(seed: int, run: str) -> Path:
+        return csv_path(seed, run, "shift" if run == "zeroshot" else method)
+
+    resolve = gru_path if path_of is None else path_of
     tgt = st.load_stula_targets()
     ref = ddpm_references(tgt)
-    zs = {s: pd.read_csv(csv_path(s, "zeroshot")) for s in SEEDS}
-    e1 = {s: pd.read_csv(csv_path(s, "all", method)) for s in SEEDS}
-    e2 = {k: pd.read_csv(csv_path(LGO_SEED, f"fold{k}", method)) for k in range(lgo.N_FOLDS)}
+    zs = {s: pd.read_csv(resolve(s, "zeroshot")) for s in SEEDS}
+    e1 = {s: pd.read_csv(resolve(s, "all")) for s in SEEDS}
+    e2 = {k: pd.read_csv(resolve(LGO_SEED, f"fold{k}")) for k in range(lgo.N_FOLDS)}
     rows: list[dict[str, Any]] = []
 
     # J1・J2: held-out の rate_mse_split（種 42）
@@ -430,10 +471,10 @@ def judge(method: str = "shift") -> pd.DataFrame:
         z = _value(zs[LGO_SEED], "rate_mse_split", eval_kind="held-out", mask="12act", mask_name=f"fold{k}")
         better_zs += g < z
         better_ddpm += g < ref["heldout"][k]
-        rows.append({"item": f"J1/J2 fold{k}", "gru": g, "zero_shot": z, "ddpm": ref["heldout"][k]})
-    rows.append({"item": "J1 held-out が zero-shot より改善した fold 数", "gru": better_zs,
+        rows.append({"item": f"J1/J2 fold{k}", label: g, "zero_shot": z, "ddpm": ref["heldout"][k]})
+    rows.append({"item": "J1 held-out が zero-shot より改善した fold 数", label: better_zs,
                  "pass": better_zs == lgo.N_FOLDS})
-    rows.append({"item": "J2 held-out が DDPM より小さい fold 数", "gru": better_ddpm,
+    rows.append({"item": "J2 held-out が DDPM より小さい fold 数", label: better_ddpm,
                  "pass": better_ddpm >= J2_MIN_FOLDS})
 
     # J3: 実 ATUS との距離（E1 と E0 の 5 本の中央値）
@@ -454,10 +495,10 @@ def judge(method: str = "shift") -> pd.DataFrame:
         g, z = dist(e1), dist(zs)
         ok = g <= J3_RATIO * z
         j3_ok &= ok
-        rows.append({"item": f"J3 {metric}（実 ATUS との距離）", "gru": g, "zero_shot": z, "pass": ok})
+        rows.append({"item": f"J3 {metric}（実 ATUS との距離）", label: g, "zero_shot": z, "pass": ok})
     copies = sum(_value(df, "exact_copy_rate", eval_kind="all", reference="atus") > 0 for df in e1.values())
     memorized = sum(_value(df, "memorized", eval_kind="all", reference="atus") > 0 for df in e1.values())
-    rows.append({"item": "J3 exact copy・暗記の本数", "gru": copies + memorized, "pass": copies + memorized == 0})
+    rows.append({"item": "J3 exact copy・暗記の本数", label: copies + memorized, "pass": copies + memorized == 0})
     rows.append({"item": "J3", "pass": j3_ok and copies + memorized == 0})
 
     # J4: 公表表（起床・就寝・日次行動者率）
@@ -467,24 +508,24 @@ def judge(method: str = "shift") -> pd.DataFrame:
         z = med(zs, metric, reference="stula_published")
         ok = abs(g) < abs(z)
         j4_ok &= ok
-        rows.append({"item": f"J4 |{metric}|", "gru": g, "zero_shot": z, "pass": ok})
+        rows.append({"item": f"J4 |{metric}|", label: g, "zero_shot": z, "pass": ok})
     rows.append({"item": "J4", "pass": j4_ok})
 
     # J5・J6: 28 群すべて（循環）
     g5 = med(e1, "national_curve_mse", statistic="national_curve")
-    rows.append({"item": "J5 全国の曲線の MSE", "gru": g5, "zero_shot": med(zs, "national_curve_mse",
+    rows.append({"item": "J5 全国の曲線の MSE", label: g5, "zero_shot": med(zs, "national_curve_mse",
                  statistic="national_curve"), "ddpm": ref["national_curve_mse"],
                  "pass": g5 < ref["national_curve_mse"]})
     g6 = med(e1, "rate_mse_split", eval_kind="in-teacher", mask="12act")
     g6d = med(e1, "dev_rmse", eval_kind="in-teacher", mask="12act")
-    rows.append({"item": "J6 28 群の rate_mse_split", "gru": g6,
+    rows.append({"item": "J6 28 群の rate_mse_split", label: g6,
                  "zero_shot": med(zs, "rate_mse_split", eval_kind="in-teacher", mask="12act", mask_name="all"),
                  "ddpm": ref["rate_mse_split"], "pass": g6 < ref["rate_mse_split"]})
-    rows.append({"item": "J6 28 群の dev_rmse", "gru": g6d,
+    rows.append({"item": "J6 28 群の dev_rmse", label: g6d,
                  "zero_shot": med(zs, "dev_rmse", eval_kind="in-teacher", mask="12act", mask_name="all"),
                  "ddpm": ref["dev_rmse"], "pass": g6d < ref["dev_rmse"]})
     out = pd.DataFrame(rows)
-    out.to_csv(OUT_DIR / f"stage2_gru{METHOD_TAG[method]}_judge.csv", index=False)
+    out.to_csv(out_path or OUT_DIR / f"stage2_gru{METHOD_TAG[method]}_judge.csv", index=False)
     return out
 
 
