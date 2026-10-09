@@ -26,6 +26,7 @@ NOTE.md
 docs/*
 Stage2_design.md
 Stage2_implementation.md
+docs
 
 # wandb
 wandb/
@@ -37,10 +38,13 @@ CLAUDE_EXPERIMENT.md
 
 # src
 viz/
+*primer*
 
 # generated
 slides/
 outputs/
+figure/
+figures/
 
 # jobs
 # 投入時のローカル設定（グループ名・メールアドレス）。jobs/local.env.example は追跡する。
