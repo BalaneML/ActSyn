@@ -108,7 +108,7 @@ def test_positional_encoding():
 
     判定は「同じ重みの同じモデルで、位置符号だけを 0 にしたら内部変動が落ちるか」。
     別アーキ (現行 UNet1D) との比較だと初期化と構造の違いが混ざるので、PE の寄与だけを
-    切り出す。現行 UNet1D の値は文脈として並記する（≈0 = 時計が無いことの定量確認）。
+    切り出す。現行 UNet1D の値は文脈として並記する（≈0 = 時刻符号が無いことの定量確認）。
     """
     m = _wake_up(tang.TangUNet1D().to(DEV).eval())
     v_with, g_with = _interior_variation(m), _shift_gap(m, k=24)

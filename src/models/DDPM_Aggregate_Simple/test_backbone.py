@@ -12,12 +12,29 @@ DDPM_Aggregate からずれていないか」を検証する:
                      かつ t を変えると出力が実際に変わる（時刻情報が届いている）
     4. 条件付け     : cond_idx を変えると出力が変わる。drop_mask=True の行は
                      cond_idx=None と厳密に一致する（CFG の無条件経路の同一性）
-    5. DDIM / EMA   : ★どちらも存在しない。チェックポイントのキーは "model" のみ
+    5. DDIM / EMA   : ★どちらも存在しない。チェックポイントのキーは "model" と "config" のみ
     6. 中間特徴     : features() が h1/h2/h3 を解像度 96/48/24 で返す
                      （clock_diagnostics が同じ表を出せる条件）
     7. 逆過程       : T を短くした ancestral が最後まで走り、正しい範囲のラベルを返す
     8. 原本との差分 : ★DDPM_Aggregate.UNet1D との違いが time_mlp だけであること。
                      自己完結（コピー）なので、意図しない差分が混入していないかを固定する
+    9. 時刻符号 (--clock) : φ の直交性、零初期化の時点で時刻符号なしと出力が一致すること、
+                     解像度 96/48/24 の位置の対応、保存して読み直したときの構造
+   10. 反復 (--seed) : 学習の乱数だけを変え、学習/評価の分割は SEED で固定のまま
+   11. 行動者率の項 (--rate-lam) : ★loss() が従来の式と厳密に一致すること（Stage 2 が呼ぶ）、
+                     rate_lam=0 の 1 更新が従来のループと一致すること、v(t) の境目、
+                     u = −(x̂0 − x0) の換算、eps_hat=eps で 0、Stage 2 が loss_terms を呼ばないこと
+   12. 構造の指定 (ArchSpec) : 倍音 K=48 が 96 スロットの全関数を張ること、Transformer 型が
+                     timestep_embedding と一致すること、零初期化で時刻符号なしと出力が一致すること、
+                     config["arch"] から構造が戻ること、矛盾する指定を弾くこと
+   13. 計算ブロック : RoPE は回転 0 で nn.MultiheadAttention と一致し、位置をずらしても出力が不変、
+                     96 解像度の attention は attn1 / u1_attn だけを足すこと、
+                     条件×時刻のバイアスは零初期化で一致し、学習前から勾配が流れること
+   14. L_rate の単位 (--rate-mode) : 層・区間が 1 つなら batch と一致すること、層の割り当て、
+                     pop は r̄ をバッチ平均に置くと batch と一致すること、loss() が不変なこと
+   15. 診断 (--save-every / Diffusion.restore) : 途中の ckpt が学習中の重みで、保存が乱数を
+                     消費しないこと、restore が ti = t0 から戻ること（添字のずれを固定）、
+                     t0 = 0 で入力の x0 が戻ること
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは出力が恒等的に 0 になり
@@ -31,6 +48,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -167,9 +185,20 @@ def test_no_ddim_no_ema():
         for b in banned:
             assert b not in params, f"{fn.__name__} に {b} 引数が残っている"
 
-    # チェックポイントの契約: キーは "model" のみ
-    src = inspect.getsource(sm.train)
-    assert '{"model": model.state_dict()}' in src, "保存するチェックポイントの形が変わっている"
+    # チェックポイントの契約: 重みはキー "model"、出所の記録はキー "config"。EMA の重みは持たない
+    # 保存は save_ckpt が一手に行う（最良の ckpt も途中の epoch の ckpt も）
+    assert "save_ckpt(model, save_path, arch, seed, rate_lam, rate_gamma, rate_mode)" \
+        in inspect.getsource(sm.train), "train が save_ckpt を通さずに保存している"
+    src = inspect.getsource(sm.save_ckpt)
+    assert 'torch.save({"model": model.state_dict(), "config": config}, path)' in src, \
+        "保存するチェックポイントの形が変わっている"
+    # ★config のリテラルを丸ごと固定する（EMA の重みなど第3のキーが入ると落ちる）。
+    #   '"ema"' の有無では判定できない。wandb の config に "ema": False があるため
+    assert ('config: dict[str, Any] = {"kernel_size": KERNEL_SIZE, "clock": arch.has_clock,\n'
+            '                              "arch": asdict(arch), "seed": seed,\n'
+            '                              "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma,\n'
+            '                              "rate_mode": rate_mode}'
+            ) in src, "チェックポイントの config が変わっている"
     print("  5. DDIM / EMA を持たない: OK")
 
 
@@ -245,6 +274,477 @@ def test_diff_against_baseline():
           f"({n_a:,} -> {n_b:,}, -{n_mlp:,} params): OK")
 
 
+def test_clock():
+    """★--clock の契約（時刻符号つき UNet1D）。
+
+    (a) φ は 8 行 × 96 スロットで、行どうしが直交する（離散フーリエの直交性 φφᵀ = 48·I）
+    (b) 追加されるパラメータは 11 個の clock_proj だけ
+    (c) 零初期化の時点では、時刻符号なしのモデルと出力がビット単位で一致する
+    (d) clock_proj を動かすと出力が変わり、48 解像度のバイアスは 96 解像度を 2 つおきに
+        取ったものと一致する（ds1 の出力位置 j がスロット 2j にあたるという規約）
+    (e) 保存して load_pretrained で読むと、時刻符号つきの構造で組み直される
+    """
+    import tempfile
+
+    # (a) φ の形と直交性
+    phi = sm.clock_features()
+    assert phi.shape == (sm.CLOCK_DIM, sm.NUM_SLOTS)
+    gram = phi @ phi.T
+    assert torch.allclose(gram, torch.eye(sm.CLOCK_DIM) * sm.NUM_SLOTS / 2, atol=1e-4), \
+        "φ の行が直交していない"
+
+    # (b) 増えるパラメータは clock_proj だけ
+    torch.manual_seed(0)
+    base = sm.UNet1D().to(DEVICE).eval()
+    torch.manual_seed(0)
+    clk = sm.UNet1D(clock=True).to(DEVICE).eval()
+    only_clk = set(clk.state_dict()) - set(base.state_dict())
+    assert only_clk and all(".clock_proj." in k for k in only_clk), sorted(only_clk)
+    assert set(base.state_dict()) - set(clk.state_dict()) == set()
+    n_blocks = sum(1 for m in clk.modules() if isinstance(m, sm.ResBlock1D))
+    assert n_blocks == 11 and len(only_clk) == 2 * n_blocks
+    assert not sm.state_has_clock(base.state_dict()) and sm.state_has_clock(clk.state_dict())
+    n_extra = sum(p.numel() for p in clk.parameters()) - sum(p.numel() for p in base.parameters())
+
+    # (c) 零初期化の時点で一致。時刻符号なしの重みを時刻符号つきへ流し込み、clock_proj は零のまま
+    missing, unexpected = clk.load_state_dict(base.state_dict(), strict=False)
+    assert not unexpected and set(missing) == only_clk
+    _wake_up(base)
+    _wake_up(clk)
+    x, t, c = _inputs()
+    with torch.no_grad():
+        y_base, y_clk = base(x, t, c), clk(x, t, c)
+    assert torch.equal(y_base, y_clk), "零初期化の時刻符号つきが時刻符号なしと一致しない"
+
+    # (d) clock_proj を動かすと出力が変わる。解像度間の位置の対応
+    g = torch.Generator().manual_seed(1)
+    with torch.no_grad():
+        for name, p in clk.named_parameters():
+            if ".clock_proj." in name:
+                p.copy_(torch.randn(p.shape, generator=g) * 0.1)
+        y_moved = clk(x, t, c)
+        b96, b48, b24 = clk.d1a.clock_bias(96), clk.d1a.clock_bias(48), clk.d1a.clock_bias(24)
+    assert not torch.equal(y_base, y_moved), "clock_proj を動かしても出力が変わらない"
+    assert b96.shape == (1, sm.BASE_CH, 96) and b48.shape == (1, sm.BASE_CH, 48)
+    assert torch.allclose(b48, b96[:, :, ::2]) and torch.allclose(b24, b96[:, :, ::4])
+
+    # (e) 保存 -> load_pretrained / build_unet_for_ckpt で時刻符号つきの構造に戻る
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "clock.pt"
+        torch.save({"model": clk.state_dict(), "config": {"clock": True}}, path)
+        loaded = sm.load_pretrained(path).to(DEVICE)
+        assert loaded.clock and sm.build_unet_for_ckpt(path).clock
+        with torch.no_grad():
+            assert torch.equal(loaded(x, t, c), y_moved), "読み直した時刻符号つきの出力が変わった"
+        torch.save({"model": base.state_dict()}, path)      # config の無い古い形式
+        assert not sm.load_pretrained(path).clock
+
+    print(f"  9. 時刻符号 (φ 直交・零初期化で一致・解像度の対応・読み直し, +{n_extra:,} params): OK")
+
+
+def _copy_into(dst: Any, src: Any) -> set[str]:
+    """src の重みを dst へ流し込み、dst にだけある（流し込まれなかった）キーを返す。"""
+    missing, unexpected = dst.load_state_dict(src.state_dict(), strict=False)
+    assert not unexpected, unexpected
+    return set(missing)
+
+
+def test_arch_spec():
+    """★ArchSpec の契約（時刻符号の種類と次元、構造の保存と復元）。
+
+    (a) 倍音 K=48 の φ に定数の行を足すと階数 96（96 スロットの全関数を張る）。
+        sin(πs) の行は恒等的に 0
+    (b) Transformer 型の φ は timestep_embedding(0..95, 96) の転置そのもの
+    (c) どちらの種類も零初期化の時点で時刻符号なしと出力がビット単位で一致する
+    (d) config["arch"] を持つ ckpt から同じ構造が戻る。config["arch"] が無く
+        入力次元が CLOCK_DIM と違う ckpt は構造を決められないので例外
+    (e) 矛盾する指定（範囲外の K、時刻符号なしのランク、clock=True と arch の併用）を弾く
+    """
+    import tempfile
+    from dataclasses import asdict
+
+    # (a) 倍音 K=48
+    h48 = sm.ArchSpec(clock_kind="harmonic", clock_harmonics=48)
+    phi = sm.time_features(h48)
+    assert phi.shape == (96, sm.NUM_SLOTS) and h48.clock_dim == 96
+    assert torch.allclose(phi[-1], torch.zeros(sm.NUM_SLOTS), atol=1e-4), "sin(πs) の行が 0 でない"
+    full = torch.cat([torch.ones(1, sm.NUM_SLOTS), phi], dim=0).double()
+    assert int(torch.linalg.matrix_rank(full)) == sm.NUM_SLOTS, "倍音 K=48 が全関数を張らない"
+
+    # (b) Transformer 型
+    tf = sm.ArchSpec(clock_kind="transformer")
+    phi_tf = sm.time_features(tf)
+    ref = sm.timestep_embedding(torch.arange(sm.NUM_SLOTS), sm.CLOCK_TRANSFORMER_DIM).T
+    assert phi_tf.shape == (sm.CLOCK_TRANSFORMER_DIM, sm.NUM_SLOTS) and torch.equal(phi_tf, ref)
+
+    # (c) 零初期化で時刻符号なしと一致
+    torch.manual_seed(0)
+    base = sm.UNet1D().to(DEVICE).eval()
+    x, t, c = _inputs()
+    for arch in (h48, tf):
+        model = sm.UNet1D(arch=arch).to(DEVICE).eval()
+        only = _copy_into(model, base)
+        assert only and all(".clock_proj." in k for k in only), sorted(only)
+        _wake_up(base)
+        _wake_up(model)
+        with torch.no_grad():
+            assert torch.equal(base(x, t, c), model(x, t, c)), f"{arch} が零初期化で一致しない"
+
+    # (d) 保存と復元
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "arch.pt"
+        for arch in (sm.ArchSpec(), h48, tf):
+            model = sm.UNet1D(arch=arch)
+            torch.save({"model": model.state_dict(), "config": {"arch": asdict(arch)}}, path)
+            assert sm.build_unet_for_ckpt(path).arch == arch
+            assert sm.load_pretrained(path).arch == arch
+        # config["arch"] の無い K=48 は種類を決められない
+        torch.save({"model": sm.UNet1D(arch=h48).state_dict()}, path)
+        try:
+            sm.build_unet_for_ckpt(path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("config['arch'] の無い K=48 の ckpt を黙って読んだ")
+
+    # (e) 矛盾する指定を弾く
+    bad_specs = [dict(clock_kind="harmonic", clock_harmonics=0),
+                 dict(clock_kind="harmonic", clock_harmonics=49),
+                 dict(clock_kind="none", cond_clock_rank=4),
+                 dict(clock_kind="sundial")]
+    for kwargs in bad_specs:
+        try:
+            sm.ArchSpec(**kwargs)
+        except ValueError:
+            continue
+        raise AssertionError(f"矛盾する指定を弾かなかった: {kwargs}")
+    try:
+        sm.UNet1D(clock=True, arch=h48)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("clock=True と arch の併用を弾かなかった")
+
+    n_h48 = sum(p.numel() for p in sm.UNet1D(arch=h48).parameters())
+    n_base = sum(p.numel() for p in base.parameters())
+    print(f"  12. ArchSpec (K=48 全基底・Transformer 型・零初期化で一致・保存と復元, "
+          f"K=48 は +{n_h48 - n_base:,} params): OK")
+
+
+def test_blocks():
+    """★ArchSpec の計算ブロック（attn_rope / attn96 / cond_clock_rank）の契約。
+
+    (a) RoPE: 位置を全て 0 にすると nn.MultiheadAttention と一致する。全位置を同じ量だけ
+        ずらしても出力は変わらない（内積が位置の差だけで決まる）。重みのキーは増えない
+    (b) attn96: 増えるキーは attn1 / u1_attn だけ
+    (c) cond_clock: 増えるキーは cond_clock_* だけで、零初期化の時点で出力が一致する。
+        混ぜる重み a が 0 でも、1 回の逆伝播で a に勾配が流れる（学習が始まる）
+    """
+    torch.manual_seed(0)
+    block = sm.AttnBlock1D(sm.BASE_CH * 2, rope=True).eval()
+    h = torch.randn(3, 48, sm.BASE_CH * 2)
+    pos = sm.slot_positions(48, "cpu")
+    with torch.no_grad():
+        ref, _ = block.attn(h, h, h, need_weights=False)
+        zero = block.rope_attention(h, torch.zeros_like(pos))
+        a0, a7 = block.rope_attention(h, pos), block.rope_attention(h, pos + 7.0)
+    assert torch.allclose(zero, ref, atol=1e-5), "回転 0 の RoPE が MultiheadAttention と一致しない"
+    assert torch.allclose(a0, a7, atol=1e-4), "位置をずらすと RoPE の出力が変わった（相対位置でない）"
+    assert not torch.allclose(a0, zero, atol=1e-4), "RoPE の回転が効いていない"
+    assert torch.equal(pos[:3], torch.tensor([0.0, 2.0, 4.0])), "48 解像度の位置がスロット 2j でない"
+
+    h48 = sm.ArchSpec(clock_kind="harmonic", clock_harmonics=48)
+    torch.manual_seed(0)
+    base = sm.UNet1D(arch=h48).eval()
+    x, t, c = _inputs()
+    n_base = sum(p.numel() for p in base.parameters())
+
+    rope = sm.UNet1D(arch=sm.ArchSpec(clock_kind="harmonic", clock_harmonics=48, attn_rope=True))
+    assert set(rope.state_dict()) == set(base.state_dict()), "RoPE で重みのキーが変わった"
+
+    attn96 = sm.UNet1D(arch=sm.ArchSpec(clock_kind="harmonic", clock_harmonics=48,
+                                        attn_rope=True, attn96=True)).eval()
+    extra = set(attn96.state_dict()) - set(base.state_dict())
+    assert extra and all(k.startswith(("attn1.", "u1_attn.")) for k in extra), sorted(extra)
+    with torch.no_grad():
+        assert attn96(x, t, c).shape == (x.size(0), sm.IN_CH, sm.NUM_SLOTS)
+    n_attn96 = sum(p.numel() for p in attn96.parameters())
+
+    cc = sm.UNet1D(arch=sm.ArchSpec(clock_kind="harmonic", clock_harmonics=48,
+                                    cond_clock_rank=4)).eval()
+    only = _copy_into(cc, base)
+    assert only and all(".cond_clock_" in k for k in only), sorted(only)
+    _wake_up(base)
+    _wake_up(cc)
+    with torch.no_grad():
+        assert torch.equal(base(x, t, c), cc(x, t, c)), "零初期化の条件×時刻のバイアスで出力が変わった"
+    cc.train()
+    cc.zero_grad()
+    cc(x, t, c).pow(2).mean().backward()
+    grad = cc.d1a.cond_clock_mix.weight.grad
+    assert grad is not None and float(grad.abs().sum()) > 0.0, "混ぜる重み a に勾配が流れない"
+    n_cc = sum(p.numel() for p in cc.parameters())
+
+    print(f"  13. 計算ブロック (RoPE の一致と相対性・attn96 は +{n_attn96 - n_base:,}・"
+          f"条件×時刻 R=4 は +{n_cc - n_base:,} params, 零初期化で一致・勾配が流れる): OK")
+
+
+def test_rate_modes():
+    """★rate_mode（Diffusion.rate_objective）の契約。
+
+    (a) stratified_mean_sq は層が 1 つなら rate_loss（batch）と一致する
+    (b) group の層: 条件ありは 性×就業、条件なし（drop_mask）は最後の層
+    (c) tbin の区間は SNR の境目 100 / 10 / 1 で 0..3。全行が 1 区間なら batch と一致する
+    (d) pop は目標 r̄ をバッチの x0 平均に置き、全行を SNR >= γ にすると batch と一致する。
+        r̄ をずらすと値が変わる（目標が効いている）
+    (e) rate_split は mode によらず batch の定義。loss() は mode によらず同じ値
+    (f) population_rates は各スロットで活動の和が 1。pop に目標が無ければ例外
+    """
+    g = torch.Generator().manual_seed(3)
+    batch = 16
+    sched = torch.randint(0, sm.NUM_ACT, (batch, sm.NUM_SLOTS), generator=g)
+    x0 = sm.sched_to_x0(sched)
+    eps = torch.randn(x0.shape, generator=g)
+    eps_hat = eps + 0.1 * torch.randn(x0.shape, generator=g)
+    t = torch.full((batch,), 50, dtype=torch.long)             # SNR >= 100 の区間 0
+    cond = torch.as_tensor(sm.cond_grid()[:batch], dtype=torch.long)
+    no_drop = torch.zeros(batch, dtype=torch.bool)
+    pair = sm.EpsPair(eps_hat, eps, t, x0, no_drop)
+    d_batch = sm.Diffusion(device=DEVICE)
+    ref, ref_split = d_batch.rate_loss(eps_hat, eps, t)
+
+    # (a) 層が 1 つなら batch と一致
+    u = d_batch.rate_v[t][:, None, None] * (eps_hat - eps)
+    one = sm.stratified_mean_sq(u, torch.zeros(batch, dtype=torch.long), 3)
+    assert torch.allclose(one, ref, rtol=1e-6, atol=0.0), "層 1 つの stratified_mean_sq が batch とずれた"
+
+    # (b) group の層
+    drop = torch.zeros(batch, dtype=torch.bool)
+    drop[0] = True
+    strata = sm.rate_group_strata(cond, drop)
+    expect = cond[:, 0] * sm.N_E + cond[:, 2]
+    expect[0] = sm.N_G * sm.N_E
+    assert torch.equal(strata, expect) and int(strata.max()) < sm.N_RATE_GROUPS
+
+    # (c) tbin の区間
+    snr = d_batch.snr
+    tb = d_batch.rate_tbin
+    for k, (lo, hi) in enumerate([(100.0, float("inf")), (10.0, 100.0), (1.0, 10.0), (0.0, 1.0)]):
+        sel = (snr >= lo) & (snr < hi)
+        assert bool((tb[sel] == k).all()), f"tbin の区間 {k} の割り当てが違う"
+    d_tbin = sm.Diffusion(device=DEVICE, rate_mode="tbin")
+    rate_tbin, split_tbin = d_tbin.rate_objective(pair, cond)
+    assert torch.allclose(rate_tbin, ref, rtol=1e-6, atol=0.0), "全行 1 区間の tbin が batch とずれた"
+
+    # (d) pop: r̄ = バッチの x0 平均、t=50 は SNR >= γ=1
+    d_pop = sm.Diffusion(device=DEVICE, rate_mode="pop", rate_target=x0.mean(dim=0))
+    rate_pop, split_pop = d_pop.rate_objective(pair, cond)
+    assert torch.allclose(rate_pop, ref, rtol=1e-5, atol=1e-10), "r̄ をバッチ平均に置いた pop が batch とずれた"
+    d_off = sm.Diffusion(device=DEVICE, rate_mode="pop", rate_target=x0.mean(dim=0) + 0.05)
+    assert float(d_off.rate_objective(pair, cond)[0]) > float(ref) + 1e-4, "pop の目標 r̄ が効いていない"
+
+    # (e) rate_split は mode によらず batch の定義。loss() は mode によらない
+    assert torch.equal(split_tbin, ref_split) and torch.equal(split_pop, ref_split)
+    model = _model(0).train()
+    torch.manual_seed(5)
+    l_batch = d_batch.loss(model, sched[:8], cond[:8])
+    torch.manual_seed(5)
+    l_group = sm.Diffusion(device=DEVICE, rate_mode="group").loss(model, sched[:8], cond[:8])
+    assert torch.equal(l_batch, l_group), "rate_mode で loss() が変わった（Stage 2 に影響する）"
+
+    # (f) population_rates と例外
+    r = sm.population_rates(sched.numpy(), np.linspace(1.0, 2.0, batch))
+    assert r.shape == (sm.NUM_ACT, sm.NUM_SLOTS) and torch.allclose(r.sum(dim=0), torch.ones(sm.NUM_SLOTS))
+    for kwargs in (dict(rate_mode="pop"), dict(rate_mode="median")):
+        try:
+            sm.Diffusion(device=DEVICE, **kwargs)
+        except ValueError:
+            continue
+        raise AssertionError(f"不正な指定を弾かなかった: {kwargs}")
+    print("  14. L_rate の単位 (batch/group/tbin/pop の一致・層と区間の割り当て・loss 不変): OK")
+
+
+def test_seed_keeps_split():
+    """--seed は学習の乱数だけを変え、学習/評価の分割（split_indices）は変えないこと。
+
+    ★分割が変わると Stage 2 の val_epsilon_mse と暗記チェックの参照集合が別物になり、
+      反復実験の差が「種の差」でなく「データの差」を含んでしまう。
+    """
+    import inspect
+    before = sm.split_indices(1000)
+    torch.manual_seed(12345)                       # 学習側の乱数をどう動かしても
+    after = sm.split_indices(1000)
+    assert all((x == y).all() for x, y in zip(before, after)), "split_indices が大域の乱数に依存している"
+    src = inspect.getsource(sm.train)
+    assert "torch.manual_seed(seed)" in src and "torch.manual_seed(SEED)" not in src
+    assert "manual_seed(SEED)" in inspect.getsource(sm.split_indices)
+    print("  10. --seed は学習の乱数だけを変え、分割は SEED で固定: OK")
+
+
+def _old_loss(diffusion: Any, model: Any, sched: torch.Tensor,
+              cond_idx: torch.Tensor) -> torch.Tensor:
+    """--rate-lam 導入前の Diffusion.loss を書き写した参照実装（比較専用）。"""
+    x0 = sm.sched_to_x0(sched)
+    t = torch.randint(0, sm.T_STEPS, (x0.size(0),), device=x0.device)
+    eps = torch.randn_like(x0)
+    x_t = diffusion.q_sample(x0, t, eps)
+    drop_mask = torch.rand(x0.size(0), device=x0.device) < sm.P_UNCOND
+    eps_hat = model(x_t, t, cond_idx, drop_mask)
+    return torch.nn.functional.mse_loss(eps_hat, eps)
+
+
+def test_rate_loss():
+    """★行動者率の項 L_rate（Diffusion.rate_loss / loss_terms, --rate-lam）。
+
+    Stage 2 は Diffusion.loss をリハーサル項と val に使い、make_loaders で ATUS を読む。
+    その 2 つの挙動が 1 ビットも変わっていないことを最初に固定する。
+    """
+    import inspect
+    d = sm.Diffusion(device=DEVICE)
+    sched = torch.randint(0, sm.NUM_ACT, (8, sm.NUM_SLOTS), generator=torch.Generator().manual_seed(1))
+    cond = torch.as_tensor(sm.cond_grid()[:8], dtype=torch.long)
+
+    # (a) loss() は従来の式と同じ乱数・同じ値。loss_terms の eps も一致する
+    model = _model(0).train()
+    torch.manual_seed(7)
+    ref = _old_loss(d, model, sched, cond)
+    torch.manual_seed(7)
+    new = d.loss(model, sched, cond)
+    torch.manual_seed(7)
+    terms = d.loss_terms(model, sched, cond)
+    assert torch.equal(ref, new), f"loss() が従来の式とずれた ({float(ref)} vs {float(new)})"
+    assert torch.equal(ref, terms["eps"]), "loss_terms の eps が loss() と一致しない"
+
+    # (b) rate_lam=0 の 1 更新は、従来の学習ループ（loss().backward()）と同じ重みになる
+    ds = sm.ScheduleDataset(cond, sched)
+    loader = torch.utils.data.DataLoader(ds, batch_size=8, shuffle=False)
+    m_old, m_new = _model(3).train(), _model(3).train()
+    o_old = torch.optim.AdamW(m_old.parameters(), lr=sm.LR, weight_decay=0.0)
+    o_new = torch.optim.AdamW(m_new.parameters(), lr=sm.LR, weight_decay=0.0)
+    torch.manual_seed(11)
+    for c_b, s_b in loader:
+        o_old.zero_grad()
+        _old_loss(d, m_old, s_b, c_b).backward()
+        o_old.step()
+    torch.manual_seed(11)
+    # run_epoch はバッチをモジュール変数 DEVICE へ送るので、テストの間だけ CPU に揃える
+    saved_device, sm.DEVICE = sm.DEVICE, DEVICE
+    try:
+        sm.run_epoch(m_new, d, loader, o_new, rate_lam=0.0)
+    finally:
+        sm.DEVICE = saved_device
+    for (name, p_old), p_new in zip(m_old.named_parameters(), m_new.parameters()):
+        assert torch.equal(p_old, p_new), f"rate_lam=0 の更新が従来とずれた: {name}"
+
+    # (c) v(t) の境目: SNR >= γ の t は 1/√SNR、それより大きい t は 1/√γ
+    snr = d.acp / (1.0 - d.acp)
+    for gamma in (1.0, 0.01):
+        dg = sm.Diffusion(device=DEVICE, rate_gamma=gamma)
+        low, high = snr >= gamma, snr < gamma
+        assert torch.allclose(dg.rate_v[low], snr[low].rsqrt())
+        assert torch.allclose(dg.rate_v[high], torch.full_like(dg.rate_v[high], gamma ** -0.5))
+    assert int(torch.nonzero(snr >= 1.0).max()) == 258, "γ=1 の境目が t=258 でない"
+
+    # (d) SNR >= γ の t では u = v·(eps_hat − eps) が −(x̂0 − x0) に一致する（x0 空間の残差）
+    g = torch.Generator().manual_seed(5)
+    x0 = sm.sched_to_x0(sched)
+    eps = torch.randn(x0.shape, generator=g)
+    eps_hat = eps + 0.1 * torch.randn(x0.shape, generator=g)
+    t = torch.full((8,), 100, dtype=torch.long)
+    x_t = d.q_sample(x0, t, eps)
+    x0_hat = (x_t - d.sqrt_1m_acp[t][:, None, None] * eps_hat) / d.sqrt_acp[t][:, None, None]
+    u = d.rate_v[t][:, None, None] * (eps_hat - eps)
+    assert torch.allclose(u, -(x0_hat - x0), atol=1e-5), "u が x0 空間の残差になっていない"
+
+    # (e) eps_hat = eps なら L_rate も split 推定も 0。偏りを足すと m² に一致する
+    rate, split = d.rate_loss(eps, eps, t)
+    assert float(rate) == 0.0 and float(split) == 0.0
+    bias = torch.full_like(eps, 0.2)
+    rate, split = d.rate_loss(eps + bias, eps, t)
+    expect = float((d.rate_v[100] * 0.2) ** 2)
+    assert abs(float(rate) - expect) < 1e-7 and abs(float(split) - expect) < 1e-7
+
+    # (f) Stage 2 は loss() と既定の make_loaders だけを使う（L_rate も drop_last も入らない）
+    assert inspect.signature(sm.make_loaders).parameters["drop_last"].default is False
+    assert inspect.signature(sm.Diffusion).parameters["rate_gamma"].default == sm.RATE_SNR_GAMMA
+    assert sm.RATE_LAM == 0.0
+    s2 = (Path(__file__).resolve().parent / "stage2_finetune.py").read_text(encoding="utf-8")
+    assert "loss_terms" not in s2 and "drop_last" not in s2 and "rate_gamma" not in s2, \
+        "stage2_finetune が L_rate の経路を使っている"
+    print("  11. 行動者率の項 (loss 不変・λ=0 の更新一致・v(t) の境目 t=258・x0 換算・0 の検算): OK")
+
+
+def test_diagnostics():
+    """★少ない活動の診断に使う 2 つの経路の契約。
+
+    (a) save_every: 途中の ckpt は学習中の実際の重みで、最良の ckpt はそのどれかと一致する。
+        保存は乱数を消費しない。途中の ckpt の config にだけ "epoch" が入る
+    (b) restore: 雑音化した x_t から ti = t0 .. 0 の順に _reverse_step を当てたものと
+        ビット単位で一致する（K = t0 + 1 のずれを固定する）
+    (c) restore: t0 = 0 なら入力の x0 が argmax でそのまま戻る
+    """
+    import tempfile
+
+    # (a) 途中の ckpt は学習中の実際の重みで、最良の ckpt はそのどれかと一致する。
+    #     ★2 回学習して比べる形にしないのは、train が model.DEVICE（MPS / CUDA）で走り、
+    #       2 回の学習がビット単位で一致する保証が無いため
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "traj.pt"
+        sm.train(epochs=2, use_wandb=False, save_path=path, save_every=1)
+        best = torch.load(path, map_location="cpu")
+        per_epoch = [torch.load(sm.epoch_ckpt_path(path, e), map_location="cpu") for e in (1, 2)]
+        assert "epoch" not in best["config"], "最良の ckpt の config に epoch が入った"
+        for e, ck in zip((1, 2), per_epoch):
+            assert ck["config"] == {**best["config"], "epoch": e}
+        same = [all(torch.equal(best["model"][k], ck["model"][k]) for k in best["model"])
+                for ck in per_epoch]
+        assert any(same), "最良の重みがどの epoch の ckpt とも一致しない"
+
+        # save_ckpt は乱数を消費しない（save_every の有無で学習の乱数列が変わらない）
+        fresh = sm.UNet1D()                     # 初期化は乱数を使うので、状態を取る前に作る
+        state = torch.get_rng_state()
+        sm.save_ckpt(fresh, Path(tmp) / "x.pt", sm.ArchSpec(), 0, 0.0, 1.0, "batch", epoch=3)
+        assert torch.equal(state, torch.get_rng_state()), "save_ckpt が乱数を消費した"
+    import inspect
+    assert "if save_every > 0 and ep % save_every == 0:" in inspect.getsource(sm.train)
+
+    # (b) restore の添字。T を短くして全段を比べる
+    m = _model()
+    orig_t = sm.T_STEPS
+    try:
+        sm.T_STEPS = 6
+        d = sm.Diffusion(device=DEVICE)
+        sched = torch.randint(0, sm.NUM_ACT, (4, sm.NUM_SLOTS), generator=torch.Generator().manual_seed(3))
+        x0 = sm.sched_to_x0(sched)
+        ci = torch.as_tensor(sm.cond_grid()[:4], dtype=torch.long)
+        for t0 in (0, 2, sm.T_STEPS - 1):
+            torch.manual_seed(7)
+            got = d.restore(m, x0, t0, ci)
+            torch.manual_seed(7)
+            t = torch.full((4,), t0, dtype=torch.long)
+            x = d.q_sample(x0, t, torch.randn_like(x0))
+            with torch.no_grad():
+                for ti in reversed(range(t0 + 1)):
+                    x = d._reverse_step(m, x, ti, ci, sm.GUIDANCE_SCALE)
+            assert torch.equal(got, x), f"restore が ti = {t0} から戻っていない"
+        for bad in (-1, sm.T_STEPS):
+            try:
+                d.restore(m, x0, bad, ci)
+            except ValueError:
+                continue
+            raise AssertionError(f"範囲外の t0 を弾かなかった: {bad}")
+    finally:
+        sm.T_STEPS = orig_t
+
+    # (c) t0 = 0 は 1 段だけ戻す（post_coef_x0[0] = 1）ので x0 がそのまま戻る
+    d = sm.Diffusion(device=DEVICE)
+    torch.manual_seed(0)
+    back = d.restore(m, x0, 0, ci).argmax(dim=1)
+    agree = float((back == sched).float().mean())
+    assert agree > 0.99, f"t0 = 0 で x0 が戻らない（一致率 {agree:.3f}）"
+    print(f"  15. 診断 (途中の ckpt・restore は ti = t0 から・t0 = 0 の一致率 {agree:.3f}): OK")
+
+
 if __name__ == "__main__":
     print("DDPM_Aggregate_Simple backbone tests")
     test_shapes()
@@ -255,4 +755,11 @@ if __name__ == "__main__":
     test_features()
     test_reverse_process()
     test_diff_against_baseline()
+    test_clock()
+    test_seed_keeps_split()
+    test_rate_loss()
+    test_arch_spec()
+    test_blocks()
+    test_rate_modes()
+    test_diagnostics()
     print("test_backbone: OK")

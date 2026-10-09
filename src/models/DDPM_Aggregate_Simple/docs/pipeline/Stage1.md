@@ -4,7 +4,8 @@
 `DDPM_Aggregate_Tang` は別系統（x0 の値域が -1/+1、EMA あり、adaLN、DDIM 可）で
 Stage 2 につながらないため、この図には含めない。
 
-**関連**: [Stage 2 の処理の流れ](./Stage2.md) ／
+**関連**: [2 段学習の全体像](./Overview.md)（論文 概要図の下敷き） ／
+[Stage 2 の処理の流れ](./Stage2.md) ／
 [Stage2_design.md](../Stage2_design.md)（設計） ／
 [Stage2_implementation.md](../Stage2_implementation.md)（実装記録） ／
 [Stage1_overfitting_rebuttal.md](../Stage1_overfitting_rebuttal.md)（過学習の検証）
@@ -99,7 +100,7 @@ flowchart LR
 flowchart TB
     IN["1バッチ: cond_idx (B,3) / sched (B,96)<br/>(図① から)"]
 
-    subgraph LOSS["Diffusion.loss(model, sched, cond_idx) :537"]
+    subgraph LOSS["Diffusion._eps_pair(model, sched, cond_idx)<br/>★loss / loss_terms の共通部分。乱数は t → eps → drop_mask の順"]
         direction TB
         L1["x0 = sched_to_x0(sched) :272<br/>one_hot して (B,12,96)、値は 0 か 1"]
         L2["t = randint(0, T_STEPS) (B,)<br/>T_STEPS=1000、一様"]
@@ -112,11 +113,13 @@ flowchart TB
     end
 
     EMB["emb = timestep_embedding(t) + embed_cond(cond_idx, B, drop_mask)<br/>(B,256)<br/>★time_mlp を通さない (sinusoidal を直接加算)<br/>drop_mask が True の行は null_emb に置換"]
+    CLOCK["arch.has_clock のときだけ: clock_phi = time_features(arch) (arch.clock_dim, 96)<br/>harmonic: clock_features(K) 24h の倍音 k=1..K（--clock は K=4、K=48 で全関数）<br/>transformer: timestep_embedding(0..95, 96).T（底 10000）<br/>学習パラメータなしの buffer (各 ResBlock1D が保持)"]
+    CC["arch.cond_clock_rank=R>0 のときだけ: cond_clock_bias(emb, L)<br/>Σ_r cond_clock_mix(emb)_r · cond_clock_profile(φ)[l,c,r]<br/>mix は零初期化（群と t で形が変わる時刻の山）"]
 
     subgraph NET["UNet1D.forward(x_t, t, cond_idx, drop_mask) :449"]
         direction TB
         N0["in_conv Conv1d(IN_CH=12 → c1=64, k=KERNEL_SIZE)"]
-        N1["d1a, d1b : ResBlock1D(64,64)<br/>h1 (B,64,96)"]
+        N1["d1a, d1b : ResBlock1D(64,64) → attn1（arch.attn96 のときだけ）<br/>h1 (B,64,96)"]
         N2["ds1 : Conv1d stride=2"]
         N3["d2a, d2b : ResBlock1D(64→128) → attn2 : AttnBlock1D(128)<br/>h2 (B,128,48)"]
         N4["ds2 : Conv1d stride=2"]
@@ -124,7 +127,7 @@ flowchart TB
         N6["m1 → m_attn → m2<br/>m (B,128,24)"]
         N7["u3 : ResBlock1D(cat of m and h3)<br/>u (B,128,24)"]
         N8["interpolate x2 → us2 → u2 : ResBlock1D(cat of u and h2) → u2_attn<br/>u (B,128,48)"]
-        N9["interpolate x2 → us1 → u1 : ResBlock1D(cat of u and h1)<br/>u (B,64,96)"]
+        N9["interpolate x2 → us1 → u1 : ResBlock1D(cat of u and h1) → u1_attn（arch.attn96 のときだけ）<br/>u (B,64,96)"]
         N10["out_norm → SiLU → out_conv (重み・バイアスをゼロ初期化)"]
         N0 --> N1 --> N2 --> N3 --> N4 --> N5 --> N6 --> N7 --> N8 --> N9 --> N10
         N1 -.->|"skip"| N9
@@ -133,13 +136,15 @@ flowchart TB
     end
 
     EPS["eps_hat (B,12,96)"]
-    OBJ["loss = F.mse_loss(eps_hat, eps)"]
+    OBJ["l_eps = F.mse_loss(eps_hat, eps)<br/>(Diffusion.loss はこれだけを返す。Stage 2 が呼ぶ)"]
+    RATE["--rate-lam のときだけ効く: Diffusion.rate_objective(pair, cond_idx)<br/>u = rate_v[t] * (eps_hat − eps)、rate_v = 1/√max(SNR(t), RATE_SNR_GAMMA=1)<br/>rate_mode=batch: m = u.mean(dim=0) (12,96)　★行動者率の偏り、l_rate = (m ** 2).mean()<br/>group / tbin: stratified_mean_sq(u, 層, 層の数)（性×就業+条件なし / SNR 4 区間）<br/>pop: u' = −u + rate_x0_coef[t]·(x0 − rate_target)（目標を学習分割の r̄ にする対照）"]
+    TOT["total = l_eps + rate_lam * l_rate<br/>(rate_lam=0 なら total = l_eps で従来と一致)"]
 
     subgraph EPOCH["run_epoch :724 → train :749"]
         direction TB
-        E1["train_loader を1周 → tr<br/>optimizer.zero_grad → loss.backward → optimizer.step<br/>AdamW(lr=LR=2e-4, weight_decay=0.0)"]
+        E1["run_epoch(..., rate_lam): train_loader を1周 → tr (eps / rate / rate_split / total)<br/>optimizer.zero_grad → total.backward → optimizer.step<br/>AdamW(lr=LR=2e-4, weight_decay=0.0)<br/>rate_lam &gt; 0 のときだけ make_loaders(drop_last=True)"]
         E2["val_loader を1周 → va<br/>optimizer=None なので model.eval() かつ勾配なし"]
-        E3{"va が best_val - EARLY_STOP_MIN_DELTA(1e-4)<br/>を下回るか"}
+        E3{"va['eps'] が best_val - EARLY_STOP_MIN_DELTA(1e-4)<br/>を下回るか (★判定は ε-MSE のみ)"}
         E4["best_state = deepcopy(model.state_dict()), epoch=ep<br/>epochs_no_improve = 0"]
         E5["epochs_no_improve += 1<br/>EARLY_STOP_PATIENCE=200 に達したら break"]
         E1 --> E2 --> E3
@@ -147,7 +152,7 @@ flowchart TB
         E3 -->|"no"| E5
     end
 
-    SAVE["model.load_state_dict(best_state) で最良重みへ戻す<br/>torch.save の payload はキー 'model' のみ (EMA なし)<br/>MODEL_SAVE_PATH: outputs/checkpoints/<br/>ddpm_simple_pretrain_common12_weekday.pt"]
+    SAVE["model.load_state_dict(best_state) で最良重みへ戻す<br/>torch.save の payload はキー 'model' と 'config' (kernel_size, clock)。EMA なし<br/>MODEL_SAVE_PATH: outputs/checkpoints/<br/>ddpm_simple_pretrain_common12_weekday.pt<br/>--kernel は _k{K}、--clock は _clock を付けた別名へ保存"]
 
     subgraph SANITY["sanity_check(model, n_per_group=256) :994"]
         direction TB
@@ -171,11 +176,20 @@ flowchart TB
     L2 --> EMB
     L5 --> EMB
     L4 --> N0
-    EMB -.->|"各 ResBlock1D の emb_proj で加算 (adaLN ではない)"| NET
+    EMB -.->|"各 ResBlock1D の emb_proj で加算 (adaLN ではない)<br/>全スロットで同じ値"| NET
+    CLOCK -.->|"各 ResBlock1D の clock_proj (零初期化) で加算<br/>clock_bias(L): φ を stride 96//L で間引く<br/>スロットごとに違う値"| NET
+    CLOCK --> CC
+    EMB --> CC
+    CC -.->|"各 ResBlock1D で clock_bias と同じ位置に加算"| NET
     N10 --> EPS
     EPS --> OBJ
     L3 --> OBJ
-    OBJ --> E1
+    EPS --> RATE
+    L3 --> RATE
+    L2 --> RATE
+    OBJ --> TOT
+    RATE --> TOT
+    TOT --> E1
     E4 --> SAVE
     E5 --> SAVE
     SAVE --> V1
@@ -183,10 +197,31 @@ flowchart TB
 
 **要点**
 
-- 損失は ε 予測の MSE ただ 1 項。集計表は Stage 1 では一切使わない
+- **構造は `ArchSpec`** でまとめて指定する（`clock_kind` / `clock_harmonics` / `attn_rope` /
+  `attn96` / `cond_clock_rank`）。チェックポイントの `config["arch"]` に保存し、`arch_spec_from_ckpt` が
+  構造を戻す（倍音 K=48 と Transformer 型 96 次元は重みの形が同じなので、重みのキーでは区別できない）。
+  アブレーションの arm は `stage1_arms.ARMS` が唯一の出所で、`model.py --arm NAME` で学習する。
+- **`attn_rope`** は既存の attention の q, k をスロット番号で回転させる（RoPE、重みのキーは不変）。
+- **`--rate-mode`**（既定 batch）で L_rate の偏りを平均する単位を変える（`rate_objective`）。
+  `pop` は目標をバッチ自身の x0 でなく学習分割の r̄ にする対照で、デノイザを r̄ へ縮める項が入る。
+- **`--rate-lam`（既定 0）**で行動者率の偏りの項 `l_rate` を足す。同じ forward の残差を
+  `rate_v[t]` で行動者率（x0）の単位へ換算し、バッチ平均した `m` (12,96) の二乗平均を取る。
+  個票ごとの残差は平均で打ち消され、全員に共通する偏りだけが残る。`rate_v` は t<=258 で
+  1/√SNR（x0 空間の残差）、それより大きい t は 1 で頭打ち（`--rate-gamma` で変えられる）。
+  `Diffusion.loss` は ε-MSE だけを返し続けるので、Stage 2 のリハーサル項と val は変わらない
+  （`test_backbone.py` の 11）。保存先は `_rate{λ}`（γ が既定以外なら `g{γ}` も付く）。
+- 損失は（`--rate-lam` を使わない限り）ε 予測の MSE ただ 1 項。集計表は Stage 1 では一切使わない
   （教師 `A*` が入るのは [Stage 2](./Stage2.md) から）。
 - 条件は**個人属性のみ** (`gender`, `age7`, `telfs`)。`emb` は時刻埋め込みとの**和**で、
   各 `ResBlock1D` の `emb_proj` を通して加算注入する。adaLN ではない。
+  **全スロットに同じ値として足される**ので、この経路は「何時に」を表せない。
+- **`--clock`（アブレーション）**では各 `ResBlock1D` に零初期化の `clock_proj`
+  (`Linear(CLOCK_DIM=8, c_out)`, 11 個で +10,944 params) が加わり、24 時間周期の
+  フーリエ特徴 `clock_phi` をスロットごとに違う値のバイアスとして足す。
+  48/24 解像度では `clock_phi` を stride 2/4 で間引く（`ds1`/`ds2` の出力位置 j はスロット 2j/4j）。
+  零初期化なので学習前の出力は時刻符号なしと一致する（`test_backbone.py` の 9）。
+  構造は重みのキーで決まり（`state_has_clock`）、`load_pretrained` と
+  `build_unet_for_ckpt` が時刻符号の有無を自動で合わせる。
 - `out_conv` のゼロ初期化により、学習開始時の `eps_hat` は恒等的に 0 になる。
   これは `E[eps]=0` より最適な定数予測器である。
 - 検証損失で選んだ重みがそのまま生成に使われる。**EMA を持たない**ので、

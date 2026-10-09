@@ -3,9 +3,9 @@ test_clock_diagnostics.py
 ================
 clock_diagnostics.py の検証。
 
-診断は「時計が無い」と結論しうるので、**指標そのものが時計に反応することを
+診断は「時刻符号が無い」と結論しうるので、**指標そのものが時刻符号に反応することを
 先に示す**必要がある。各テストは「答えが分かっている合成データ」で
-    - 時計を壊した入力 -> 床の外 / gap 大 / R² 高
+    - 時刻符号を壊した入力 -> 床の外 / gap 大 / R² 高
     - 壊していない入力 -> 床の内 / gap ≈ 0 / R² ≈ 0
 の両方向を確認する。片方向だけだと、常に「異常なし」を返す指標でも通ってしまう。
 
@@ -55,7 +55,7 @@ def make_clocked(n: int, seed: int = 0) -> np.ndarray:
 
 
 def make_declocked(sched: np.ndarray, seed: int = 0) -> np.ndarray:
-    """各個票を大きく巡回シフトして時計だけを壊す。
+    """各個票を大きく巡回シフトして時刻符号だけを壊す。
 
     活動の構成・エピソード長・切替回数はそのまま。日内リズム（時刻との対応）
     だけが失われるので、時刻を見る指標だけが反応するはず。
@@ -66,7 +66,7 @@ def make_declocked(sched: np.ndarray, seed: int = 0) -> np.ndarray:
 
 
 def test_curve_comparison():
-    """(1) B1: 時計を壊すとピークが鈍り、L1 が床の外に出ること。"""
+    """(1) B1: 時刻符号を壊すとピークが鈍り、L1 が床の外に出ること。"""
     real = make_clocked(1200, seed=0)
     same = make_clocked(1200, seed=1)
     flat = make_declocked(real, seed=2)
@@ -76,7 +76,7 @@ def test_curve_comparison():
     assert (ok["l1_verdict"] == "床の内").all(), ok
     assert np.allclose(ok["peak_ratio"], 1.0, atol=0.15), ok
 
-    # 時計を壊すとピークが鈍り、L1 は床の外
+    # 時刻符号を壊すとピークが鈍り、L1 は床の外
     bad = cd.curve_comparison(real, flat, N_ACT, ACT_NAMES, n_boot=40, seed=0)
     assert (bad["l1_verdict"] == "★床の外").all(), bad
     # 巡回シフトで平坦化するので、鋭いピークを持つ活動は必ず低くなる
@@ -89,7 +89,7 @@ def test_curve_comparison():
     # 数えられなくなるため厳密一致にはならない（境界は t=1..95 の95本だけ）
     d_sw = abs(im.switch_stats(real)["mean"] - im.switch_stats(flat)["mean"])
     assert d_sw < 0.2, d_sw
-    print(f"  (1) B1 curve: OK  (時計あり L1={ok['curve_l1'].mean():.4f} / "
+    print(f"  (1) B1 curve: OK  (時刻符号あり L1={ok['curve_l1'].mean():.4f} / "
           f"壊した後 L1={bad['curve_l1'].mean():.4f}, peak比={bad['peak_ratio'].min():.2f})")
 
 
@@ -123,7 +123,7 @@ def test_first_onset():
     assert sleep["onset_std_real"] == 0.0 and np.isnan(sleep["onset_std_ratio"])
     rest = bad[bad.activity != "SLEEP_PERSONAL"]
     assert (rest["onset_std_ratio"] > 3.0).all(), rest
-    print(f"  (2) B2 onset: OK  (std比 時計あり={ok['onset_std_ratio'].mean():.2f} / "
+    print(f"  (2) B2 onset: OK  (std比 時刻符号あり={ok['onset_std_ratio'].mean():.2f} / "
           f"壊した後={rest['onset_std_ratio'].mean():.2f})")
 
 
@@ -169,7 +169,7 @@ def test_ridge_probe():
 
 
 def test_shift_equivariance():
-    """(5) B5: シフト等変なモデルで gap≈0、時計を持つモデルで gap 大。"""
+    """(5) B5: シフト等変なモデルで gap≈0、時刻符号を持つモデルで gap 大。"""
     import torch
     import torch.nn as nn
 
@@ -190,7 +190,7 @@ def test_shift_equivariance():
             return self.conv(x)
 
     class Clocked(Equivariant):
-        """位置ごとの固定バイアスを足す = 時計を持つ。"""
+        """位置ごとの固定バイアスを足す = 時刻符号を持つ。"""
         def __init__(self):
             super().__init__()
             self.pos = nn.Parameter(torch.randn(1, ch, length), requires_grad=False)
@@ -214,7 +214,7 @@ def test_shift_equivariance():
     assert (eq["noise_gap"] > 0).all()
     assert np.isnan(eq["gap_over_cond"]).all(), "cond_gap=0 のとき比は nan にすべき"
     print(f"  (5) B5 shift: OK  (等変モデル gap={eq['gap'].max():.2e} / "
-          f"時計つき gap={ck['gap'].min():.3f})")
+          f"時刻符号つき gap={ck['gap'].min():.3f})")
 
 
 def test_position_probe_integration():

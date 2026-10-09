@@ -49,6 +49,10 @@ Stage 2 基盤の単体テスト（Stage2_design.md §10.3）。
     (e)    ★2パス蓄積の勾配が一括計算と一致する（近似ではない）
     (e2)   2パス目に1パス目と同じ zs を渡すと x_0 が一致する
     (d_idx) stage2_targets.d_index が model.d_index と全28組で一致
+    (tilt) 傾けたリハーサル（stage2_tilt.py）: 群の重みの合計が保たれ、傾けない群は
+           元の重みと完全一致し、傾けた群は A* に近づく。rho=inf は傾けない
+    (tug)  ★add_rehearsal_grad が θ.grad を従来の「集計側の上へ backward」と
+           ビット単位で同じにし、tug_cos が 2 つの勾配の cos に一致する
 
 ★ 出口の零初期化について:
     UNet1D は out_conv を零初期化するので、そのままでは勾配の大きさが測れない。
@@ -102,6 +106,7 @@ ck: Any = _load("simple_stage2_checkpoint", HERE / "stage2_checkpoint.py")
 st: Any = _load("simple_stage2_targets", HERE / "stage2_targets.py")
 sl: Any = _load("simple_stage2_loss", HERE / "stage2_loss.py")
 ft: Any = _load("simple_stage2_finetune", HERE / "stage2_finetune.py")
+tl: Any = _load("simple_stage2_tilt", HERE / "stage2_tilt.py")
 se: Any = _load("simple_stage2_select", HERE / "stage2_select.py")
 lg: Any = _load("simple_stage2_lgo", HERE / "stage2_lgo.py")
 sp: Any = _load("simple_stage2_published", HERE / "stage2_published.py")
@@ -1747,6 +1752,87 @@ def test_grad_norms() -> None:
     print("test_grad_norms: OK")
 
 
+def test_clock_param_group() -> None:
+    """(ck) 時刻符号つきの Stage 1 では clock 群が 4 つ目の層別 LR 群として立つこと。
+
+    ★時刻符号なしモデルは従来の 3 群のまま（test_layered_lr が固定）。時刻符号つきでは
+      clock_proj だけが clock 群に入り、conv へ混ざらないこと、grad_norms が
+      agg_gnorm_clock を出すこと、群名を持たない optimizer を黙って読まないことを固定する。
+    """
+    torch.manual_seed(0)
+    model = _wake_up(sm.UNet1D(clock=True).to(DEVICE)).eval()
+    opt = ft.build_optimizer(model, lr_clock=3e-4)
+    names = [g["name"] for g in opt.param_groups]
+    assert names == ["cond", "emb", ft.CLOCK_GROUP_NAME, "conv"], names
+    lr_by_name = {g["name"]: g["lr"] for g in opt.param_groups}
+    assert lr_by_name[ft.CLOCK_GROUP_NAME] == 3e-4 and lr_by_name["cond"] == ft.LR_COND
+
+    groups = ft.split_param_groups(model)
+    pname = {id(p): n for n, p in model.named_parameters()}
+    assert all(".clock_proj." in pname[id(p)] for p in groups[ft.CLOCK_GROUP_NAME])
+    assert not any(".clock_proj." in pname[id(p)] for p in groups["conv"]), \
+        "clock_proj が conv 群へ混入している"
+    n_clock = sum(p.numel() for p in groups[ft.CLOCK_GROUP_NAME])
+    assert n_clock == 10_944, f"clock_proj のパラメータ数が想定と違う: {n_clock}"
+    # 時刻符号以外の 3 群は時刻符号なしモデルと同じ大きさ
+    base_groups = ft.split_param_groups(_model())
+    for k in ft.PARAM_GROUP_NAMES:
+        assert sum(p.numel() for p in groups[k]) == sum(p.numel() for p in base_groups[k]), k
+
+    # 零初期化の clock_proj にも勾配は届く（∂h/∂W = 上流勾配 × φ）
+    model(torch.randn(2, sm.IN_CH, sm.NUM_SLOTS), torch.zeros(2, dtype=torch.long),
+          _cond(2)).square().mean().backward()
+    got = ft.grad_norms(opt, "agg")
+    assert set(got) == {f"agg_gnorm_{k}" for k in ["cond", "emb", ft.CLOCK_GROUP_NAME, "conv"]}
+    assert got[f"agg_gnorm_{ft.CLOCK_GROUP_NAME}"] > 0, got
+
+    # 群名を持たない optimizer は黙って読まない
+    bare = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    try:
+        ft.grad_norms(bare, "agg")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("群名の無い optimizer を grad_norms が受け付けた")
+    print(f"  (1) (ck) clock 群 {n_clock:,} params・LR 3e-4・agg_gnorm_clock "
+          f"{got[f'agg_gnorm_{ft.CLOCK_GROUP_NAME}']:.3e}: OK")
+    print("test_clock_param_group: OK")
+
+
+def test_arch_param_groups() -> None:
+    """(ar) ArchSpec の追加部品が Stage 2 の層別 LR 群へ正しく入ること。
+
+    ★条件×時刻のバイアス（cond_clock_*）は clock 群、96 解像度の attention（attn1 / u1_attn）は
+      conv 群に入る。cond_clock_* が cond 群（cond_embeds / cond_proj）へ混ざらないこと、
+      Stage 2 の世代の config に arch が残り、そこから同じ構造が組み直せることを固定する。
+    """
+    import tempfile
+    from dataclasses import asdict
+
+    arch = sm.ArchSpec(clock_kind="harmonic", clock_harmonics=48, attn_rope=True,
+                       attn96=True, cond_clock_rank=4)
+    torch.manual_seed(0)
+    model = sm.UNet1D(arch=arch).to(DEVICE)
+    groups = ft.split_param_groups(model)
+    pname = {id(p): n for n, p in model.named_parameters()}
+    in_group = {k: {pname[id(p)] for p in v} for k, v in groups.items()}
+    cc = {n for n in pname.values() if ".cond_clock_" in n}
+    a96 = {n for n in pname.values() if n.startswith(("attn1.", "u1_attn."))}
+    assert cc and cc <= in_group[ft.CLOCK_GROUP_NAME], sorted(cc - in_group[ft.CLOCK_GROUP_NAME])
+    assert not cc & in_group["cond"], "cond_clock_* が cond 群へ混入している"
+    assert a96 and a96 <= in_group["conv"], sorted(a96 - in_group["conv"])
+
+    # Stage 2 の世代（config は Stage 2 の設定 + arch）から同じ構造が戻る
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "stage2_step0001.pt"
+        torch.save({"model": model.state_dict(), "step": 1,
+                    "config": {"K": 1, "arch": asdict(arch)}}, path)
+        assert sm.build_unet_for_ckpt(path).arch == arch
+    print(f"  (1) (ar) cond_clock_* {len(cc)} 個は clock 群、attn96 {len(a96)} 個は conv 群・"
+          f"Stage 2 の世代から構造が戻る: OK")
+    print("test_arch_param_groups: OK")
+
+
 def test_x0_diagnostics() -> None:
     """(x0) clamp の飽和と straight-through の鋭さが観測できること。
 
@@ -1970,6 +2056,112 @@ def test_select_common_random_numbers() -> None:
     print("test_select_common_random_numbers: OK")
 
 
+def test_tilted_rehearsal() -> None:
+    """(tilt) 傾けたリハーサルの重み（stage2_tilt.fit_tilt / stage2_finetune.tilted_rehearsal_weights）。
+
+    ★実データ（ATUS 学習分割）の 2 群だけを傾けて速く測る。
+    """
+    cond_idx, sched, weight, _ = sm.load_data()
+    train_idx, val_idx = sm.split_indices(len(sched))
+    groups = sm.cond_to_d(cond_idx)
+    a_star = np.asarray(st.load_stula_targets()["group_rates_tbl"], dtype=np.float64)
+    tilt_groups = [5, 20]
+    s_tr, g_tr, w_tr = sched[train_idx], groups[train_idx], weight[train_idx]
+
+    res = tl.fit_tilt(s_tr, g_tr, w_tr, a_star, tilt_groups, rho=0.1)
+    for d in range(st.D_GROUPS):
+        m = g_tr == d
+        if not m.any():
+            continue
+        # 群の重みの合計は変わらない
+        assert abs(res.weights[m].sum() - w_tr[m].sum()) <= 1e-9 * w_tr[m].sum(), d
+        if d not in tilt_groups:
+            # 傾けない群（held-out を含む）は元の重みと完全一致
+            assert np.array_equal(res.weights[m], w_tr[m]), d
+            assert not res.eta[d].any(), d
+    t = res.table.set_index("d")
+    for d in tilt_groups:
+        assert t.loc[d, "mse_after"] < 0.5 * t.loc[d, "mse_before"], t.loc[d]
+        assert t.loc[d, "ess_after"] <= t.loc[d, "ess_before"] + 1e-9, t.loc[d]
+        assert t.loc[d, "grad_norm"] < 1e-5, t.loc[d]
+    print(f"  (1) (tilt) 群 5: rate_mse {t.loc[5, 'mse_before']:.5f} -> {t.loc[5, 'mse_after']:.5f}、"
+          f"ESS {t.loc[5, 'ess_before']:.1f} -> {t.loc[5, 'ess_after']:.1f} 人。"
+          "群の合計は保存・傾けない群は完全一致: OK")
+
+    # rho=inf は傾けない（従来のリハーサルと一致）
+    none = tl.fit_tilt(s_tr, g_tr, w_tr, a_star, tilt_groups, rho=float("inf"))
+    assert np.array_equal(none.weights, w_tr) and not none.eta.any()
+    print("  (2) (tilt) rho=inf は w = b（従来と一致）: OK")
+
+    # 学習ループからの入口: 学習分割だけを傾け、val 分割の重みは元のまま
+    w_all, summary = ft.tilted_rehearsal_weights(cond_idx, sched, weight, a_star,
+                                                  np.asarray(tilt_groups), 0.1)
+    assert np.array_equal(w_all[val_idx], weight[val_idx])
+    assert np.array_equal(w_all[train_idx], res.weights)
+    assert summary["tilt_mse_after"] < summary["tilt_mse_before"]
+    # 既定は従来のリハーサル
+    assert inspect.signature(ft.run).parameters["rehearsal"].default == "atus"
+    print("  (3) (tilt) 学習分割だけを傾け、val は元のまま。run の既定は rehearsal='atus': OK")
+    print("test_tilted_rehearsal: OK")
+
+
+def test_add_rehearsal_grad() -> None:
+    """(tug) add_rehearsal_grad が θ.grad を従来の累積とビット単位で同じにし、cos を正しく測ること。
+
+    ★従来は「集計側の backward の上へ (λ·L_atus).backward() で累積」していた。
+      新しい実装は g_agg を退避して λ·g_atus を別に得てから足し戻す。
+      IEEE の加算は交換則が成り立つので一致するはずで、それを固定する。
+    """
+    x1 = torch.randn(3, sm.IN_CH, sm.NUM_SLOTS, generator=torch.Generator().manual_seed(1))
+    x2 = torch.randn(3, sm.IN_CH, sm.NUM_SLOTS, generator=torch.Generator().manual_seed(2))
+    t = torch.full((3,), 100, dtype=torch.long)
+    lam = 0.003
+
+    def losses(model: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        agg = model(x1, t, _cond(3)).square().mean()
+        reh = model(x2, t, None).abs().mean()
+        return agg, reh
+
+    # 従来の経路
+    m_old = _model(4)
+    opt_old = ft.build_optimizer(m_old)
+    agg, reh = losses(m_old)
+    agg.backward()
+    (lam * reh).backward()
+    # 新しい経路
+    m_new = _model(4)
+    opt_new = ft.build_optimizer(m_new)
+    params = [p for g in opt_new.param_groups for p in g["params"]]
+    agg, reh = losses(m_new)
+    agg.backward()
+    tug = ft.add_rehearsal_grad(params, lam * reh)
+    old_params = [p for g in opt_old.param_groups for p in g["params"]]
+    for p_old, p_new in zip(old_params, params):
+        if p_old.grad is None:
+            assert p_new.grad is None
+        else:
+            assert torch.equal(p_old.grad, p_new.grad), "θ.grad が従来の累積とずれた"
+
+    # tug_cos は 2 つの勾配を別々に測った cos に一致する
+    m_a, m_r = _model(4), _model(4)
+    agg_a, _ = losses(m_a)
+    agg_a.backward()
+    _, reh_r = losses(m_r)
+    (lam * reh_r).backward()
+
+    def flat(m: Any) -> torch.Tensor:
+        opt = ft.build_optimizer(m)
+        return torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).flatten()
+                          for g in opt.param_groups for p in g["params"]])
+
+    ga, gr = flat(m_a).double(), flat(m_r).double()      # float64 で比べる（丸め誤差を避ける）
+    cos = float(torch.dot(ga, gr) / (ga.norm() * gr.norm()))
+    assert abs(tug["tug_cos"] - cos) < 1e-6, (tug["tug_cos"], cos)
+    assert abs(tug["tug_ratio"] - float(gr.norm() / ga.norm())) < 1e-6
+    print(f"  (1) (tug) θ.grad は従来とビット一致、tug_cos {tug['tug_cos']:+.4f} = 直接計算 {cos:+.4f}: OK")
+    print("test_add_rehearsal_grad: OK")
+
+
 def main() -> None:
     test_checkpoint_roundtrip()
     test_reverse_step_matches_inline()
@@ -2002,12 +2194,16 @@ def main() -> None:
     test_two_pass_memory_scaling()
     test_resolve_chunk()
     test_grad_norms()
+    test_clock_param_group()
+    test_arch_param_groups()
     test_x0_diagnostics()
     test_val_epsilon_mse()
     test_memorization_guardrail()
     test_lam_warmup_is_robust()
     test_jsd_memory_gate()
     test_select_common_random_numbers()
+    test_tilted_rehearsal()
+    test_add_rehearsal_grad()
     print("\ntest_stage2: OK")
 
 

@@ -14,6 +14,18 @@ model.py
         --epochs N   : 学習エポック数を上書き
         --no-wandb   : wandb ログを無効化
         --smoke      : 形状・整合の確認だけを短時間で回す
+        --kernel K   : 畳み込みの受容野（アブレーション。保存先に _k{K}）
+        --clock      : 全 ResBlock1D に 24 時間の時刻符号を足す（アブレーション。保存先に _clock）
+        --seed S     : 学習の乱数の種。分割は変えない（反復実験。保存先に _s{S}）
+        --rate-lam L : 行動者率の偏りの項 L_rate の重み（既定 0 = 従来の損失。保存先に _rate{L}）
+        --rate-gamma G : L_rate の重み v(t) の頭打ち（既定 1.0。既定以外は保存先に g{G}）
+        --rate-mode M  : L_rate の偏りを平均する単位 batch / group / tbin / pop（既定 batch。
+                         batch 以外は保存先の _rate{L} が _{M}rate{L} になる）
+        --no-pool      : 学習後の生成（sanity_check）を飛ばす。生成は stage1_guidance_pool.py で行う
+        --arm NAME     : stage1_arms.ARMS の arm を学習する（構造・損失・保存先を表から決める。
+                         上の構造・損失のフラグとは併用できない）
+        --save-every N : N epoch ごとに途中の ckpt を {ckpt の stem}_ep{epoch:04d}.pt へ保存する
+                         （診断用。最良の ckpt は変わらない）
 
 出力:
     outputs/checkpoints/ddpm_simple_pretrain_common12_weekday.pt   Stage1 の重み
@@ -26,8 +38,9 @@ import importlib.util
 import math
 import sys
 from collections.abc import Iterator
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal, overload
+from typing import Any, Literal, NamedTuple, overload
 
 import numpy as np
 import numpy.typing as npt
@@ -106,6 +119,16 @@ KERNEL_SIZE = 3
 # ★時刻埋め込みの次元。sinusoidal をこの次元で直接作り、MLP を通さずに足す。
 #   条件埋め込み (cond_proj) の出力次元と null_emb の次元もこれに揃う
 TIME_EMB_DIM = 256
+# ★24 時間の時刻符号（--clock のときだけ使う）。スロット s の位相 2πs/96 のフーリエ特徴を
+#   調和次数 k=1..CLOCK_HARMONICS（周期 24h, 12h, 8h, 6h）で作り、各 ResBlock1D へ
+#   スロットごとに違う値のバイアスとして足す。条件は emb_proj で全スロット同じ値として
+#   足されるので、時刻符号が無いと「何時に」を表す経路が無い（clock_diagnostics の B4）。
+#   周期 24h の関数なので左端 04:00 と右端の翌 04:00 がつながる（活動日は環）
+CLOCK_HARMONICS = 4
+CLOCK_DIM = 2 * CLOCK_HARMONICS
+# ★Transformer 型の時刻符号の次元（ArchSpec.clock_kind="transformer"）。timestep_embedding と同じ
+#   底 10000 の等比周波数をスロット番号 0..95 に当てる。96 スロットの全基底（倍音 K=48）と同じ次元にそろえる
+CLOCK_TRANSFORMER_DIM = NUM_SLOTS
 
 # Classifier-Free Guidance
 P_UNCOND       = 0.1
@@ -124,12 +147,36 @@ BATCH_SIZE  = 256
 EPOCHS      = 1000
 LR          = 2e-4  # 0.0002
 VAL_RATIO   = 0.1
+# ★2 つの用途がある。split_indices の学習/評価の分割（常にこの値で固定）と、
+#   学習の乱数（初期値・ミニバッチ・拡散の t と ε）の既定値。--seed が変えるのは後者だけで、
+#   分割は変えない。分割まで変えると Stage 2 の val や暗記チェックの参照集合が別物になる
 SEED        = 42
 USE_WEIGHTED_SAMPLER = True
 WEIGHT_COL  = "TUFINLWGT"
 EARLY_STOP_PATIENCE  = 200
 EARLY_STOP_MIN_DELTA = 1e-4
 GEN_BATCH   = 1024
+
+# ★行動者率の偏りの項 L_rate（Diffusion.rate_loss）。既定 0 で従来の損失と完全一致する。
+#   L_rate = mean_{c,s} m[c,s]²,  m[c,s] = mean_b v(t_b)·(eps_hat_b − eps_b)[c,s]
+#   v(t) = 1/√max(SNR(t), RATE_SNR_GAMMA)。SNR(t) >= RATE_SNR_GAMMA の t では
+#   v·(eps_hat − eps) = −(x̂0 − x0) で x0 空間（行動者率の単位）の残差になり、
+#   それより大きい t では x̂0 への換算係数 1/√SNR（t=999 で 157）を 1/√RATE_SNR_GAMMA で頭打ちにする。
+#   RATE_SNR_GAMMA=1 なら t<=258 を x0 空間の重み 1 で見て、t=500 で 0.29、t=999 で 0.006 に下がる
+RATE_LAM       = 0.0
+RATE_SNR_GAMMA = 1.0
+# ★L_rate の偏り m をどの単位で平均するか（Diffusion.rate_objective）。既定 "batch" は従来の L_rate
+#   batch: バッチ全体で平均する
+#   group: 条件ありの行を性×就業の 4 層、条件なしの行（drop_mask）を 1 層に分け、層ごとに平均する
+#   tbin : SNR(t) で 4 区間（>=100 / 10..100 / 1..10 / <1）に分け、区間ごとに平均する
+#   pop  : 目標をバッチの x0 でなく学習分割全体の行動者率 r̄ にする（ユーザー案。対照 arm）
+RateMode = Literal["batch", "group", "tbin", "pop"]
+RATE_MODES: tuple[RateMode, ...] = ("batch", "group", "tbin", "pop")
+RATE_MODE: RateMode = "batch"
+# tbin の区間の境目の SNR（降順）。t が大きいほど SNR は小さい
+RATE_TBIN_SNR = (100.0, 10.0, 1.0)
+# group の層の数。条件ありの 性(N_G)×就業(N_E) と、条件なしの 1 層
+N_RATE_GROUPS = N_G * N_E + 1
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
 
@@ -219,7 +266,20 @@ def split_indices(n: int) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]
     return perm[n_val:], perm[:n_val]
 
 
-def make_loaders(cond_idx, sched, weight):
+def make_loaders(cond_idx, sched, weight, drop_last: bool = False):
+    """学習用と評価用の DataLoader を作る
+
+    Args:
+        cond_idx: 条件インデックス, dtype=int64, (N, 3)
+        sched: 活動スケジュール (インデックス表現), dtype=int64, (N, 96)
+        weight: 調査ウェイト TUFINLWGT, dtype=float64, (N,)
+        drop_last: 学習用の最後の端数バッチ (3363 = 13×256 + 35 の 35 本) を捨てるか,
+            default=False (従来どおり)。L_rate はバッチ平均の偏りを測るので,
+            35 本のバッチでは雑音が √(256/35) ≈ 2.7 倍になる。rate_lam > 0 のときだけ True にする
+
+    Returns:
+        (train_loader, val_loader)。train は TUFINLWGT 加重の復元抽出, val は非加重・順序固定
+    """
     train_idx, val_idx = split_indices(len(sched))
 
     train_ds = ScheduleDataset(cond_idx[train_idx], sched[train_idx])
@@ -228,9 +288,11 @@ def make_loaders(cond_idx, sched, weight):
     if USE_WEIGHTED_SAMPLER:
         w = torch.as_tensor(weight[train_idx], dtype=torch.double)
         sampler = WeightedRandomSampler(w, num_samples=len(w), replacement=True)  # type: ignore
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler)
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler,
+                                  drop_last=drop_last)
     else:
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                                  drop_last=drop_last)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
     return train_loader, val_loader
 
@@ -270,6 +332,128 @@ def timestep_embedding(t: torch.Tensor, dim: int = TIME_EMB_DIM) -> torch.Tensor
     return torch.cat([torch.cos(args), torch.sin(args)], dim=1)  # (B, dim)
 
 
+def clock_features(num_slots: int = NUM_SLOTS,
+                   harmonics: int = CLOCK_HARMONICS) -> torch.Tensor:
+    """時刻スロットを 24 時間周期のフーリエ特徴 φ へ符号化する, -> (2*harmonics, num_slots)
+
+    φ[2(k−1), s] = cos(2πks / num_slots),  φ[2(k−1)+1, s] = sin(2πks / num_slots),  k = 1..harmonics
+
+    Note:
+        1. 拡散ステップの timestep_embedding とは別物。こちらは「1 日のうちの何時か」を表す
+        2. 学習パラメータを持たない固定の特徴。学習するのは ResBlock1D.clock_proj だけ
+        3. k=1 の cos/sin の組だけで 96 スロットすべてが別の点になる（円周上の 96 点）。
+           ただし clock_proj は φ の線形結合なので、作れるバイアスの形は最短周期 24h/harmonics
+           までに限られる。harmonics=4 では周期 6h 以上で、ATUS の 12:00 の 1 スロット幅の段差
+           （MEALS 0.082→0.169）は線形の当てはめでも 0.103 までしか戻らない。
+           harmonics=48 で 96 スロットの全関数を表せる（clock_proj の bias が定数成分を担う）
+        4. harmonics=num_slots//2 の sin 列は sin(πs)=0 で恒等的に 0 になる。
+           その列の重みに勾配が流れないだけで害は無い
+
+    Args:
+        num_slots: 1 日のスロット数, default=NUM_SLOTS=96
+        harmonics: 調和次数の上限 k, 1..num_slots//2, default=CLOCK_HARMONICS=4
+
+    Returns:
+        フーリエ特徴 φ, dtype=float32, (2*harmonics, num_slots)
+
+    Raises:
+        ValueError: harmonics が 1..num_slots//2 の外のとき
+    """
+    if not 1 <= harmonics <= num_slots // 2:
+        raise ValueError(f"harmonics は 1..{num_slots // 2}: {harmonics}")
+    s = torch.arange(num_slots, dtype=torch.float32)
+    k = torch.arange(1, harmonics + 1, dtype=torch.float32)
+    angle = 2.0 * math.pi * k[:, None] * s[None, :] / num_slots          # (H, S)
+    return torch.stack([torch.cos(angle), torch.sin(angle)], dim=1).reshape(2 * harmonics, num_slots)
+
+
+ClockKind = Literal["none", "harmonic", "transformer"]
+CLOCK_KINDS: tuple[ClockKind, ...] = ("none", "harmonic", "transformer")
+
+
+@dataclass(frozen=True)
+class ArchSpec:
+    """UNet1D の構造の指定。チェックポイントの config["arch"] に asdict で保存する
+
+    Note:
+        1. 既定値は時刻符号なしの従来の構造 (本編・DDPM_Aggregate との差分テストの対象)
+        2. 時刻の特徴 φ は保存しない buffer なので, 倍音 K=48 と Transformer 型 96 次元は
+           重みの形が同じになる。そのため構造は重みのキーでなく config["arch"] から復元する
+           (arch_spec_from_ckpt)
+        3. 追加した部品はすべて零初期化か, 零初期化の部品の後ろに置く。ただし attn_rope と
+           attn96 は学習前から出力が変わる (attention の計算そのものを変えるため)
+
+    Attributes:
+        clock_kind: 時刻符号の種類
+            "none": 時刻符号なし
+            "harmonic": 24h を基本周期とする倍音のフーリエ特徴 (clock_features)
+            "transformer": 底 10000 の等比周波数の sin/cos (timestep_embedding をスロット番号に当てる)
+        clock_harmonics: 倍音の調和次数の上限 K, 1..NUM_SLOTS//2。clock_kind="harmonic" のときだけ使う
+        attn_rope: attention の q, k をスロット番号で回転させる (RoPE) か
+        attn96: 96 解像度に attention (attn1, u1_attn) を足すか
+        cond_clock_rank: 条件×時刻のバイアスのランク R。0 なら足さない。時刻符号が要る
+    """
+    clock_kind: ClockKind = "none"
+    clock_harmonics: int = CLOCK_HARMONICS
+    attn_rope: bool = False
+    attn96: bool = False
+    cond_clock_rank: int = 0
+
+    def __post_init__(self) -> None:
+        """組み合わせの矛盾を構築時に弾く
+
+        Raises:
+            ValueError: 未知の clock_kind, 範囲外の clock_harmonics, 負のランク,
+                時刻符号なしで cond_clock_rank > 0 のとき
+        """
+        if self.clock_kind not in CLOCK_KINDS:
+            raise ValueError(f"clock_kind は {CLOCK_KINDS} のいずれか: {self.clock_kind}")
+        if not 1 <= self.clock_harmonics <= NUM_SLOTS // 2:
+            raise ValueError(f"clock_harmonics は 1..{NUM_SLOTS // 2}: {self.clock_harmonics}")
+        if self.cond_clock_rank < 0:
+            raise ValueError(f"cond_clock_rank は 0 以上: {self.cond_clock_rank}")
+        if self.cond_clock_rank > 0 and self.clock_kind == "none":
+            raise ValueError("cond_clock_rank > 0 には時刻符号 (clock_kind != 'none') が要る")
+
+    @property
+    def has_clock(self) -> bool:
+        """時刻符号を持つか"""
+        return self.clock_kind != "none"
+
+    @property
+    def clock_dim(self) -> int:
+        """時刻の特徴 φ の次元。時刻符号なしは 0"""
+        if self.clock_kind == "harmonic":
+            return 2 * self.clock_harmonics
+        if self.clock_kind == "transformer":
+            return CLOCK_TRANSFORMER_DIM
+        return 0
+
+
+def time_features(arch: ArchSpec) -> torch.Tensor:
+    """構造の指定に合う時刻の特徴 φ を返す, -> (arch.clock_dim, NUM_SLOTS)
+
+    Note:
+        1. "transformer" は既存の timestep_embedding をスロット番号 0..95 にそのまま当てる。
+           底 10000 は数千位置の系列向けの値で, 96 位置では大半の列がほぼ定数か直線になる
+           (96 次元でも独立な成分は 34 個)。比較のために手を加えず標準形のまま使う
+
+    Args:
+        arch: 構造の指定。clock_kind != "none" であること
+
+    Returns:
+        時刻の特徴 φ, dtype=float32, (arch.clock_dim, NUM_SLOTS)
+
+    Raises:
+        ValueError: 時刻符号なしの指定を渡したとき
+    """
+    if arch.clock_kind == "harmonic":
+        return clock_features(harmonics=arch.clock_harmonics)
+    if arch.clock_kind == "transformer":
+        return timestep_embedding(torch.arange(NUM_SLOTS), CLOCK_TRANSFORMER_DIM).T.contiguous()
+    raise ValueError("時刻符号なしの ArchSpec には時刻の特徴が無い")
+
+
 class ResBlock1D(nn.Module):
     """条件埋め込みを注入する1D残差ブロック (pre-activation ResNet)
 
@@ -277,14 +461,23 @@ class ResBlock1D(nn.Module):
         1. GroupNorm -> SiLU -> Conv1d の pre-activation 構成を2段重ね, 入力を残差加算する
         2. emb を emb_proj で c_out 次元へ落とし、チャネル毎バイアスとして時間軸一様に加算する
         3. 時間長Lは変えない (padding = KERNEL_SIZE // 2)
+        4. arch.has_clock のときだけ、時刻の特徴 φ (time_features) を clock_proj で c_out 次元へ
+           落とし、スロットごとに違う値のバイアスとして 2. と同じ位置に加算する
+        5. arch.cond_clock_rank = R > 0 のときだけ、条件×時刻のバイアス (cond_clock_bias) を
+           同じ位置に加算する。4. は全員に同じ時刻の形を足すが、5. は emb に応じて形が変わる
     """
-    def __init__(self, c_in: int, c_out: int, emb_dim: int = TIME_EMB_DIM):
+    # arch.has_clock のときだけ register_buffer で作る。型チェッカに Tensor と伝えるための宣言
+    clock_phi: torch.Tensor
+
+    def __init__(self, c_in: int, c_out: int, emb_dim: int = TIME_EMB_DIM,
+                 arch: ArchSpec = ArchSpec()):
         """残差ブロックの層を構築する。
 
         Args:
             c_in: 入力チャネル数, GroupNorm(8, c_in) のため8の倍数
             c_out: 出力チャネル数, 8の倍数, c_in と異なるとき skip は 1x1 conv になる
             emb_dim: 条件埋め込みの次元, default=TIME_EMB_DIM=256
+            arch: 構造の指定, default=ArchSpec() (時刻符号なしの従来の構造)
         """
         super().__init__()
         k, pad = KERNEL_SIZE, KERNEL_SIZE // 2
@@ -297,6 +490,54 @@ class ResBlock1D(nn.Module):
         self.conv2 = nn.Conv1d(c_out, c_out, k, padding=pad)
 
         self.skip = nn.Identity() if c_in == c_out else nn.Conv1d(c_in, c_out, 1)
+
+        # ★時刻符号なしでは nn.Linear を作らないので、乱数の消費も層の初期値も従来と同じ。
+        #   時刻符号つきでは nn.Linear の初期化が乱数を消費するため、後続ブロックの初期値は
+        #   時刻符号なしのモデルと一致しない（新しく学習するモデルなので問題にしない）。
+        # ★零初期化。学習前の出力は時刻符号なしの構造と一致する（test_backbone で検証）
+        self.clock_proj: nn.Linear | None = None
+        if arch.has_clock:
+            self.register_buffer("clock_phi", time_features(arch), persistent=False)
+            self.clock_proj = nn.Linear(arch.clock_dim, c_out)
+            nn.init.zeros_(self.clock_proj.weight)
+            nn.init.zeros_(self.clock_proj.bias)
+
+        # ★条件×時刻のバイアス。R 本の時刻プロファイル V φ を emb に応じた重み a(emb) で混ぜる。
+        #   a を零初期化し、V は通常の初期化にする（両方を 0 にすると互いの勾配が 0 のままになる）。
+        #   a が 0 なので、学習前の出力は条件×時刻のバイアスが無い構造と一致する
+        self.cond_clock_rank = arch.cond_clock_rank
+        self.cond_clock_profile: nn.Linear | None = None
+        self.cond_clock_mix: nn.Linear | None = None
+        if arch.cond_clock_rank > 0:
+            self.cond_clock_profile = nn.Linear(arch.clock_dim, c_out * arch.cond_clock_rank)
+            self.cond_clock_mix = nn.Linear(emb_dim, arch.cond_clock_rank)
+            nn.init.zeros_(self.cond_clock_mix.weight)
+            nn.init.zeros_(self.cond_clock_mix.bias)
+
+    def clock_bias(self, length: int) -> torch.Tensor:
+        """時刻符号のバイアスを解像度 length で返す, -> (1, c_out, length)
+
+        Note:
+            ★φ は 96 スロットで作ってあり、stride = 96 // length で間引く。
+              ds1/ds2（stride 2, padding = KERNEL_SIZE // 2）の出力位置 j は入力位置 2j を
+              中心に畳み込むので、48 解像度の j はスロット 2j、24 解像度の j はスロット 4j にあたる。
+
+        Args:
+            length: 特徴の時間長 L。NUM_SLOTS を割り切る値 (96 / 48 / 24)
+
+        Returns:
+            スロットごとのバイアス, dtype=float32, (1, c_out, length)
+
+        Raises:
+            RuntimeError: 時刻符号を持たないブロックで呼んだとき
+            ValueError: length が NUM_SLOTS を割り切らないとき
+        """
+        if self.clock_proj is None:
+            raise RuntimeError("時刻符号なしの ResBlock1D には時刻符号が無い")
+        if NUM_SLOTS % length != 0:
+            raise ValueError(f"時間長 {length} が NUM_SLOTS={NUM_SLOTS} を割り切らない")
+        phi = self.clock_phi[:, ::NUM_SLOTS // length]          # (clock_dim, L)
+        return self.clock_proj(phi.T).T[None]                    # (1, c_out, L)
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
         """残差ブロック, (B, c_in, L) -> (B, c_out, L)
@@ -311,24 +552,105 @@ class ResBlock1D(nn.Module):
             出力特徴, dtype=float32, (B, c_out, L)。Lは入力と同じ
         """
         h = self.conv1(F.silu(self.norm1(x)))
-        h = h + self.emb_proj(emb)[:, :, None]
+        h = h + self.emb_proj(emb)[:, :, None]           # 全スロットで同じ値
+        if self.clock_proj is not None:
+            h = h + self.clock_bias(h.size(-1))          # スロットごとに違う値
+        if self.cond_clock_mix is not None:
+            h = h + self.cond_clock_bias(emb, h.size(-1))  # 行（群・t）とスロットごとに違う値
         h = self.conv2(self.dropout(F.silu(self.norm2(h))))
         return h + self.skip(x)
+
+    def cond_clock_bias(self, emb: torch.Tensor, length: int) -> torch.Tensor:
+        """条件×時刻のバイアスを解像度 length で返す, -> (B, c_out, length)
+
+        bias[b, c, l] = Σ_r a_r(emb_b) · P[l, c, r],  a = cond_clock_mix(emb),  P = cond_clock_profile(φ(l))
+
+        Note:
+            1. emb は拡散ステップ埋め込みと条件埋め込みの和なので, 混ぜる重み a は群と t の両方で変わる
+            2. φ の間引きは clock_bias と同じ規約 (stride = NUM_SLOTS // length)
+
+        Args:
+            emb: 拡散ステップ埋め込みと条件埋め込みの和, dtype=float32, (B, emb_dim)
+            length: 特徴の時間長 L。NUM_SLOTS を割り切る値 (96 / 48 / 24)
+
+        Returns:
+            行とスロットごとのバイアス, dtype=float32, (B, c_out, length)
+
+        Raises:
+            RuntimeError: 条件×時刻のバイアスを持たないブロックで呼んだとき
+        """
+        if self.cond_clock_mix is None or self.cond_clock_profile is None:
+            raise RuntimeError("cond_clock_rank=0 の ResBlock1D には条件×時刻のバイアスが無い")
+        phi = self.clock_phi[:, ::NUM_SLOTS // length]                       # (clock_dim, L)
+        profile = self.cond_clock_profile(phi.T).view(length, -1, self.cond_clock_rank)  # (L, c_out, R)
+        mix = self.cond_clock_mix(emb)                                       # (B, R)
+        return torch.einsum("br,lcr->bcl", mix, profile)
+
+
+# ★RoPE の周波数の底。timestep_embedding と同じ値（Transformer の標準形）
+ROPE_BASE = 10000.0
+
+
+def slot_positions(length: int, device: torch.device | str) -> torch.Tensor:
+    """解像度 length の各位置が指すスロット番号を返す, -> (length,)
+
+    Note:
+        1. clock_bias と同じ規約。48 解像度の j はスロット 2j、24 解像度の j はスロット 4j
+
+    Args:
+        length: 特徴の時間長 L。NUM_SLOTS を割り切る値 (96 / 48 / 24)
+        device: 返すテンソルのデバイス
+
+    Returns:
+        スロット番号, dtype=float32, (length,)
+    """
+    return torch.arange(length, device=device, dtype=torch.float32) * (NUM_SLOTS // length)
+
+
+def rope_rotate(x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+    """q または k を位置 pos に応じて回転させる (RoPE), (B, H, L, d) -> (B, H, L, d)
+
+    Note:
+        1. 次元を前半と後半に分け, i 番目の組 (x_i, x_{i+d/2}) を角度 pos·θ_i だけ回す。
+           θ_i = ROPE_BASE^(-i/(d/2)) で, timestep_embedding と同じ等比周波数
+        2. 回転後の内積 q'·k' は位置の差 pos_q − pos_k だけで決まる (相対位置)
+
+    Args:
+        x: 回転させる q または k, dtype=float32, (B, H, L, d)。d は偶数
+        pos: 各位置のスロット番号, dtype=float32, (L,)
+
+    Returns:
+        回転後のテンソル, dtype=float32, (B, H, L, d)
+    """
+    half = x.size(-1) // 2
+    freqs = torch.exp(-math.log(ROPE_BASE)
+                      * torch.arange(half, device=x.device, dtype=x.dtype) / half)   # (d/2,)
+    angle = pos.to(x.dtype)[:, None] * freqs[None, :]                               # (L, d/2)
+    cos, sin = angle.cos(), angle.sin()
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
 
 class AttnBlock1D(nn.Module):
     """時間軸(スロット間)の self-attention + residual
     畳み込みが届かない遠いスロット同士を直接結ぶ
+
+    Note:
+        1. rope=False では位置の情報を持たない（スロットの並べ替えに対して等変）
+        2. rope=True では q と k をスロット番号で回転させ, 2 つのスロットの時刻差を attention に渡す。
+           重みは nn.MultiheadAttention のものをそのまま使うので, state_dict のキーは変わらない
     """
-    def __init__(self, ch: int):
+    def __init__(self, ch: int, rope: bool = False):
         """attention層を構築する。
 
         Args:
             ch: 入出力チャネル数, GroupNorm(8, ch) のため8の倍数
+            rope: q, k をスロット番号で回転させるか, default=False (従来の構造)
         """
         super().__init__()
         self.norm = nn.GroupNorm(8, ch)
         self.attn = nn.MultiheadAttention(ch, ATTN_HEADS, batch_first=True)
+        self.rope = rope
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """self-attentionを1回かける, (B, C, L) -> (B, C, L)
@@ -340,15 +662,63 @@ class AttnBlock1D(nn.Module):
             出力特徴, dtype=float32, (B, C, L)
         """
         h = self.norm(x).permute(0, 2, 1)
-        h, _ = self.attn(h, h, h, need_weights=False)
+        if self.rope:
+            h = self.rope_attention(h, slot_positions(h.size(1), h.device))
+        else:
+            h, _ = self.attn(h, h, h, need_weights=False)
         return h.permute(0, 2, 1) + x
+
+    def rope_attention(self, h: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """nn.MultiheadAttention の重みで q, k, v を作り, q と k を回転させて attention をかける
+
+        Note:
+            1. pos を全て 0 にすると回転は恒等写像になり, self.attn(h, h, h) と一致する (test_backbone)
+            2. self.attn の dropout は 0 (既定) なので, 学習時と評価時で同じ計算になる
+
+        Args:
+            h: 正規化済みの入力, dtype=float32, (B, L, C)
+            pos: 各位置のスロット番号, dtype=float32, (L,)
+
+        Returns:
+            attention の出力 (残差加算の前), dtype=float32, (B, L, C)
+        """
+        weight, bias = self.attn.in_proj_weight, self.attn.in_proj_bias
+        assert weight is not None, "in_proj_weight が無い（kdim/vdim を変えた MultiheadAttention）"
+        batch, length, ch = h.shape
+        heads = self.attn.num_heads
+        q, k, v = F.linear(h, weight, bias).chunk(3, dim=-1)                  # 各 (B, L, C)
+        q, k, v = (z.view(batch, length, heads, ch // heads).transpose(1, 2)
+                   for z in (q, k, v))                                        # 各 (B, H, L, d)
+        out = F.scaled_dot_product_attention(rope_rotate(q, pos), rope_rotate(k, pos), v)
+        return self.attn.out_proj(out.transpose(1, 2).reshape(batch, length, ch))
 
 
 class UNet1D(nn.Module):
     """ε予測ネットワーク: (B,12,96) + 拡散ステップt + 条件cond -> (B,12,96)"""
-    def __init__(self):
+    def __init__(self, clock: bool = False, arch: ArchSpec | None = None):
+        """UNet1D の層を構築する。
+
+        Args:
+            clock: 全 ResBlock1D (11 個) に 24 時間の倍音の時刻符号 (K=CLOCK_HARMONICS) を足すか,
+                default=False (従来の構造)。True は arch=ArchSpec(clock_kind="harmonic") の略記。
+                零初期化なので、学習前の出力は False と一致する
+            arch: 構造の指定, default=None。None なら clock から決める。
+                渡すときは clock を省略すること
+
+        Raises:
+            ValueError: clock=True と arch を同時に渡したとき
+        """
         super().__init__()
+        if arch is None:
+            arch = ArchSpec(clock_kind="harmonic") if clock else ArchSpec()
+        elif clock:
+            raise ValueError("clock=True と arch は同時に渡せない。arch.clock_kind で指定すること")
+        self.arch = arch
+        self.clock = arch.has_clock
         c1, c2 = BASE_CH, BASE_CH * 2
+
+        def res_block(c_in: int, c_out: int) -> ResBlock1D:
+            return ResBlock1D(c_in, c_out, arch=arch)
 
         # Condition Embedding
         self.cond_embeds = nn.ModuleList([
@@ -359,34 +729,40 @@ class UNet1D(nn.Module):
 
         k, pad = KERNEL_SIZE, KERNEL_SIZE // 2
 
+        def attn_block(ch: int) -> AttnBlock1D:
+            return AttnBlock1D(ch, rope=arch.attn_rope)
+
         # Down h1
         self.in_conv = nn.Conv1d(IN_CH, c1, k, padding=pad)
-        self.d1a, self.d1b = ResBlock1D(c1, c1), ResBlock1D(c1, c1)
+        self.d1a, self.d1b = res_block(c1, c1), res_block(c1, c1)
+        # ★arch.attn96 のときだけ 96 解像度にも attention を置く（attn2 / u2_attn と対称な位置）
+        self.attn1: AttnBlock1D | None = attn_block(c1) if arch.attn96 else None
         self.ds1 = nn.Conv1d(c1, c1, k, stride=2, padding=pad)
 
         # Down h2
-        self.d2a, self.d2b = ResBlock1D(c1, c2), ResBlock1D(c2, c2)
-        self.attn2 = AttnBlock1D(c2)
+        self.d2a, self.d2b = res_block(c1, c2), res_block(c2, c2)
+        self.attn2 = attn_block(c2)
         self.ds2 = nn.Conv1d(c2, c2, k, stride=2, padding=pad)
 
         # Down h3
-        self.d3a, self.d3b = ResBlock1D(c2, c2), ResBlock1D(c2, c2)
-        self.attn3 = AttnBlock1D(c2)
+        self.d3a, self.d3b = res_block(c2, c2), res_block(c2, c2)
+        self.attn3 = attn_block(c2)
 
         # Bottleneck (middle)
-        self.m1, self.m_attn, self.m2 = ResBlock1D(c2, c2), AttnBlock1D(c2), ResBlock1D(c2, c2)
+        self.m1, self.m_attn, self.m2 = res_block(c2, c2), attn_block(c2), res_block(c2, c2)
 
         # Up with h3
-        self.u3 = ResBlock1D(c2 + c2, c2)
+        self.u3 = res_block(c2 + c2, c2)
 
         # Up with h2
         self.us2 = nn.Conv1d(c2, c2, k, padding=pad)
-        self.u2 = ResBlock1D(c2 + c2, c2)
-        self.u2_attn = AttnBlock1D(c2)
+        self.u2 = res_block(c2 + c2, c2)
+        self.u2_attn = attn_block(c2)
 
         # Up with h1
         self.us1 = nn.Conv1d(c2, c1, k, padding=pad)
-        self.u1 = ResBlock1D(c1 + c1, c1)
+        self.u1 = res_block(c1 + c1, c1)
+        self.u1_attn: AttnBlock1D | None = attn_block(c1) if arch.attn96 else None
 
         # 最終出力層
         self.out_norm = nn.GroupNorm(8, c1)
@@ -460,6 +836,8 @@ class UNet1D(nn.Module):
                 h3: (B, BASE_CH*2, NUM_SLOTS//4) = (B, 128, 24)  Bottleneck への入力
         """
         h1 = self.d1b(self.d1a(self.in_conv(x_t), emb), emb)
+        if self.attn1 is not None:
+            h1 = self.attn1(h1)
         h2 = self.attn2(self.d2b(self.d2a(self.ds1(h1), emb), emb))
         h3 = self.attn3(self.d3b(self.d3a(self.ds2(h2), emb), emb))
         return h1, h2, h3
@@ -516,6 +894,8 @@ class UNet1D(nn.Module):
         u = self.u2_attn(self.u2(torch.cat([u, h2], dim=1), emb))
         u = self.us1(F.interpolate(u, scale_factor=2, mode='nearest'))
         u = self.u1(torch.cat([u, h1], dim=1), emb)
+        if self.u1_attn is not None:
+            u = self.u1_attn(u)
         return self.out_conv(F.silu(self.out_norm(u)))
 
 
@@ -538,9 +918,82 @@ def eval_mode(model: nn.Module) -> Iterator[nn.Module]:
         model.train(was_training)
 
 
+class EpsPair(NamedTuple):
+    """Diffusion._eps_pair の戻り値。1 回の forward で得た予測と、その入力側の量"""
+    eps_hat: torch.Tensor    # 予測ノイズ, (B, 12, 96)
+    eps: torch.Tensor        # 真のノイズ, (B, 12, 96)
+    t: torch.Tensor          # 拡散ステップ, int64, (B,)
+    x0: torch.Tensor         # one-hot の活動スケジュール, (B, 12, 96)
+    drop_mask: torch.Tensor  # 条件なしで予測した行, bool, (B,)
+
+
+def stratified_mean_sq(u: torch.Tensor, labels: torch.Tensor, n_strata: int) -> torch.Tensor:
+    """層ごとに u をバッチ平均し, 層の大きさで重み付けた二乗平均の和を返す
+
+    Σ_g (n_g/B)·mean_{c,s} m_g²,  m_g = mean_{b ∈ g} u_b
+
+    Note:
+        1. 空の層は 0 を足す (n_g = 0)
+        2. 層が 1 つなら rate_loss の batch の定義 mean_{c,s} (mean_b u_b)² と一致する
+
+    Args:
+        u: 行ごとの残差, dtype=float32, (B, 12, 96)
+        labels: 各行の層番号, dtype=int64, (B,), 値域 [0, n_strata)
+        n_strata: 層の数
+
+    Returns:
+        スカラー, dtype=float32, 勾配グラフを保つ
+    """
+    batch = u.size(0)
+    onehot = F.one_hot(labels, n_strata).to(u.dtype)                 # (B, G)
+    counts = onehot.sum(dim=0)                                        # (G,)
+    means = (onehot.T @ u.reshape(batch, -1)) / counts.clamp_min(1.0)[:, None]   # (G, 12*96)
+    return ((counts / batch) * means.pow(2).mean(dim=1)).sum()
+
+
+def rate_group_strata(cond_idx: torch.Tensor, drop_mask: torch.Tensor) -> torch.Tensor:
+    """group の層番号を返す, -> (B,) int64, 値域 [0, N_RATE_GROUPS)
+
+    Note:
+        1. 条件ありの行は 性×就業 の g·N_E + e (0..3)。年齢は層にしない (1 層あたり約 64 行を保つため)
+        2. ★条件なしの行 (drop_mask) はまとめて最後の層 N_G·N_E にする。条件なしの予測は
+           群ごとには偏りが 0 にならない (全体の平均へ寄る) ので, 群の層に混ぜると
+           正しい予測まで罰してしまう
+
+    Args:
+        cond_idx: 条件インデックス, dtype=int64, (B, 3), 列は [gender, age, telfs]
+        drop_mask: 条件なしで予測した行, dtype=bool, (B,)
+
+    Returns:
+        層番号, dtype=int64, (B,)
+    """
+    strata = cond_idx[:, 0] * N_E + cond_idx[:, 2]
+    return torch.where(drop_mask, torch.full_like(strata, N_G * N_E), strata)
+
+
+def population_rates(sched: npt.NDArray[np.int64], weight: npt.NDArray[np.float64]) -> torch.Tensor:
+    """個票の加重行動者率 r̄ を返す, -> (NUM_ACT, NUM_SLOTS)
+
+    Note:
+        1. rate_mode="pop" の目標。学習分割だけを渡すこと (val の情報を学習へ漏らさない)
+        2. 学習バッチは TUFINLWGT 加重の復元抽出なので, バッチの x0 の期待値はこの r̄ に一致する
+
+    Args:
+        sched: 活動スケジュール, dtype=int64, (N, NUM_SLOTS)
+        weight: 調査ウェイト, dtype=float64, (N,)
+
+    Returns:
+        行動者率, dtype=float32, (NUM_ACT, NUM_SLOTS)。各スロットで活動の和は 1
+    """
+    w = weight / weight.sum()
+    onehot = sched[:, None, :] == np.arange(NUM_ACT)[None, :, None]    # (N, 12, 96)
+    return torch.as_tensor(np.einsum("n,ncs->cs", w, onehot), dtype=torch.float32)
+
+
 class Diffusion:
     """Stage1とStage2を実装"""
-    def __init__(self, device=DEVICE):
+    def __init__(self, device=DEVICE, rate_gamma: float = RATE_SNR_GAMMA,
+                 rate_mode: RateMode = RATE_MODE, rate_target: torch.Tensor | None = None):
         """β schedule と, そこから導かれるバッファを事前計算する
 
         Note:
@@ -557,10 +1010,34 @@ class Diffusion:
             8. post_coef_xt: 事後平均の x_t 側の係数 (1-ᾱ_{t-1})·√α_t/(1-ᾱ_t)
 
             6〜8 は事後分布 q(x_{t-1}|x_t, x0) の閉形式で, _reverse_step だけが使う
+            9. rate_v: L_rate の重み v(t) = 1/√max(SNR(t), rate_gamma), SNR(t) = ᾱ_t/(1-ᾱ_t)
+               rate_loss だけが使う。乱数を消費しないので, 追加しても他の出力は変わらない
+            10. snr: SNR(t)
+            11. rate_x0_coef: min(1, √(SNR/rate_gamma)) = v(t)·√SNR(t)。u = v·(eps_hat − eps) を
+                −rate_x0_coef·(x̂0 − x0) と読むための係数で, rate_mode="pop" だけが使う
+            12. rate_tbin: t の区間番号 0..3 (RATE_TBIN_SNR の境目), rate_mode="tbin" だけが使う
 
         Args:
             device: バッファを置くデバイス, default=DEVICE
+            rate_gamma: v(t) の頭打ち, 正の値, default=RATE_SNR_GAMMA=1.0
+                小さくするほど高ノイズ側の t まで x0 空間の重み 1 で見る
+                (1.0 なら t<=258, 0.1 なら t<=484, 0.01 なら t<=673)。
+                代償に勾配が最大 1/√rate_gamma 倍になる
+            rate_mode: L_rate の偏りをどの単位で平均するか, default=RATE_MODE="batch" (従来)
+                rate_objective だけが使う。loss() (Stage 2 が呼ぶ) には影響しない
+            rate_target: rate_mode="pop" の目標 r̄, dtype=float32, (NUM_ACT, NUM_SLOTS)。
+                学習分割の TUFINLWGT 加重の行動者率 (population_rates)。他の mode では使わない
+
+        Raises:
+            ValueError: rate_gamma が正でないとき, 未知の rate_mode,
+                rate_mode="pop" で rate_target が無いとき
         """
+        if rate_gamma <= 0.0:
+            raise ValueError(f"rate_gamma は正でなければならない: {rate_gamma}")
+        if rate_mode not in RATE_MODES:
+            raise ValueError(f"rate_mode は {RATE_MODES} のいずれか: {rate_mode}")
+        if rate_mode == "pop" and rate_target is None:
+            raise ValueError("rate_mode='pop' には rate_target (学習分割の行動者率 r̄) が要る")
         betas = torch.linspace(BETA_START, BETA_END, T_STEPS, device=device)
         alphas = 1.0 - betas
         acp = torch.cumprod(alphas, dim=0)
@@ -574,6 +1051,14 @@ class Diffusion:
         self.post_var = betas * (1.0 - acp_prev) / (1.0 - acp)
         self.post_coef_x0 = betas * acp_prev.sqrt() / (1.0 - acp)
         self.post_coef_xt = (1.0 - acp_prev) * alphas.sqrt() / (1.0 - acp)
+        self.rate_gamma = rate_gamma
+        self.rate_v = (acp / (1.0 - acp)).clamp_min(rate_gamma).rsqrt()
+        self.snr = acp / (1.0 - acp)
+        self.rate_x0_coef = self.rate_v * self.snr.sqrt()
+        self.rate_tbin = torch.stack([(self.snr < thr).long() for thr in RATE_TBIN_SNR]).sum(dim=0)
+        self.rate_mode: RateMode = rate_mode
+        self.rate_target = None if rate_target is None else rate_target.to(device=device,
+                                                                            dtype=torch.float32)
 
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
         """x0 から任意のtステップ先の x_t を求める (前向き拡散過程)
@@ -592,10 +1077,15 @@ class Diffusion:
         return (self.sqrt_acp[t][:, None, None] * x0
                 + self.sqrt_1m_acp[t][:, None, None] * eps)
 
-    def loss(self, model: UNet1D, sched: torch.Tensor, cond_idx: torch.Tensor) -> torch.Tensor:
-        """Stage1学習の目的関数, 標準的な ε予測MSEに CFGを組み込んだもの
+    def _eps_pair(self, model: UNet1D, sched: torch.Tensor,
+                  cond_idx: torch.Tensor) -> EpsPair:
+        """1バッチに t と ε を引いてノイズを予測する, loss と loss_terms の共通部分
 
         Note:
+            1. 乱数は t -> ε -> drop_mask の順で引く。この順序を変えると,
+               同じ種でも従来の Stage1 と Stage2 のリハーサル項が別の値になる
+            2. drop_mask が True の行 (P_UNCOND=0.1) は条件なしの予測になる。
+               CFG は条件なしの予測も使うので, L_rate もこの行を含めて測る
 
         Args:
             model: UNet1D
@@ -603,7 +1093,12 @@ class Diffusion:
             cond_idx: 条件インデックス, dtype=int64, (B, 3)
 
         Returns:
-            バッチ損失, dtype=float32, (スカラ)
+            EpsPair(eps_hat, eps, t, x0, drop_mask)
+                eps_hat: 予測ノイズ, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)
+                eps: 真のノイズ, dtype=float32, (B, 12, 96)
+                t: 拡散ステップ, dtype=int64, (B,)
+                x0: one-hot の活動スケジュール, dtype=float32, (B, 12, 96)
+                drop_mask: 条件なしで予測した行, dtype=bool, (B,)
         """
         x0 = sched_to_x0(sched)  # (B,96)->(B,12,96)∈{0,1}
         t = torch.randint(0, T_STEPS, (x0.size(0),), device=x0.device)  # t~U{0,T-1}
@@ -613,7 +1108,127 @@ class Diffusion:
         drop_mask = torch.rand(x0.size(0), device=x0.device) < P_UNCOND  # CFGの条件dropout
 
         eps_hat = model(x_t, t, cond_idx, drop_mask)
-        return F.mse_loss(eps_hat, eps)  # ノイズ間のMSE
+        return EpsPair(eps_hat, eps, t, x0, drop_mask)
+
+    def loss(self, model: UNet1D, sched: torch.Tensor, cond_idx: torch.Tensor) -> torch.Tensor:
+        """Stage1学習の目的関数, 標準的な ε予測MSEに CFGを組み込んだもの
+
+        Note:
+            1. Stage2 のリハーサル項と val の ε-MSE もこの関数を呼ぶ。
+               L_rate は足さない (足すと Stage2 の挙動が変わる)。L_rate は loss_terms で得る
+
+        Args:
+            model: UNet1D
+            sched: 活動スケジュール (インデックス表現), dtype=int64, (B, 96)
+            cond_idx: 条件インデックス, dtype=int64, (B, 3)
+
+        Returns:
+            バッチ損失, dtype=float32, (スカラ)
+        """
+        pair = self._eps_pair(model, sched, cond_idx)
+        return F.mse_loss(pair.eps_hat, pair.eps)  # ノイズ間のMSE
+
+    def rate_loss(self, eps_hat: torch.Tensor, eps: torch.Tensor,
+                  t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """時刻別行動者率の偏り L_rate を返す
+
+        L_rate = mean_{c,s} m[c,s]²,  m[c,s] = mean_b u_b[c,s],  u_b = v(t_b)·(eps_hat_b − eps_b)
+        v(t) = rate_v[t] = 1/√max(SNR(t), rate_gamma)
+
+        Note:
+            1. SNR(t) >= rate_gamma の t では u = −(x̂0 − x0) で, x0 空間の残差になる。
+               それより大きい t では x̂0 への換算係数 1/√SNR（t=999 で 157）を頭打ちにする
+            2. 個票ごとの残差はバッチ平均で打ち消され, 全員に共通する偏り
+               (= 時刻別行動者率のずれ) だけが m に残る。学習バッチは TUFINLWGT 加重の
+               復元抽出なので, 単純平均で母集団の行動者率になる
+            3. E[L_rate] = bias² + Var(u)/B。第2項はバッチサイズ由来の床で,
+               その勾配は予測誤差のばらつきを減らす向き (ε-MSE と同じ向き) なので最適解はずれない
+            4. 2つ目の返り値 rate_split は記録専用で, バッチを前半と後半に割った
+               mean(m_A · m_B)。第2項が消えて bias² を直接読める (負にもなりうる)
+            5. t をまたいで符号が逆の偏りは, m の中で打ち消し合って見えない
+
+        Args:
+            eps_hat: 予測ノイズ, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)
+            eps: 真のノイズ, dtype=float32, (B, 12, 96)
+            t: 拡散ステップ, dtype=int64, (B,)
+
+        Returns:
+            (rate, rate_split)
+                rate: L_rate, dtype=float32, スカラー, 勾配グラフを保つ
+                rate_split: split-batch 推定の bias², dtype=float32, スカラー, 勾配なし
+        """
+        u = self.rate_v[t][:, None, None] * (eps_hat - eps)       # (B, 12, 96)
+        rate = u.mean(dim=0).pow(2).mean()
+        with torch.no_grad():
+            half = u.size(0) // 2
+            m_a = u[:half].mean(dim=0)
+            m_b = u[half:2 * half].mean(dim=0)
+            rate_split = (m_a * m_b).mean()
+        return rate, rate_split
+
+    def loss_terms(self, model: UNet1D, sched: torch.Tensor,
+                   cond_idx: torch.Tensor) -> dict[str, torch.Tensor]:
+        """1回の forward から ε-MSE と行動者率の項を返す (Stage1 の学習ループ専用)
+
+        Note:
+            1. loss() と同じ _eps_pair を使うので, 同じ乱数状態なら
+               loss_terms(...)["eps"] は loss(...) と厳密に一致する
+            2. Stage2 は loss() だけを呼ぶので, この関数の影響を受けない
+
+        Args:
+            model: UNet1D
+            sched: 活動スケジュール (インデックス表現), dtype=int64, (B, 96)
+            cond_idx: 条件インデックス, dtype=int64, (B, 3)
+
+        Returns:
+            {"eps": ε-MSE, "rate": L_rate, "rate_split": split-batch 推定の bias²}
+            それぞれ dtype=float32 のスカラー。rate_split だけ勾配を持たない
+        """
+        pair = self._eps_pair(model, sched, cond_idx)
+        rate, rate_split = self.rate_objective(pair, cond_idx)
+        return {"eps": F.mse_loss(pair.eps_hat, pair.eps), "rate": rate, "rate_split": rate_split}
+
+    def rate_objective(self, pair: EpsPair,
+                       cond_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """self.rate_mode に応じた行動者率の項と, 記録用の split-batch bias² を返す
+
+        u_b = v(t_b)·(eps_hat_b − eps_b) (rate_loss と同じ, SNR >= γ では −(x̂0 − x0))
+
+            batch: mean_{c,s} m², m = mean_b u_b (rate_loss そのもの)
+            group: Σ_g (n_g/B)·mean_{c,s} m_g², 層 g は rate_group_strata
+            tbin : Σ_k (n_k/B)·mean_{c,s} m_k², 区間 k は rate_tbin[t]
+            pop  : mean_{c,s} m'², m' = mean_b u'_b, u'_b = −u_b + rate_x0_coef[t_b]·(x0_b − r̄)
+                   SNR >= γ では u'_b = x̂0_b − r̄。目標がバッチ自身の x0 でなく r̄ になる
+
+        Note:
+            1. rate_split は mode によらず batch の定義 (rate_loss) で測る。arm 間で同じ物差しにするため
+            2. group と tbin の期待値は Σ_g (n_g/B)·bias_g² + (層の数)·Var(u)/B。
+               第2項の勾配は ε-MSE と同じ向きなので最適解はずれない
+            3. ★pop の期待値は (1−1/B)·bias² + E[(x̂0 − r̄)²]/B で, 第2項はデノイザを定数 r̄ へ
+               縮める向きに働く (ε-MSE と対立する)。これを実測で確かめるための対照 arm である
+
+        Args:
+            pair: _eps_pair の戻り値
+            cond_idx: 条件インデックス, dtype=int64, (B, 3)
+
+        Returns:
+            (rate, rate_split)
+                rate: 行動者率の項, dtype=float32, スカラー, 勾配グラフを保つ
+                rate_split: batch の定義の split-batch bias², dtype=float32, スカラー, 勾配なし
+        """
+        rate, rate_split = self.rate_loss(pair.eps_hat, pair.eps, pair.t)
+        if self.rate_mode == "batch":
+            return rate, rate_split
+        u = self.rate_v[pair.t][:, None, None] * (pair.eps_hat - pair.eps)       # (B, 12, 96)
+        if self.rate_mode == "group":
+            labels = rate_group_strata(cond_idx, pair.drop_mask)
+            return stratified_mean_sq(u, labels, N_RATE_GROUPS), rate_split
+        if self.rate_mode == "tbin":
+            return stratified_mean_sq(u, self.rate_tbin[pair.t], len(RATE_TBIN_SNR) + 1), rate_split
+        assert self.rate_target is not None, "rate_mode='pop' に rate_target が無い"
+        coef = self.rate_x0_coef[pair.t][:, None, None]
+        u_pop = -u + coef * (pair.x0 - self.rate_target)
+        return u_pop.mean(dim=0).pow(2).mean(), rate_split
 
     def _eps(self, model: UNet1D, x: torch.Tensor,
             t_scalar: int, cond_idx: torch.Tensor | None, guidance_scale: float) -> torch.Tensor:
@@ -781,6 +1396,37 @@ class Diffusion:
         x_K = self._sample_head(model, cond_idx, K, guidance_scale)
         return self._sample_tail(model, x_K, K, cond_idx, guidance_scale, zs)
 
+    @torch.no_grad()
+    def restore(self, model: UNet1D, x0: torch.Tensor, t0: int, cond_idx: torch.Tensor,
+                guidance_scale: float = GUIDANCE_SCALE) -> torch.Tensor:
+        """x0 を雑音水準 t0 まで前向きに進めてから、逆過程で t=0 まで戻す（部分ノイズ化の診断）
+
+        t0 が小さければ x0 の細部（エピソードの長さ）だけを作り直し、大きければ
+        「誰がどの活動をするか」まで作り直す。どの t0 から実データとずれるかで、
+        逆過程のどの段階が生成のずれを作るかを切り分ける。
+
+        Note:
+            ★q_sample(x0, t0) は雑音水準 t0 の状態で、_reverse_step(ti=t0) がそこから
+              1 段戻す。よって _sample_tail の K は t0 + 1（ti = t0 .. 0）。
+              t0 = T_STEPS − 1 はほぼ純粋な雑音からの生成と同じ逆過程になる
+
+        Args:
+            model: UNet1D, ε を予測する denoiser
+            x0: 実データの one-hot, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96), 値域{0,1}
+            t0: 雑音化する水準, 値域[0, T_STEPS-1]
+            cond_idx: 条件インデックス, dtype=int64, (B, 3)
+            guidance_scale: CFGの強さ, default=GUIDANCE_SCALE=1.25
+
+        Returns:
+            逆過程 t=0 の出力, dtype=float32, (B, IN_CH, NUM_SLOTS) = (B, 12, 96)。
+            argmax しない連続値（離散化は関数外で行う）
+        """
+        if not 0 <= t0 < T_STEPS:
+            raise ValueError(f"t0 は [0, {T_STEPS - 1}] の整数: {t0}")
+        t = torch.full((x0.size(0),), t0, dtype=torch.long, device=x0.device)
+        x_t = self.q_sample(x0, t, torch.randn_like(x0))
+        return self._sample_tail(model, x_t, t0 + 1, cond_idx, guidance_scale)
+
 
 def straight_through(x0: torch.Tensor, tau: float=1.0) -> torch.Tensor:
     """連続値 (B,12,96) を微分可能に one-hot 化
@@ -804,11 +1450,17 @@ def straight_through(x0: torch.Tensor, tau: float=1.0) -> torch.Tensor:
 # ============================================================
 # 6. 学習
 # ============================================================
-def run_epoch(model: UNet1D, diffusion: Diffusion,loader: DataLoader,
-            optimizer: torch.optim.Optimizer | None=None) -> float:
-    """1エポック分の学習または評価を実行し, サンプル加重平均の ε-MSE を返す
+def run_epoch(model: UNet1D, diffusion: Diffusion, loader: DataLoader,
+            optimizer: torch.optim.Optimizer | None = None,
+            rate_lam: float = RATE_LAM) -> dict[str, float]:
+    """1エポック分の学習または評価を実行し, 損失の各項のサンプル加重平均を返す
 
     optimizerを渡せば学習, 渡さなければ評価として動く
+
+    Note:
+        1. 更新に使う損失は total = eps + rate_lam·rate。rate_lam=0 では total = eps で,
+           勾配も乱数の消費も従来の Stage1 と一致する (rate は計算するが逆伝播に入れない)
+        2. val_loader は非加重なので, 評価時の rate / rate_split は監視用。早期終了には使わない
 
     Args:
         model: ノイズ予測器ε_θ
@@ -818,44 +1470,83 @@ def run_epoch(model: UNet1D, diffusion: Diffusion,loader: DataLoader,
             cond_idx: 条件インデックス, dtype=int64, (B, 3)
             sched: 活動スケジュール (インデックス表現), dtype=int64, (B, 96)
         optimizer: 学習時の最適化器, Noneなら評価モード, default=None
+        rate_lam: L_rate の重み λ_rate, default=RATE_LAM=0.0
 
     Returns:
-        エポック平均の ε-MSE, float
+        エポック平均, dict[str, float]
+            eps: ε-MSE
+            rate: L_rate
+            rate_split: split-batch 推定の bias²（記録専用）
+            total: eps + rate_lam·rate
     """
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
-    sum_loss, n_samples = 0.0, 0
+    sums = {"eps": 0.0, "rate": 0.0, "rate_split": 0.0, "total": 0.0}
+    n_samples = 0
     with torch.set_grad_enabled(is_train):
         for cond_idx, sched in loader:
             cond_idx = cond_idx.to(DEVICE)
             sched    = sched.to(DEVICE)
-            loss = diffusion.loss(model, sched, cond_idx)
+            terms = diffusion.loss_terms(model, sched, cond_idx)
+            total = terms["eps"] if rate_lam == 0.0 else terms["eps"] + rate_lam * terms["rate"]
             if is_train:
                 optimizer.zero_grad()
-                loss.backward()
+                total.backward()
                 optimizer.step()
             bs = sched.size(0)
-            sum_loss += loss.item() * bs
+            for key in ("eps", "rate", "rate_split"):
+                sums[key] += terms[key].item() * bs
+            sums["total"] += total.item() * bs
             n_samples += bs
-    return sum_loss / n_samples
+    return {key: val / n_samples for key, val in sums.items()}
 
 
 def train(epochs: int = EPOCHS,
             use_wandb: bool = True,
-            save_path: Path | None = MODEL_SAVE_PATH) -> UNet1D:
+            save_path: Path | None = MODEL_SAVE_PATH,
+            arch: ArchSpec = ArchSpec(),
+            seed: int = SEED,
+            rate_lam: float = RATE_LAM,
+            rate_gamma: float = RATE_SNR_GAMMA,
+            rate_mode: RateMode = RATE_MODE,
+            save_every: int = 0) -> UNet1D:
     """Stage1の学習を実行, val 損失が最良だった重みのモデルを返す
 
     ATUS実個票を教師に, 条件付きノイズ予測器 ε_θ(x_t, t, c)を学習
+
+    Note:
+        1. 早期終了は rate_lam によらず val の ε-MSE で判定する
+           (L_rate の有無で最良 epoch の選び方を変えないため)
+        2. rate_lam > 0 のときだけ学習用の端数バッチを捨てる (make_loaders の drop_last)。
+           1 エポックの更新回数が 14 -> 13 になり, 乱数列も従来とずれる
 
     Args:
         epochs: 学習エポック数の上限, default=EPOCHS=1000
         use_wandb: wandbへハイパラと学習曲線を記録するか, default=True
         save_path: チェックポイントの保存先, Noneなら保存しない
+        arch: UNet1D の構造の指定, default=ArchSpec() (時刻符号なしの従来の構造)
+        seed: 学習の乱数の種（初期値・ミニバッチ・t・ε）, default=SEED=42。
+            学習/評価の分割は split_indices が SEED で固定するので、この値では変わらない
+        rate_lam: 行動者率の偏りの項 L_rate の重み, 0 以上, default=RATE_LAM=0.0 (従来の損失)
+        rate_gamma: L_rate の重み v(t) の頭打ち, default=RATE_SNR_GAMMA=1.0
+        rate_mode: L_rate の偏りをどの単位で平均するか, default=RATE_MODE="batch"。
+            "pop" の目標 r̄ は学習分割 (split_indices) だけから作る
+        save_every: 正なら N epoch ごとにその時点の重みを epoch_ckpt_path(save_path, ep) へ保存する,
+            default=0 (保存しない)。最良 epoch の選び方と save_path の中身は変えない。
+            ckpt の選び方が生成に効くかを epoch の軌跡で見るための診断用
 
     Returns:
         best_stateを復元済みのUNet1D, 必ずしも最終エポックのおもみではない
     """
+    if rate_lam < 0.0:
+        raise ValueError(f"rate_lam は 0 以上でなければならない: {rate_lam}")
+    if rate_mode != "batch" and rate_lam == 0.0:
+        raise ValueError(f"rate_mode={rate_mode!r} は rate_lam > 0 のときだけ意味を持つ")
+    if save_every < 0:
+        raise ValueError(f"save_every は 0 以上でなければならない: {save_every}")
+    if save_every > 0 and save_path is None:
+        raise ValueError("save_every > 0 には save_path が要る（epoch ごとの保存先を作るため）")
     run = None
     if use_wandb:
         import wandb
@@ -877,15 +1568,25 @@ def train(epochs: int = EPOCHS,
                 "early_stop_min_delta": EARLY_STOP_MIN_DELTA,
                 "day_filter": DAY_FILTER, "num_act": NUM_ACT, "d_groups": D_GROUPS,
                 "data": DATA_PATH.name,
+                "kernel_size": KERNEL_SIZE,
+                "clock": arch.has_clock,
+                "clock_harmonics": arch.clock_harmonics if arch.clock_kind == "harmonic" else 0,
+                "arch": asdict(arch),
+                "seed": seed,
+                "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma, "rate_mode": rate_mode,
             }
         )
 
-    torch.manual_seed(SEED)
+    torch.manual_seed(seed)
     cond_idx, sched, weight, _ = load_data(DATA_PATH)
-    train_loader, val_loader = make_loaders(cond_idx, sched, weight)
+    train_loader, val_loader = make_loaders(cond_idx, sched, weight, drop_last=rate_lam > 0.0)
 
-    model = UNet1D().to(DEVICE)
-    diffusion = Diffusion()
+    model = UNet1D(arch=arch).to(DEVICE)
+    rate_target = None
+    if rate_mode == "pop":
+        train_idx, _ = split_indices(len(sched))     # make_loaders と同じ分割
+        rate_target = population_rates(sched[train_idx], weight[train_idx])
+    diffusion = Diffusion(rate_gamma=rate_gamma, rate_mode=rate_mode, rate_target=rate_target)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.0)
     print(f"device={DEVICE}  N={len(sched)}  params={sum(p.numel() for p in model.parameters()):,}")
 
@@ -894,12 +1595,22 @@ def train(epochs: int = EPOCHS,
     epochs_no_improve = 0
     ep = 0
     for ep in range(1, epochs + 1):
-        tr = run_epoch(model, diffusion, train_loader, optimizer)
-        va = run_epoch(model, diffusion, val_loader)
+        tr_terms = run_epoch(model, diffusion, train_loader, optimizer, rate_lam=rate_lam)
+        va_terms = run_epoch(model, diffusion, val_loader, rate_lam=rate_lam)
+        tr, va = tr_terms["eps"], va_terms["eps"]
         if ep % 25 == 0 or ep == 1:
-            print(f"epoch {ep:4d} | train {tr:.4f} | val {va:.4f}", flush=True)
+            print(f"epoch {ep:4d} | train {tr:.4f} | val {va:.4f} | "
+                  f"rate {tr_terms['rate']:.3e} (split {tr_terms['rate_split']:+.2e})", flush=True)
         if run is not None:
-            run.log({"epoch": ep, "train/loss": tr, "val/loss": va})
+            # train/loss と val/loss は従来どおり ε-MSE（過去の run と同じ量で並べるため）
+            run.log({"epoch": ep, "train/loss": tr, "val/loss": va,
+                     **{f"train/{k}": v for k, v in tr_terms.items()},
+                     **{f"val/{k}": v for k, v in va_terms.items()}})
+
+        if save_every > 0 and ep % save_every == 0:
+            assert save_path is not None
+            save_ckpt(model, epoch_ckpt_path(save_path, ep), arch, seed, rate_lam, rate_gamma,
+                      rate_mode, epoch=ep)
 
         if va < best_val - EARLY_STOP_MIN_DELTA:
             best_val = va
@@ -924,8 +1635,7 @@ def train(epochs: int = EPOCHS,
         run.summary["stopped_epoch"] = ep
 
     if save_path is not None:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"model": model.state_dict()}, save_path)
+        save_ckpt(model, save_path, arch, seed, rate_lam, rate_gamma, rate_mode)
         print(f"saved model to {save_path}")
     if run is not None:
         run.finish()
@@ -933,13 +1643,111 @@ def train(epochs: int = EPOCHS,
     return model
 
 
+def epoch_ckpt_path(save_path: Path, epoch: int) -> Path:
+    """途中の epoch の ckpt の保存先 {save_path の stem}_ep{epoch:04d}.pt"""
+    return save_path.with_name(f"{save_path.stem}_ep{epoch:04d}{save_path.suffix}")
+
+
+def save_ckpt(model: UNet1D, path: Path, arch: ArchSpec, seed: int, rate_lam: float,
+              rate_gamma: float, rate_mode: RateMode, epoch: int | None = None) -> None:
+    """重みと出所の記録（config）を保存する
+
+    Note:
+        ★config["arch"] は構造の復元に使う（arch_spec_from_ckpt）。時刻の特徴 φ は保存しない
+          buffer なので、倍音 K=48 と Transformer 型 96 次元は重みの形だけでは区別できない
+
+    Args:
+        model: 保存する UNet1D
+        path: 保存先
+        arch / seed / rate_lam / rate_gamma / rate_mode: train の引数（出所の記録）
+        epoch: 途中の epoch の ckpt ならその epoch。None なら config に "epoch" を書かない
+            （最良の ckpt。従来の保存物と同じキーにする）
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    config: dict[str, Any] = {"kernel_size": KERNEL_SIZE, "clock": arch.has_clock,
+                              "arch": asdict(arch), "seed": seed,
+                              "rate_lam": rate_lam, "rate_snr_gamma": rate_gamma,
+                              "rate_mode": rate_mode}
+    if epoch is not None:
+        config["epoch"] = epoch
+    torch.save({"model": model.state_dict(), "config": config}, path)
+
+
+def state_has_clock(state: dict[str, torch.Tensor]) -> bool:
+    """重みの state_dict が時刻符号つきの UNet1D のものかを返す
+
+    Note:
+        ★時刻符号の有無だけは重みのキーで判定できる。種類と次元は arch_spec_from_ckpt を使う
+
+    Args:
+        state: UNet1D の state_dict
+
+    Returns:
+        clock_proj の重みを持てば True
+    """
+    return any(".clock_proj." in k for k in state)
+
+
+def arch_spec_from_ckpt(ckpt: dict) -> ArchSpec:
+    """チェックポイントから UNet1D の構造の指定を復元する
+
+    Note:
+        1. config["arch"] があればそれを使う（この形式で保存した Stage 1 と、それを引き継いだ Stage 2）
+        2. 無ければ重みのキーから決める。config を持たない古いチェックポイント（20260819 版など）と、
+           ArchSpec 導入前の時刻符号つき（倍音 K=4）を同じ規則で読むため
+        3. ★2. で時刻符号の入力次元が CLOCK_DIM と違うときは, 種類 (倍音 / Transformer 型) を
+          決められないので例外にする
+
+    Args:
+        ckpt: キー "model" に state_dict を持つチェックポイントの dict。
+            Stage 1 の重みと Stage 2 の世代（stage2_step*.pt）のどちらでもよい
+
+    Returns:
+        構造の指定
+
+    Raises:
+        ValueError: config["arch"] が無く、時刻符号の入力次元が CLOCK_DIM と違うとき
+    """
+    config = ckpt.get("config") or {}
+    arch = config.get("arch")
+    if arch is not None:
+        return ArchSpec(**arch)
+    state = ckpt["model"]
+    if not state_has_clock(state):
+        return ArchSpec()
+    dims = {int(v.shape[1]) for k, v in state.items() if k.endswith(".clock_proj.weight")}
+    if dims != {CLOCK_DIM}:
+        raise ValueError(f"config['arch'] が無く、時刻符号の入力次元 {sorted(dims)} が "
+                         f"CLOCK_DIM={CLOCK_DIM} と違うので構造を決められない")
+    return ArchSpec(clock_kind="harmonic", clock_harmonics=CLOCK_HARMONICS)
+
+
+def build_unet_for_ckpt(path: Path) -> UNet1D:
+    """チェックポイントの重みに合う構造の UNet1D を組む（重みはまだ読まない）
+
+    stage2_checkpoint.load_ckpt のように「組んだモデルへ後から読む」呼び出し側のための入口。
+    Stage 1 の重みと Stage 2 の世代（stage2_step*.pt）のどちらも受け付ける。
+
+    Args:
+        path: キー "model" に state_dict を持つチェックポイント
+
+    Returns:
+        CPU 上の UNet1D。構造は arch_spec_from_ckpt で決める
+    """
+    # ★weights_only=False。Stage 2 の世代は RNG 状態と config を含む。自分で書いたファイルだけを読む
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    return UNet1D(arch=arch_spec_from_ckpt(ckpt))
+
+
 def load_pretrained(path: Path = MODEL_SAVE_PATH) -> nn.Module:
     """保存済み Stage1 を読み込む。
 
-    ★EMA が無いので use_ema 引数も無い。チェックポイントのキーは "model" のみ
+    ★EMA が無いので use_ema 引数も無い。重みはキー "model"、出所の記録はキー "config"
+      （20260819 版など古いチェックポイントには config が無い）
+    ★構造は arch_spec_from_ckpt で決める（config["arch"]、無ければ重みのキー）
     """
     ckpt = torch.load(path, map_location=DEVICE)
-    model = UNet1D().to(DEVICE)
+    model = UNet1D(arch=arch_spec_from_ckpt(ckpt)).to(DEVICE)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model
@@ -1179,15 +1987,30 @@ def sanity_check(model, n_per_group: int = 256, save_path: Path | None = GEN_SAV
     if save_path is None:
         print("\n(save_path=None のため生成CSVは書かない)")
         return
+    write_pool_csv(pool, save_path)
+    print(f"\nsaved generated schedules to {save_path}")
+
+
+def write_pool_csv(pool: npt.NDArray[np.int64], save_path: Path) -> None:
+    """群別サンプルプールを生成個票の CSV として書く
+
+    列は group_d, sampler, gender, age7, employment, s0..s95。
+    stage2_curves.load_sample_pool と clock_diagnostics がこの形式を読む。
+
+    Args:
+        pool: 群別サンプルプール, dtype=int64, (D_GROUPS, M, NUM_SLOTS)。行 d は cond_grid()[d] の条件
+        save_path: 書き出す CSV のパス
+    """
+    n_per_group = pool.shape[1]
+    gen = pool.reshape(-1, NUM_SLOTS)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    grid = cond_grid()
-    meta = pd.DataFrame(np.repeat(grid, n_per_group, axis=0), columns=["gender", "age7", "employment"])
-    meta.insert(0, "group_d", gen_d)   # w_gen と同一の群割り当て（ずれ得ない）
+    meta = pd.DataFrame(np.repeat(cond_grid(), n_per_group, axis=0),
+                        columns=["gender", "age7", "employment"])
+    meta.insert(0, "group_d", np.repeat(np.arange(D_GROUPS), n_per_group))
     # サンプラ列は clock_diagnostics が読むので残す。本実装では常に ancestral
     meta.insert(1, "sampler", "ancestral")
     pd.concat([meta, pd.DataFrame(gen, columns=[f"s{i}" for i in range(NUM_SLOTS)])],
-                axis=1).to_csv(save_path, index=False)
-    print(f"\nsaved generated schedules to {save_path}")
+              axis=1).to_csv(save_path, index=False)
 
 
 # ============================================================
@@ -1276,31 +2099,102 @@ if __name__ == "__main__":
         description="AggDDPM-Simple: ATUS平日・共通12分類・28群の条件付き pretrain（簡素化版）")
     ap.add_argument("--epochs", type=int, default=EPOCHS)
     ap.add_argument("--no-wandb", action="store_true")
+    ap.add_argument("--no-pool", action="store_true",
+                    help="学習後の sanity_check（7,168 本の生成と暗記チェック）を飛ばす。"
+                         "生成は src/eval/diagnostics/stage1_guidance_pool.py で別に行う"
+                         "（DBG の 10 分枠に学習だけを収めるため）")
     ap.add_argument("--smoke", action="store_true", help="短時間の動作確認のみ")
     ap.add_argument("--kernel", type=int, default=None, choices=[1, 3, 5, 7],
                     help="畳み込みの受容野。省略すると本編の設定 (3) で"
                          "既定の保存先に書く。明示するとアブレーション扱いになり、"
                          "保存先に _k{K} が付くので本編の成果物とは混ざらない")
+    ap.add_argument("--clock", action="store_true",
+                    help="全 ResBlock1D に 24 時間の時刻符号（clock_proj）を足す。"
+                         "アブレーション扱いで、保存先に _clock が付く")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="学習の乱数の種（既定 SEED=42）。学習/評価の分割は変えない。"
+                         "明示すると反復実験扱いで、保存先に _s{seed} が付く")
+    ap.add_argument("--rate-lam", type=float, default=RATE_LAM,
+                    help="行動者率の偏りの項 L_rate の重み（既定 0 = 従来の損失）。"
+                         "正の値を渡すと保存先に _rate{値} が付く")
+    ap.add_argument("--rate-gamma", type=float, default=RATE_SNR_GAMMA,
+                    help="L_rate の重み v(t)=1/√max(SNR,γ) の頭打ち γ（既定 1.0）。"
+                         "既定以外は保存先に g{値} が付く。--rate-lam > 0 のときだけ意味を持つ")
+    ap.add_argument("--arm", default=None,
+                    help="stage1_arms.ARMS の arm 名。構造・損失・保存先の接尾辞を表から決める。"
+                         "--kernel / --clock / --rate-* とは併用できない")
+    ap.add_argument("--save-every", type=int, default=0,
+                    help="N epoch ごとに途中の ckpt を {ckpt の stem}_ep{epoch:04d}.pt へ保存する"
+                         "（既定 0 = 保存しない）。最良の ckpt は従来どおり")
+    ap.add_argument("--rate-mode", choices=RATE_MODES, default=RATE_MODE,
+                    help="L_rate の偏り m を平均する単位（Diffusion.rate_objective）。"
+                         "batch 以外は保存先の _rate{λ} が _{mode}rate{λ} になる。"
+                         "--rate-lam > 0 のときだけ意味を持つ")
     args = ap.parse_args()
+    seed = SEED if args.seed is None else args.seed
+    if args.rate_lam < 0.0:
+        ap.error(f"--rate-lam は 0 以上: {args.rate_lam}")
+    if args.rate_gamma <= 0.0:
+        ap.error(f"--rate-gamma は正: {args.rate_gamma}")
+    if args.rate_lam == 0.0 and args.rate_gamma != RATE_SNR_GAMMA:
+        ap.error("--rate-gamma は --rate-lam > 0 のときだけ指定できる（λ=0 では効かない）")
+    if args.rate_lam == 0.0 and args.rate_mode != RATE_MODE:
+        ap.error("--rate-mode は --rate-lam > 0 のときだけ指定できる（λ=0 では効かない）")
 
-    if args.kernel is not None:
-        # ★モデル構築より前に差し替える。UNet1D/ResBlock1D は __init__ で
-        #   モジュール変数 KERNEL_SIZE を読むため、ここで決めた値が全層に効く。
-        KERNEL_SIZE = args.kernel
-        # --kernel を明示した実行は、値が 3 でもアブレーションとして別名に隔離する。
-        # スイープ一式を同じ規則で並べられるようにするため。
-        suffix = f"_k{args.kernel}"
+    rate_lam, rate_gamma, rate_mode = args.rate_lam, args.rate_gamma, args.rate_mode
+    if args.arm is not None:
+        # ★構造・損失・保存先の接尾辞はすべて stage1_arms.ARMS から決める（唯一の出所）
+        if (args.kernel is not None or args.clock or args.rate_lam != RATE_LAM
+                or args.rate_gamma != RATE_SNR_GAMMA or args.rate_mode != RATE_MODE):
+            ap.error("--arm は --kernel / --clock / --rate-lam / --rate-gamma / --rate-mode と併用できない")
+        arms = _load_module("simple_stage1_arms", Path(__file__).resolve().parent / "stage1_arms.py")
+        if args.arm not in arms.ARMS:
+            ap.error(f"未知の arm: {args.arm}（既知: {sorted(arms.ARMS)}）")
+        arm_spec = arms.ARMS[args.arm]
+        if seed == SEED and arm_spec.legacy_seed42_tag is not None:
+            ap.error(f"arm {args.arm} の種 {SEED} は既存の本編（{arm_spec.legacy_seed42_tag}）を指す。"
+                     "上書きしないよう学習を禁止している")
+        arch = ArchSpec(**arm_spec.arch)
+        rate_lam, rate_mode = arm_spec.rate_lam, arm_spec.rate_mode
+        suffix = arms.arm_suffix(args.arm, seed)
+    else:
+        arch = ArchSpec(clock_kind="harmonic") if args.clock else ArchSpec()
+        suffix = ""
+        if args.kernel is not None:
+            # ★モデル構築より前に差し替える。UNet1D/ResBlock1D は __init__ で
+            #   モジュール変数 KERNEL_SIZE を読むため、ここで決めた値が全層に効く。
+            KERNEL_SIZE = args.kernel
+            # --kernel を明示した実行は、値が 3 でもアブレーションとして別名に隔離する。
+            # スイープ一式を同じ規則で並べられるようにするため。
+            suffix += f"_k{args.kernel}"
+        if args.clock:
+            suffix += "_clock"
+        if args.rate_lam > 0.0:
+            # ★jobs/train_ddpm_simple_clock.sh は同じ名前を printf '%g' で組む。書式を揃えること
+            mode_tag = "" if args.rate_mode == "batch" else args.rate_mode
+            suffix += f"_{mode_tag}rate{args.rate_lam:g}"
+            if args.rate_gamma != RATE_SNR_GAMMA:
+                suffix += f"g{args.rate_gamma:g}"
+        if args.seed is not None:
+            suffix += f"_s{args.seed}"
+    if suffix:
         MODEL_SAVE_PATH = MODEL_SAVE_PATH.with_name(
             f"{MODEL_SAVE_PATH.stem}{suffix}{MODEL_SAVE_PATH.suffix}")
         GEN_SAVE_PATH = GEN_SAVE_PATH.with_name(
             f"{GEN_SAVE_PATH.stem}{suffix}{GEN_SAVE_PATH.suffix}")
+    print(f"[config] arm={args.arm}")
     print(f"[config] kernel_size={KERNEL_SIZE}")
+    print(f"[config] arch={arch}")
+    print(f"[config] seed={seed}")
+    print(f"[config] rate_lam={rate_lam:g} rate_gamma={rate_gamma:g} rate_mode={rate_mode}")
+    print(f"[config] save_every={args.save_every}")
     print(f"[config] ckpt={MODEL_SAVE_PATH.name}")
     print(f"[config] gen ={GEN_SAVE_PATH.name}")
 
     smoke_test()
     if args.smoke:
-        model = train(epochs=5, use_wandb=False, save_path=None)
+        model = train(epochs=5, use_wandb=False, save_path=None, arch=arch, seed=seed,
+                      rate_lam=rate_lam, rate_gamma=rate_gamma, rate_mode=rate_mode)
         # DDIM が無いので生成は 1000 ステップ固定。群あたり 2 本に絞って回す。
         # 暗記チェックは参照集合に対してプールが小さすぎるので飛ばす
         sanity_check(model, n_per_group=2, save_path=None, with_memorization=False)
@@ -1308,5 +2202,10 @@ if __name__ == "__main__":
         # ★保存先は明示的に渡す。train/sanity_check の既定引数は定義時に
         #   束縛済みで、上の再代入では差し替わらないため。
         model = train(epochs=args.epochs, use_wandb=not args.no_wandb,
-                      save_path=MODEL_SAVE_PATH)
-        sanity_check(model, save_path=GEN_SAVE_PATH)
+                      save_path=MODEL_SAVE_PATH, arch=arch, seed=seed,
+                      rate_lam=rate_lam, rate_gamma=rate_gamma, rate_mode=rate_mode,
+                      save_every=args.save_every)
+        if args.no_pool:
+            print("[config] --no-pool: sanity_check（生成と暗記チェック）を飛ばした")
+        else:
+            sanity_check(model, save_path=GEN_SAVE_PATH)

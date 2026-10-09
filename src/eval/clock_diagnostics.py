@@ -11,15 +11,15 @@ clock_diagnostics.py
       - timestep_embedding は拡散ステップ t 用であって時刻スロット t 用ではない
     したがって「いまが朝か夜か」は Conv1d(padding=1) の境界効果が階層を伝播する
     副産物としてしか入らない。逆過程の初期 (t≈T, x_t がほぼ純ノイズ) は日内リズムの
-    大枠を決める段階なので、ここで時計が無いことは原理的に効きうる。
+    大枠を決める段階なので、ここで時刻符号が無いことは原理的に効きうる。
 
-    この空白を埋める設計（学習型絶対PE / 巡回フーリエ時計 / 巡回バックボーン）に
+    この空白を埋める設計（学習型絶対PE / 巡回フーリエ時刻符号 / 巡回バックボーン）に
     進む前に、**欠如が実害かどうか**を再学習なしで測るのが本モジュール。
 
 ★ 5つの診断:
     B1 curve_comparison      時刻別行動者率カーブの鈍化（ピーク高さ・L1）
     B2 onset_comparison      個人の初回開始時刻の分布（集団カーブが合っていても
-                             個人がばらついていれば時計は無い）
+                             個人がばらついていれば時刻符号は無い）
     B3 wrap_comparison       日跨ぎ境界の破れ（活動日は「環」か「線分」か）
     B4 position_probe        中間特徴から時刻位相を線形復元できるか（モデル内部）
     B5 shift_equivariance    時間軸を巡回シフトしたときの予測のずれ（モデル内部）
@@ -49,6 +49,11 @@ clock_diagnostics.py
     uv run python src/eval/test_clock_diagnostics.py    # 自己テスト
     uv run python src/eval/clock_diagnostics.py         # 本番診断 (DDPM_Aggregate)
     uv run python src/eval/clock_diagnostics.py --model-dir src/models/DDPM_Aggregate_Tang
+
+    # 同じフォルダの別の重みを比べる（時刻符号アブレーション）。重みと生成 CSV は同じ組を渡す
+    uv run python src/eval/clock_diagnostics.py --model-dir src/models/DDPM_Aggregate_Simple \\
+        --ckpt outputs/checkpoints/ddpm_simple_pretrain_common12_weekday_clock.pt \\
+        --gen outputs/generated/ddpm_simple_pretrain_samples_clock.csv --tag clock
 """
 from __future__ import annotations
 
@@ -71,7 +76,7 @@ OUT_CSV = REPO_ROOT / "data" / "processed" / "aggregates" / "ddpm_clock_diagnost
 # 診断対象の既定。--model-dir で DDPM_Aggregate_Tang などに差し替えられる
 DEFAULT_MODEL_DIR = REPO_ROOT / "src" / "models" / "DDPM_Aggregate"
 
-# B1 でピーク鈍化を見る主対象。日内リズムが鋭い活動ほど「時計の欠如」が出やすい
+# B1 でピーク鈍化を見る主対象。日内リズムが鋭い活動ほど「時刻符号の欠如」が出やすい
 PEAK_ACTS = ["TRAVEL", "MEALS", "WORK", "SLEEP_PERSONAL"]
 # B5 の巡回シフト量（スロット）。1=15分, 4=1時間, 12=3時間, 24=6時間, 48=12時間
 SHIFTS = (1, 4, 12, 24, 48)
@@ -98,7 +103,7 @@ im = load_module("clockdiag_individual_metrics", REPO_ROOT / "src" / "eval" / "i
 def curve_stats(sched: IntArr, n_act: int, w: FloatArr | None = None) -> dict[str, FloatArr]:
     """時刻別行動者率カーブ (96, n_act) と、そのピーク高さ (n_act,)。
 
-    「時計が無ければ日内リズムのピークが平坦化する」という予測を測る土台。
+    「時刻符号が無ければ日内リズムのピークが平坦化する」という予測を測る土台。
     """
     curve = im.participation_by_slot(sched, n_act, w)
     return {"curve": curve, "peak": curve.max(axis=0)}
@@ -110,7 +115,7 @@ def curve_comparison(real: IntArr, gen: IntArr, n_act: int, act_names: list[str]
     """★B1: 活動別のピーク高さ比とカーブ L1 距離、それぞれのノイズ床。
 
     peak_ratio < 1 は生成側のピークが低い = 鈍化。床の外に出ていれば
-    「時計が無いせいでリズムがぼやけている」ことの直接の証拠になる。
+    「時刻符号が無いせいでリズムがぼやけている」ことの直接の証拠になる。
     """
     cr = curve_stats(real, n_act, w_real)
     cg = curve_stats(gen, n_act, w_gen)
@@ -275,7 +280,7 @@ def plot_curves(real: IntArr, gen: IntArr, n_act: int, act_names: list[str],
     """時刻別行動者率カーブを実 vs 生成で重ねる（00:00 開始表示）。
 
     B1 の peak_ratio が何を測っているかを目で確認するための図。
-    ピークが低く裾が持ち上がっていれば「時計が無い」ことの視覚的な証拠になる。
+    ピークが低く裾が持ち上がっていれば「時刻符号が無い」ことの視覚的な証拠になる。
     """
     import matplotlib.pyplot as plt
 
@@ -399,7 +404,7 @@ def shift_equivariance(model, diffusion, x0, cond_idx, shifts=SHIFTS,
         gap(k) = ‖ ε(roll(x, k)) − roll(ε(x), k) ‖ / ‖ ε(x) ‖
 
     位置情報を持たないモデルはシフト等変になり gap ≈ 0。実データの日内リズムは
-    シフト等変でないので、時計を持つモデルなら gap は大きくなる。
+    シフト等変でないので、時刻符号を持つモデルなら gap は大きくなる。
     ゼロパディングの境界効果があるため厳密な 0 にはならない。
 
     ★ 単独では読めないので、同じモデル内の 2 つのヤードスティックを併記する:
@@ -446,22 +451,32 @@ def _load_generated(path: Path) -> tuple[IntArr, IntArr, str]:
 
 
 def run(n_probe: int = 512, n_shift: int = 256, seed: int = 0,
-        model_dir: Path = DEFAULT_MODEL_DIR) -> dict[str, pd.DataFrame]:
+        model_dir: Path = DEFAULT_MODEL_DIR, ckpt: Path | None = None,
+        gen_path: Path | None = None, tag: str = "") -> dict[str, pd.DataFrame]:
     """実 ATUS 平日 vs 学習済み AggDDPM で B1-B5 を回し、結果を表で返す。
 
     model_dir: 診断対象のモデルフォルダ。既定は DDPM_Aggregate。
         DDPM_Aggregate_Tang を渡せば同じ診断を Tang バックボーンに掛けられる
         （両者は load_pretrained / Diffusion / cond_grid / features / in_channels の
         同じ契約を満たす）。出力 CSV はフォルダ名で分ける。
+    ckpt: B4/B5 に使う重み。None ならモデルフォルダの既定（load_pretrained の既定引数）。
+        同じフォルダの別の重み（DDPM_Aggregate_Simple の _clock 版や日付つきの版）を比べるときに渡す
+    gen_path: B1-B3 に使う生成 CSV。None ならモデルフォルダの GEN_SAVE_PATH。
+        ★ckpt と gen_path は同じ重みの組を渡すこと。片方だけ差し替えると
+          B1-B3 と B4/B5 が別のモデルを測る（例外は出ない）
+    tag: 出力 CSV 名の末尾に付ける識別子。ckpt を差し替えるときに結果を分ける
     """
     import torch
 
     ddpm = load_module("clockdiag_ddpm", model_dir / "model.py")
-    out_csv = OUT_CSV.with_name(f"{OUT_CSV.stem}_{model_dir.name}{OUT_CSV.suffix}")
+    suffix = f"_{model_dir.name}" + (f"_{tag}" if tag else "")
+    out_csv = OUT_CSV.with_name(f"{OUT_CSV.stem}{suffix}{OUT_CSV.suffix}")
     print(f"診断対象: {model_dir.name}/model.py")
-    gen_path = ddpm.GEN_SAVE_PATH
+    gen_file = Path(gen_path if gen_path is not None else ddpm.GEN_SAVE_PATH)
+    print(f"  生成 CSV: {gen_file}")
+    print(f"  重み    : {ckpt if ckpt is not None else '（load_pretrained の既定）'}")
     cond_idx, sched_real, w_real, _ = ddpm.load_data()
-    gen, gen_d, sampler = _load_generated(gen_path)
+    gen, gen_d, sampler = _load_generated(gen_file)
 
     # 生成側は群一様に作られているので、実データの群構成に重みで合わせる
     d_real = ddpm.cond_to_d(cond_idx)
@@ -470,7 +485,7 @@ def run(n_probe: int = 512, n_shift: int = 256, seed: int = 0,
     n_act = ddpm.NUM_ACT
     act_names = ddpm.ACT_NAMES
     print(f"実 ATUS 平日 N={len(sched_real)} / 生成 N={len(gen)} (sampler={sampler}, "
-          f"{gen_path.name})")
+          f"{gen_file.name})")
 
     print("\n=== B1. 時刻別行動者率カーブ（ピーク鈍化）===")
     b1 = curve_comparison(sched_real, gen, n_act, act_names, w_real, w_gen, seed=seed)
@@ -490,7 +505,7 @@ def run(n_probe: int = 512, n_shift: int = 256, seed: int = 0,
           f"{b3d['verdict']}")
     b3 = pd.DataFrame([b3d])
 
-    model = ddpm.load_pretrained()
+    model = ddpm.load_pretrained(ckpt) if ckpt is not None else ddpm.load_pretrained()
     diffusion = ddpm.Diffusion()
     grid = torch.as_tensor(ddpm.cond_grid(), device=ddpm.DEVICE)
 
@@ -527,6 +542,17 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="生成モデルは時刻を知っているかの診断 (B1-B5)")
     ap.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR,
                     help="診断対象のモデルフォルダ (既定: src/models/DDPM_Aggregate)")
+    ap.add_argument("--ckpt", type=Path, default=None,
+                    help="B4/B5 に使う重み (既定: モデルフォルダの load_pretrained の既定)")
+    ap.add_argument("--gen", type=Path, default=None,
+                    help="B1-B3 に使う生成 CSV (既定: モデルフォルダの GEN_SAVE_PATH)。--ckpt と同じ重みの生成を渡す")
+    ap.add_argument("--tag", type=str, default="",
+                    help="出力 CSV 名の末尾に付ける識別子 (例: clock, 20260819)")
     args = ap.parse_args()
-    run(model_dir=args.model_dir if args.model_dir.is_absolute()
-        else (REPO_ROOT / args.model_dir))
+
+    def _abs(p: Path | None) -> Path | None:
+        return None if p is None else (p if p.is_absolute() else REPO_ROOT / p)
+
+    model_dir = _abs(args.model_dir)
+    assert model_dir is not None
+    run(model_dir=model_dir, ckpt=_abs(args.ckpt), gen_path=_abs(args.gen), tag=args.tag)

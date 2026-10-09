@@ -40,15 +40,24 @@ Stage 2 の学習ループ
         --holdout-groups d1,d2,...  LGO。損失から外す群（生成と評価は常に全28群）
         --resume         ckpt-dir の最新チェックポイントから再開。
                          torch / numpy 両方の RNG と λ を引き継ぐ
+        --lr-cond / --lr-emb / --lr-conv / --lr-clock  層別学習率（既定は LR_* 定数）。
+                         --lr-clock は時刻符号つきの Stage 1（model.py --clock）のときだけ効く
+        --rehearsal {atus,tilt}  リハーサルの個票の抽出。tilt は群ごとに A* へ傾けた重みで抽出する
+                         （stage2_tilt.py。held-out 群は傾けない）
+        --tilt-rho V     傾けのリッジの強さ（既定 0.1）。--rehearsal tilt のときだけ効く
 
 学習ログで最初に見る量:
     agg_gnorm_cond / _emb / _conv  集計側だけで θ に載った勾配の L2 ノルム（層別 LR の3群）
+    agg_gnorm_clock                時刻符号つきの Stage 1 のときだけ。0 に張り付くなら
+                                   集計勾配は時刻符号（スロットごとに違う値の経路）を使っていない
         ★L_agg・rate_mae・g_* は straight-through と clamp より上流の量なので、
           代理勾配が潰れて θ が全く動いていなくても正常値を出す
     total_gnorm_*                  リハーサル項を足した後のノルム。
         ★agg との比が「集計側が更新方向にどれだけ効いているか」そのもの。
           実測では λ=auto のとき λ‖g_atus‖/‖g_agg‖ = 22〜51 倍、さらに
           cos(g_agg, g_atus) = −0.27（逆向き）。λ を下げないと集計は通らない
+    tug_cos / tug_ratio            cos(g_agg, λ·g_atus) と ‖λ·g_atus‖/‖g_agg‖。綱引きの直接の量。
+        cos < 0 ならリハーサルが集計を押し戻している（従来の実測 −0.27）
     L_atus_val                     ATUS val 分割の ε-MSE（--val-every ごと）
         300 更新は学習分割の約23エポック相当。上がり始めたらリハーサルの過学習
     x0_floor_frac                  x_0 が下側 clamp に張り付いた要素の割合
@@ -59,6 +68,7 @@ import importlib.util
 import math
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +102,11 @@ sm: Any = _load("simple_model", HERE / "model.py")
 ck: Any = _load("simple_stage2_checkpoint", HERE / "stage2_checkpoint.py")
 st: Any = _load("simple_stage2_targets", HERE / "stage2_targets.py")
 sl: Any = _load("simple_stage2_loss", HERE / "stage2_loss.py")
+tl: Any = _load("simple_stage2_tilt", HERE / "stage2_tilt.py")
+
+# リハーサルの種類。"atus" は従来どおり（TUFINLWGT で抽出）、"tilt" は個票の重みを
+# 群ごとに A* へ傾けてから抽出する（stage2_tilt.py）
+REHEARSAL_KINDS = ("atus", "tilt")
 
 # 既定値。根拠は Stage2_design.md の対応する節
 DEFAULT_STEPS = 300          # §4.7 の見積り（D_sub=7 なら実測3.2時間）
@@ -113,6 +128,13 @@ DEFAULT_VAL_EVERY = 10
 LR_COND = 1e-4               # 群だけに効く純粋な条件パラメータ 4,680 (0.27%)
 LR_EMB  = 2e-5               # emb_proj 312,512 (17.8%)。時刻と条件の共有注入路
 LR_CONV = 1e-5               # conv/attention/GroupNorm 1,441,932 (82.0%)
+# 時刻符号つきの Stage 1（model.py の --clock）のときだけ作る群。clock_proj 10,944 (0.62%)。
+# ★cond と同じ 1e-4 にする。時刻符号は群によらず全員に共通の「何時に」を表す唯一の経路で、
+#   日本の昼食が 12:00 に揃う・7:00 に朝食をとるといった全群共通の時刻構造はここを通る。
+#   時刻符号なしの λ=0.003 では周期 8h 以下の残差が 2% 台しか埋まらなかった（stage2_curves の
+#   band_closure_table）。cond と同じく小さく低次元の経路なので、速く動かしても
+#   拡散ステップ応答（emb）や畳み込み（conv）を壊しにくい
+LR_CLOCK = 1e-4
 MEMORY_BUDGET = 6600         # §4.5 K×chunk <= 約6,600（A100 40GB）
 
 # λ=auto を決めるのに使う更新数。
@@ -132,6 +154,11 @@ CKPT_DIR = REPO_ROOT / "outputs" / "checkpoints" / "stage2"
 #   群による違いも通すが、同時に拡散ステップ応答そのものでもある。
 COND_PATH_KEYS = ("cond_embeds", "cond_proj", "null_emb")
 EMB_PATH_KEYS = ("emb_proj",)
+# ★CLOCK_PATH_KEYS は時刻符号つきモデルにだけある。時刻（1 日のうちの何時か）ごとに違う値を
+#   足す経路。clock_proj は群によらず、cond_clock_*（ArchSpec.cond_clock_rank > 0）は群と t で
+#   形が変わる。無いモデルでは clock 群を作らない（従来の 3 群のまま）。
+#   ★cond_clock_* は COND_PATH_KEYS（cond_embeds / cond_proj）と重ならない名前にしてある
+CLOCK_PATH_KEYS = ("clock_proj", "cond_clock_profile", "cond_clock_mix")
 
 
 # ============================================================
@@ -166,31 +193,42 @@ def stratified_holdout(pop: np.ndarray, k: int, seed: int = 0) -> list[int]:
 # 学習
 # ============================================================
 PARAM_GROUP_NAMES = ("cond", "emb", "conv")
+CLOCK_GROUP_NAME = "clock"
 
 
 def split_param_groups(model: torch.nn.Module) -> dict[str, list[torch.nn.Parameter]]:
-    """パラメータを層別学習率の3群へ分ける, 群名は PARAM_GROUP_NAMES と同じ順
+    """パラメータを層別学習率の群へ分ける。時刻符号なしは3群、時刻符号つきは4群
 
     Note:
-        ★名前の断片で判定する。上から cond -> emb -> conv の順に当てるので、
-        COND_PATH_KEYS と EMB_PATH_KEYS が重なっていない必要がある。
-        ★build_optimizer と grad_norms の唯一の出所。片方だけ並びを変えると、
-        例外は出ずに「conv のノルムを cond として報告する」壊れ方をする。
+        ★名前の断片で判定する。上から cond -> emb -> clock -> conv の順に当てるので、
+        COND_PATH_KEYS / EMB_PATH_KEYS / CLOCK_PATH_KEYS が重なっていない必要がある。
+        ★戻り値の dict の並びが build_optimizer の param_groups の並びになる。
+        時刻符号なしモデルでは cond / emb / conv（PARAM_GROUP_NAMES と同じ）、
+        時刻符号つきモデルでは cond / emb / clock / conv。
+        ★clock 群だけは空でもよい（時刻符号なしモデル）。空なら dict から除く。
 
     Args:
         model: UNet1D
 
     Returns:
-        {群名: パラメータの list}。キーは PARAM_GROUP_NAMES と同じ3つ
+        {群名: パラメータの list}
+
+    Raises:
+        ValueError: cond / emb / conv のいずれかが空になった場合
     """
-    groups: dict[str, list[torch.nn.Parameter]] = {k: [] for k in PARAM_GROUP_NAMES}
+    groups: dict[str, list[torch.nn.Parameter]] = {
+        "cond": [], "emb": [], CLOCK_GROUP_NAME: [], "conv": []}
     for name, p in model.named_parameters():
         if any(k in name for k in COND_PATH_KEYS):
             groups["cond"].append(p)
         elif any(k in name for k in EMB_PATH_KEYS):
             groups["emb"].append(p)
+        elif any(k in name for k in CLOCK_PATH_KEYS):
+            groups[CLOCK_GROUP_NAME].append(p)
         else:
             groups["conv"].append(p)
+    if not groups[CLOCK_GROUP_NAME]:
+        del groups[CLOCK_GROUP_NAME]
     empty = [k for k, v in groups.items() if not v]
     if empty:
         raise ValueError(f"層別 LR の分割に失敗した。空の群: {empty}")
@@ -199,33 +237,39 @@ def split_param_groups(model: torch.nn.Module) -> dict[str, list[torch.nn.Parame
 
 def build_optimizer(model: torch.nn.Module, lr_cond: float = LR_COND,
                     lr_emb: float = LR_EMB,
-                    lr_conv: float = LR_CONV) -> torch.optim.Optimizer:
-    """層別学習率つき AdamW, param_groups は PARAM_GROUP_NAMES の順に3群
+                    lr_conv: float = LR_CONV,
+                    lr_clock: float = LR_CLOCK) -> torch.optim.Optimizer:
+    """層別学習率つき AdamW, param_groups は split_param_groups の並びで、各群に "name" を持つ
 
     Note:
         UNet1D 1,759,124 params の内訳:
             cond     4,680 ( 0.27%) = cond_embeds 72 + cond_proj 4,352 + null_emb 256
             emb    312,512 (17.77%) = emb_proj ×11
             conv 1,441,932 (81.97%) = 畳み込み + attention + GroupNorm
+        時刻符号つき（--clock）は clock 10,944 (0.62%) = clock_proj ×11 が加わる。
 
         ★cond だけが「群ごとに違う値」を持つ。日米差の 64.2%（二乗和）は
         dev 成分（群ごとの描き分け）なので、そこを動かせるのはこの 4,680 だけである。
         ★emb は時刻埋め込みと条件埋め込みの **和** を注入する共有経路なので、
         速く動かすと拡散ステップ応答そのものが変わる。cond と conv の中間に置く。
+        ★clock だけが「スロットごとに違う値」を持つ。全群共通の時刻構造を動かす経路。
+        ★param_groups[i]["name"] に群名を入れる。grad_norms はこの名前で群を読むので、
+          並びを組み替えても「conv のノルムを cond として報告する」壊れ方をしない。
 
     Args:
         model: Stage1 の重みを読んだUNet1D
         lr_cond: 群専用の条件パラメータの学習率, default=LR_COND=1e-4
         lr_emb: emb_proj（時刻・条件の共有注入路）の学習率, default=LR_EMB=2e-5
         lr_conv: conv/attention の学習率, default=LR_CONV=1e-5
+        lr_clock: clock_proj（時刻符号）の学習率。時刻符号なしモデルでは使わない, default=LR_CLOCK=1e-4
 
     Returns:
-        param group を PARAM_GROUP_NAMES の順に持つ AdamW, weight_decay=0.0
+        AdamW, weight_decay=0.0
     """
     groups = split_param_groups(model)
-    lrs = {"cond": lr_cond, "emb": lr_emb, "conv": lr_conv}
+    lrs = {"cond": lr_cond, "emb": lr_emb, CLOCK_GROUP_NAME: lr_clock, "conv": lr_conv}
     return torch.optim.AdamW(
-        [{"params": groups[k], "lr": lrs[k]} for k in PARAM_GROUP_NAMES],
+        [{"params": params, "lr": lrs[name], "name": name} for name, params in groups.items()],
         weight_decay=0.0)
 
 
@@ -499,26 +543,118 @@ def grad_norms(optimizer: torch.optim.Optimizer, prefix: str) -> dict[str, float
         L_agg も rate_mae も g_diagnostics も straight-through と clamp より上流なので、
         代理勾配が潰れて θ が全く動いていなくても全て正常値を出す。
         3〜13時間の予算を空回りで使い切る事故は、この値が 0 に張り付くことでしか見えない。
-        ★群の並びは build_optimizer が作った順（PARAM_GROUP_NAMES）に依存する。
-        param_groups を組み替えるなら split_param_groups と一緒に直すこと。
+        ★群名は build_optimizer が param_groups[i]["name"] に入れた値を読む（並び順に依存しない）。
+        ★時刻符号つきモデルでは <prefix>_gnorm_clock が加わる。agg_gnorm_clock が 0 に張り付くなら、
+          集計勾配は時刻符号の経路を使っていない。
 
     Args:
-        optimizer: build_optimizer が作った AdamW。param_groups は
-            PARAM_GROUP_NAMES = ("cond", "emb", "conv") の順の3群
+        optimizer: build_optimizer が作った AdamW。各 param_group が "name" キーを持つ
         prefix: 出力キーの接頭辞。集計側だけの勾配なら "agg"、両項を足した後なら "total"
 
     Returns:
         統計量の dict[str, float]
             <prefix>_gnorm_cond: 群専用の条件パラメータ（cond_embeds / cond_proj / null_emb）
             <prefix>_gnorm_emb: emb_proj（時刻・条件の共有注入路）
+            <prefix>_gnorm_clock: clock_proj（時刻符号）。時刻符号つきモデルのときだけ
             <prefix>_gnorm_conv: conv・attention・GroupNorm
+
+    Raises:
+        KeyError: param_group に "name" が無い場合（build_optimizer 以外で作った optimizer）
     """
     out: dict[str, float] = {}
-    for name, group in zip(PARAM_GROUP_NAMES, optimizer.param_groups):
+    for group in optimizer.param_groups:
+        if "name" not in group:
+            raise KeyError("param_group に 'name' が無い。build_optimizer で作った optimizer を渡すこと")
+        name = group["name"]
         sq = sum(float(p.grad.detach().pow(2).sum())
                  for p in group["params"] if p.grad is not None)
         out[f"{prefix}_gnorm_{name}"] = math.sqrt(sq)
     return out
+
+
+def tilted_rehearsal_weights(cond_idx: np.ndarray, sched: np.ndarray, weight: np.ndarray,
+                             a_star: np.ndarray, teacher_groups: np.ndarray,
+                             rho: float) -> tuple[np.ndarray, dict[str, float]]:
+    """リハーサルに使う ATUS 個票の重みを、群ごとに教師 A* へ傾ける
+
+    Note:
+        1. 学習分割（split_indices の train_idx）だけを傾ける。val 分割の重みは元のまま
+           （val_loader は非加重なので、どのみち使われない）
+        2. 傾けるのは教師群だけ。held-out 群は元の重みのまま（その群の A* を読まない）
+        3. 群の重みの合計は変えないので、リハーサルに出てくる群の比率は従来と同じ
+
+    Args:
+        cond_idx: ATUS の条件インデックス, dtype=int64, (N, 3)
+        sched: ATUS のスケジュール (インデックス表現), dtype=int64, (N, 96)
+        weight: TUFINLWGT, dtype=float64, (N,)
+        a_star: 教師 A*, (28, 12, 96)
+        teacher_groups: 教師群のインデックス
+        rho: 傾けのリッジの強さ
+
+    Returns:
+        (傾けた重み (N,), 要約 dict)。要約は stage2_tilt.summarize の戻り値
+    """
+    train_idx, _ = sm.split_indices(len(sched))
+    groups = sm.cond_to_d(cond_idx)
+    res = tl.fit_tilt(sched[train_idx], groups[train_idx], weight[train_idx],
+                      a_star, teacher_groups, rho=rho)
+    out = np.asarray(weight, dtype=np.float64).copy()
+    out[train_idx] = res.weights
+    summary = tl.summarize(res.table)
+    print(f"[stage2] rehearsal=tilt rho={rho:g}: A* との rate_mse "
+          f"{summary['tilt_mse_before']:.5f} -> {summary['tilt_mse_after']:.5f}  "
+          f"ESS/n 中央値 {summary['tilt_ess_ratio_median']:.2f} 最小 {summary['tilt_ess_ratio_min']:.2f}"
+          f"（{summary['tilt_ess_min']:.1f} 人）  |∇η| 最大 {summary['tilt_grad_norm_max']:.1e}")
+    return out, summary
+
+
+def add_rehearsal_grad(params: list[torch.nn.Parameter],
+                       rehearsal_loss: torch.Tensor) -> dict[str, float]:
+    """集計側の勾配が θ.grad に載った状態で、リハーサル側の勾配を足し、綱引きを測る
+
+    Note:
+        1. 集計側の勾配 g_agg を退避してから rehearsal_loss（= λ·L_atus）を逆伝播し、
+           g_atus を別に得てから g_agg を足し戻す。IEEE の加算は交換則が成り立つので、
+           θ.grad は従来の「g_agg の上へ backward で累積」とビット単位で一致する
+        2. tug_cos < 0 ならリハーサルが集計を押し戻している（綱引き）
+
+    Args:
+        params: optimizer の全パラメータ（param_groups の順）
+        rehearsal_loss: λ·L_atus。backward できるスカラー
+
+    Returns:
+        tug_cos: cos(g_agg, λ·g_atus)。どちらかが 0 なら 0
+        tug_ratio: ‖λ·g_atus‖ / ‖g_agg‖。g_agg が 0 なら inf
+    """
+    g_agg = [None if p.grad is None else p.grad.detach().clone() for p in params]
+    for p in params:
+        p.grad = None
+    rehearsal_loss.backward()
+    # ★内積とノルムは CPU の float64 で積む。170 万要素を float32 で足すと cos が 1e-4 程度ずれる。
+    #   MPS は float64 を持たないので、先に CPU へ移してから変換する（1 回の .to で両方を
+    #   指定すると MPS 上で変換しようとして落ちる）
+    def f64(x: torch.Tensor) -> torch.Tensor:
+        return x.detach().cpu().double()
+
+    dot, sq_agg, sq_reh = 0.0, 0.0, 0.0
+    for p, ga in zip(params, g_agg):
+        gr = p.grad
+        if ga is not None:
+            sq_agg += float(f64(ga).pow(2).sum())
+        if gr is not None:
+            sq_reh += float(f64(gr).pow(2).sum())
+            if ga is not None:
+                dot += float((f64(ga) * f64(gr)).sum())
+        # 足し戻す。gr + ga と ga + gr は IEEE で同じ値
+        if ga is not None:
+            if gr is None:
+                p.grad = ga
+            else:
+                gr.add_(ga)
+    norm_agg, norm_reh = math.sqrt(sq_agg), math.sqrt(sq_reh)
+    cos = dot / (norm_agg * norm_reh) if norm_agg > 0 and norm_reh > 0 else 0.0
+    ratio = norm_reh / norm_agg if norm_agg > 0 else float("inf")
+    return {"tug_cos": cos, "tug_ratio": ratio}
 
 
 def run(steps: int = DEFAULT_STEPS,
@@ -537,8 +673,22 @@ def run(steps: int = DEFAULT_STEPS,
         resume: bool = False,
         seed: int = 42,
         use_wandb: bool = True,
-        device: str | None = None) -> torch.nn.Module:
-    """Stage 2 を固定ステップ回す, 返すのは最終ステップのモデル"""
+        device: str | None = None,
+        lr_cond: float = LR_COND,
+        lr_emb: float = LR_EMB,
+        lr_conv: float = LR_CONV,
+        lr_clock: float = LR_CLOCK,
+        rehearsal: str = "atus",
+        tilt_rho: float = tl.DEFAULT_RHO) -> torch.nn.Module:
+    """Stage 2 を固定ステップ回す, 返すのは最終ステップのモデル
+
+    lr_cond / lr_emb / lr_conv / lr_clock は build_optimizer の層別学習率。
+    lr_clock は時刻符号つきの Stage 1（model.py の --clock）のときだけ使う。
+    rehearsal="tilt" はリハーサルの個票の重みを群ごとに A* へ傾ける（tilted_rehearsal_weights）。
+    tilt_rho はその強さで、rehearsal="atus" では使わない。
+    """
+    if rehearsal not in REHEARSAL_KINDS:
+        raise ValueError(f"rehearsal は {REHEARSAL_KINDS} のいずれか: {rehearsal}")
     dev = device or sm.DEVICE
     check_shapes(K, d_sub, n)
     chunk = resolve_chunk(K, d_sub, n, chunk)
@@ -560,10 +710,18 @@ def run(steps: int = DEFAULT_STEPS,
     # ---- モデル ----
     model = sm.load_pretrained(stage1_ckpt).to(dev)
     diffusion = sm.Diffusion(device=dev)
-    optimizer = build_optimizer(model)
+    optimizer = build_optimizer(model, lr_cond=lr_cond, lr_emb=lr_emb,
+                                lr_conv=lr_conv, lr_clock=lr_clock)
+    stage1_clock = bool(getattr(model, "clock", False))
 
     # ---- ATUS リハーサル用のイテレータ ----
     cond_idx, sched, weight, _ = sm.load_data()
+    tilt_summary: dict[str, float] = {}
+    if rehearsal == "tilt":
+        # ★学習分割の重みだけを群ごとに A* へ傾ける。held-out 群と val 分割は元のまま
+        weight, tilt_summary = tilted_rehearsal_weights(
+            cond_idx, sched, weight, np.asarray(tgt["group_rates_tbl"], dtype=np.float64),
+            teacher_groups, tilt_rho)
     train_loader, val_loader = sm.make_loaders(cond_idx, sched, weight)
 
     def atus_batches():
@@ -602,8 +760,17 @@ def run(steps: int = DEFAULT_STEPS,
         "d_sub": d_sub, "n": n, "K": K, "eps": eps, "loss": loss_kind,
         "chunk": chunk, "holdout": holdout or [], "seed": seed,
         "stage1_ckpt": stage1_ckpt.name,
-        "lr_cond": LR_COND, "lr_emb": LR_EMB, "lr_conv": LR_CONV,
+        "lr_cond": lr_cond, "lr_emb": lr_emb, "lr_conv": lr_conv,
+        # ★時刻符号なしの Stage 1 では lr_clock を使わないので NaN で残す（CSV 列を揃えるため）
+        "stage1_clock": stage1_clock,
+        "lr_clock": lr_clock if stage1_clock else float("nan"),
+        # ★構造の復元に使う（sm.arch_spec_from_ckpt）。倍音 K=48 と Transformer 型は重みの形が同じ
+        "arch": asdict(model.arch),
         "guidance_scale": sm.GUIDANCE_SCALE,
+        # ★従来のリハーサルでは tilt_* は NaN で残す（CSV 列を揃えるため）
+        "rehearsal": rehearsal,
+        "tilt_rho": tilt_rho if rehearsal == "tilt" else float("nan"),
+        **tilt_summary,
     }
 
     wandb_run = None
@@ -617,7 +784,8 @@ def run(steps: int = DEFAULT_STEPS,
     print(f"[stage2] steps={steps} d_sub={d_sub} n={n} K={K} eps={eps} loss={loss_kind} "
             f"chunk={chunk} ({n_pass}パス) teacher_groups={len(teacher_groups)}/28 device={dev}")
     print(f"[stage2] stage1={stage1_ckpt.name} guidance={sm.GUIDANCE_SCALE} "
-            f"lr cond={LR_COND:g} emb={LR_EMB:g} conv={LR_CONV:g} "
+            f"lr cond={lr_cond:g} emb={lr_emb:g} conv={lr_conv:g} "
+            f"clock={f'{lr_clock:g}' if stage1_clock else '（時刻符号なし）'} "
             f"val_every={val_every}")
 
     for step in range(start_step + 1, steps + 1):
@@ -665,7 +833,10 @@ def run(steps: int = DEFAULT_STEPS,
                         f"(warmup {len(lam_samples)}/{LAM_WARMUP_STEPS})")
 
         assert lam is not None      # lam_auto の分岐か呼び出し側が必ず与えている
-        (lam * l_atus).backward()
+        # ★集計側の勾配と λ·リハーサル側の勾配を別々に得て綱引きを測り、足し合わせる。
+        #   θ.grad は従来の (lam * l_atus).backward() とビット単位で同じ（add_rehearsal_grad の Note）
+        tug = add_rehearsal_grad([p for g in optimizer.param_groups for p in g["params"]],
+                                 lam * l_atus)
         total_gnorm = grad_norms(optimizer, "total")
         optimizer.step()
 
@@ -677,7 +848,7 @@ def run(steps: int = DEFAULT_STEPS,
                     "L_atus": l_atus_num, "lam": lam, "sec": time.time() - t0,
                     "rate_mae": float((a_full - a_star).abs().mean()),
                     "other_x_share": float(a_full[:, int(st.Common.OTHER_X)].mean()),
-                    **agg_gnorm, **total_gnorm, **x0_diag}
+                    **agg_gnorm, **total_gnorm, **x0_diag, **tug}
             # ★g の診断は二次形式のときだけ。loss_grad は split-batch の二乗誤差の
             #   勾配なので、jsd で回しているときに混ぜると別の損失の勾配を報告することになる
             if loss_kind != "jsd":
@@ -694,11 +865,13 @@ def run(steps: int = DEFAULT_STEPS,
             wandb_run.log(log)
         if step % 10 == 0 or step == start_step + 1:
             val_txt = (f"  val={log['L_atus_val']:.6f}" if "L_atus_val" in log else "")
+            # 群の並びは param_groups と同じ（時刻符号つきなら cond/emb/clock/conv）
+            gnorm_txt = "/".join(f"{log[f'agg_gnorm_{g['name']}']:.1e}"
+                                 for g in optimizer.param_groups)
             print(f"  step {step:4d}/{steps}  L_agg={log['L_agg']:+.6f}  "
                     f"L_atus={log['L_atus']:.6f}{val_txt}  rate_mae={log['rate_mae']:.5f}  "
-                    f"OTHER_X={log['other_x_share']:.4f}  |g_agg|="
-                    f"{log['agg_gnorm_cond']:.1e}/{log['agg_gnorm_emb']:.1e}/"
-                    f"{log['agg_gnorm_conv']:.1e}  "
+                    f"OTHER_X={log['other_x_share']:.4f}  |g_agg|={gnorm_txt}  "
+                    f"tug_cos={log['tug_cos']:+.3f}  "
                     f"floor={log['x0_floor_frac']:.3f}  {log['sec']:.1f}s")
 
         if step % save_every == 0 or step == steps:
@@ -742,7 +915,23 @@ def main() -> None:
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--smoke", action="store_true",
                     help="生成を短くして数更新だけ回す動作確認")
+    ap.add_argument("--lr-cond", type=float, default=LR_COND,
+                    help="群専用の条件パラメータ（cond_embeds / cond_proj / null_emb）の学習率")
+    ap.add_argument("--lr-emb", type=float, default=LR_EMB,
+                    help="emb_proj（拡散ステップと条件の共有注入路）の学習率")
+    ap.add_argument("--lr-conv", type=float, default=LR_CONV,
+                    help="conv / attention / GroupNorm の学習率")
+    ap.add_argument("--lr-clock", type=float, default=LR_CLOCK,
+                    help="clock_proj（時刻符号）の学習率。時刻符号つきの Stage 1 のときだけ使う")
+    ap.add_argument("--rehearsal", choices=list(REHEARSAL_KINDS), default="atus",
+                    help="リハーサルの個票の抽出。tilt は群ごとに A* へ傾けた重みで抽出する")
+    ap.add_argument("--tilt-rho", type=float, default=tl.DEFAULT_RHO,
+                    help="傾けのリッジの強さ。--rehearsal tilt のときだけ効く")
     args = ap.parse_args()
+    # 層別学習率とリハーサルの設定。smoke と本番の run に同じものを渡す
+    run_opts = {"lr_cond": args.lr_cond, "lr_emb": args.lr_emb,
+           "lr_conv": args.lr_conv, "lr_clock": args.lr_clock,
+           "rehearsal": args.rehearsal, "tilt_rho": args.tilt_rho}
 
     holdout: list[int] = []
     if args.holdout_groups.startswith("auto:"):
@@ -770,7 +959,8 @@ def main() -> None:
             ckpt_dir=args.ckpt_dir / "smoke",
             stage1_ckpt=args.stage1_ckpt,
             seed=args.seed,
-            use_wandb=False)
+            use_wandb=False,
+            **run_opts)
         print("stage2 smoke: OK")
         return
 
@@ -789,7 +979,8 @@ def main() -> None:
         stage1_ckpt=args.stage1_ckpt,
         resume=args.resume,
         seed=args.seed,
-        use_wandb=not args.no_wandb)
+        use_wandb=not args.no_wandb,
+        **run_opts)
 
 
 if __name__ == "__main__":
