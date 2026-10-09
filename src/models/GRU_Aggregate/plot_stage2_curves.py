@@ -8,6 +8,7 @@ GRU_Aggregate の Stage 2 の時刻別行動者率を描く（計画書 docs/sta
                                           その群を教師から外した fold（E2）の δ で生成した曲線（教師に使っていない群）
     stage2_gru_methods.png                全国の 12 活動で、δ を足す版と重みを更新する版（stage2_finetune.py）を並べる
     stage2_gru_methods_groups.png         同じく群ごと（その群を教師から外した fold）
+    （--tag を付けると、各ファイル名の .png の前に付く。例: stage2_gru_curves_h256.png）
 
 ★評価（stage2.evaluate）は生成した率を保存しないので、保存した δ（stage2.shift_path）または微調整した
   重み（stage2_finetune.ft_ckpt_path）から、評価と同じ乱数（stage2.EVAL_SEED）・同じ本数（stage2.EVAL_N）で
@@ -283,13 +284,14 @@ def main() -> None:
     matplotlib.use("Agg")
     ap = argparse.ArgumentParser(description="GRU_Aggregate の Stage 2 の時刻別行動者率の図")
     ap.add_argument("--methods", action="store_true", help="δ を足す版と重みを更新する版を並べた図も描く")
+    ap.add_argument("--tag", default="", help="図のファイル名の接尾辞（例: _h256）。既定は付けない")
     args = ap.parse_args()
     tgt = s2.st.load_stula_targets()
-    plot_national(tgt, FIG_DIR / "stage2_gru_curves.png")
-    plot_groups(tgt, FIG_DIR / "stage2_gru_curves_groups.png")
+    plot_national(tgt, FIG_DIR / f"stage2_gru_curves{args.tag}.png")
+    plot_groups(tgt, FIG_DIR / f"stage2_gru_curves_groups{args.tag}.png")
     if args.methods:
-        plot_methods(tgt, FIG_DIR / "stage2_gru_methods.png")
-        plot_methods_groups(tgt, FIG_DIR / "stage2_gru_methods_groups.png")
+        plot_methods(tgt, FIG_DIR / f"stage2_gru_methods{args.tag}.png")
+        plot_methods_groups(tgt, FIG_DIR / f"stage2_gru_methods_groups{args.tag}.png")
 
 
 if __name__ == "__main__":

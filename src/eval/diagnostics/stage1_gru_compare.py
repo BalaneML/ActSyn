@@ -10,6 +10,7 @@ GRU_Aggregate（再帰型＋交差エントロピー）と DDPM の Stage 1 を�
 比べるもの（ARM_SEEDS）:
 
     gru           本計画のモデル（g = 1.0）                       種 42〜46
+    gru_no_slot_bias  slot_bias なしの構造（計画書 §12、補正なし、g = 1.0）  種 42〜46
     gru_cal       gru の slot_bias を学習後に g = 1.0 で補正し、g = 1.0 で生成（計画書 §9）   種 42〜46
     gru_calg125   gru の slot_bias を学習後に g = 1.25 で補正し、g = 1.25 で生成（計画書 §9.5） 種 42〜46
     ddpm_tf96     clock_tf96（学習時のプール、g = 1.25）          種 42〜46
@@ -22,16 +23,22 @@ GRU_Aggregate（再帰型＋交差エントロピー）と DDPM の Stage 1 を�
     teacher     Q2 実データの履歴で条件付けた総量（teacher_forced_rates）と、自分で生成した総量の差
     guard       Q3 switch_emd / bigram_jsd / single_slot の差 / wrap_closure の差・暗記 → 判定 C3
     curves      Q4 12 活動の時刻別行動者率、‖実 − 生成‖²、代表点の値
-    mse         MSE を 4 通りの粒度で並べる（判定には使わない）
+                活動ごとの MAE・最大誤差（pt）とその時刻、活動ごとの Top-3 の 15 分区間（eval/slot_rate_errors.py）
+                床は 2 段（mse の床と同じ考え方）。どちらも種の本数ぶんの完全なモデルのプールを平均した曲線の 95% 分位
+                  下限側: ATUS 実からプールを引く（生成プールの有限さだけ）
+                  上限側: ATUS の回答者を復元抽出してからプールを引く（ATUS の標本誤差 + プール）
+    mse         MSE を 6 通りの粒度で並べる（判定には使わない）
                 curve_mse_us / curve_mse_jp : 28 群を米国加重 / 日本人口加重で 1 本にした曲線 vs ATUS 実
-                group_mse_atus              : 28 群ごとの値 vs ATUS 実（セルの単純平均）
+                group_mse_atus              : 28 群ごとの値 vs ATUS 実（全セル 28 × 12 × 96 の一様平均）
+                group_mse_atus_us / _jp     : 同じ全セルの 2 乗誤差を、群の重み（米国加重 / 日本人口加重）で平均
                 rate_mse_astar              : 28 群ごとの値 vs 日本の教師 A*（論文の rate_mse と同じ定義）
                 床: 完全なモデルでも出る MSE は floor_pool 〜 floor_real + floor_pool の間
     groups      群別（判定には使わない）。28 群ごとの MSE vs ATUS 実と群ごとの床、群の分離（separation_ratio）
     cfg         gru_cal の CFG の強さ g を CFG_SWEEP で振り、群別・総量・切替の指標を並べる（判定には使わない）
                 ★gru_cal の補正は g = 1.0 で行ったので、g ≠ 1 では総量が補正からずれうる
 
-判定（計画書 §4.3。結果を見る前に固定）。候補 CANDIDATES（gru / gru_cal / gru_calg125）のそれぞれにかける:
+判定（計画書 §4.3。結果を見る前に固定）。候補 CANDIDATES（gru / gru_no_slot_bias / gru_cal / gru_calg125）の
+それぞれにかける:
 
     C1  5 活動のうち C_MIN_ACTS 以上で、候補の総量の比の種間 sd ≤ ddpm_tf96 の種間 sd × C1_SD_RATIO
     C2  5 活動のうち C_MIN_ACTS 以上で、|候補の総量の比の種平均 − 1| ≤ 床
@@ -57,7 +64,10 @@ flowchart TD
     LP --> TCH
     LP --> GR["guard_long<br/>sel.guardrails / sm.memorization_report → C3"]
     LP --> CV["us_weighted_slot_rates<br/>(12, 96) → curve_table（Q4）"]
-    LP --> MS["mse_values<br/>4 通りの MSE"]
+    CV --> SE["curve_error_tables<br/>sre.activity_error_table / sre.topk_error_table"]
+    REAL --> PMC["perfect_model_curves<br/>floor_curves (N_FLOOR_POOL, 12, 96)<br/>下限側・上限側"]
+    PMC --> SE
+    LP --> MS["mse_values<br/>6 通りの MSE"]
     REAL --> MF["mse_floors<br/>floor_real / floor_pool"]
     MF --> MS
 ```
@@ -68,8 +78,9 @@ flowchart TD
     .venv/bin/python src/eval/diagnostics/stage1_gru_compare.py --part curves --gru-seeds 42   # 途中経過
 
 出力: data/processed/aggregates/stage1_gru_{totals_long,totals,trajectory_long,trajectory,teacher,guard_long,
-      guard,curves,mse_long,mse,groups_long,groups,cfg_long,cfg}.csv と
-      src/models/GRU_Aggregate/figures/stage1_gru_{totals,trajectory,curves,groups,cfg}.png
+      guard,curves,curve_errors,curve_topk,mse_long,mse,groups_long,groups,cfg_long,cfg}{tag}.csv と
+      src/models/GRU_Aggregate/figures/stage1_gru_{totals,trajectory,curves,curve_errors,groups,cfg}{tag}.png
+      {tag} は --tag の値（既定は空）
 """
 import argparse
 import contextlib
@@ -77,7 +88,7 @@ import importlib.util
 import io
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -87,6 +98,10 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[3]
 OUT_DIR = REPO_ROOT / "data" / "processed" / "aggregates"
 FIG_DIR = REPO_ROOT / "src" / "models" / "GRU_Aggregate" / "figures"
+# 出力のファイル名の接尾辞（--tag）。既定の空は H = 384 の報告（Stage1_gru_results.md）と同じ名前
+# ★gm の既定のパスは H = 128（2026-09-30 に切替。H = 384 は outputs/archive/gru_h384/）。
+#   H = 128 は --tag _h128 で回す。タグ無しで回すと、H = 384 の報告の表と図を H = 128 の値で上書きする
+OUT_TAG = ""
 
 FloatArr = npt.NDArray[np.float64]
 IntArr = npt.NDArray[np.int64]
@@ -108,6 +123,7 @@ def _load(name: str, path: Path) -> Any:
 
 rd: Any = _load("gru_cmp_rare_diagnosis", REPO_ROOT / "src" / "eval" / "diagnostics" / "stage1_rare_diagnosis.py")
 gm: Any = _load("gru_aggregate_model", REPO_ROOT / "src" / "models" / "GRU_Aggregate" / "model.py")
+sre: Any = _load("slot_rate_errors", REPO_ROOT / "src" / "eval" / "slot_rate_errors.py")
 rep: Any = rd.rep
 cur: Any = rd.cur
 sm: Any = rd.sm
@@ -121,6 +137,7 @@ FLOOR_Z: float = rd.FLOOR_Z
 # 比べるもの
 ARM_SEEDS: dict[str, tuple[int, ...]] = {
     "gru": (42, 43, 44, 45, 46),
+    "gru_no_slot_bias": (42, 43, 44, 45, 46),
     "gru_cal": (42, 43, 44, 45, 46),
     "gru_calg125": (42, 43, 44, 45, 46),
     "ddpm_tf96": (42, 43, 44, 45, 46),
@@ -130,13 +147,16 @@ DDPM_ARMS: dict[str, str] = {"ddpm_tf96": "clock_tf96", "ddpm_noclock": "noclock
 ARM_LABELS: dict[str, str] = {
     "gru": "GRU（g=1.0）",
     "gru_g1.25": "GRU（g=1.25）",
+    "gru_no_slot_bias": "GRU slot_bias なし（g=1.0）",
     "gru_cal": "GRU 補正後（g=1.0）",
     "gru_calg125": "GRU 補正後（g=1.25）",
     "ddpm_tf96": "DDPM Transformer 型（g=1.25）",
     "ddpm_noclock": "DDPM 時刻符号なし（g=1.25）",
+    "lstm": "LSTM（g=1.0）",
 }
 # 図の横軸の短い名前
-SHORT_LABELS: dict[str, str] = {"gru": "GRU", "gru_cal": "GRU\n補正後\ng=1.0", "gru_calg125": "GRU\n補正後\ng=1.25",
+SHORT_LABELS: dict[str, str] = {"gru": "GRU", "gru_no_slot_bias": "GRU\nslot_bias\nなし",
+                                "gru_cal": "GRU\n補正後\ng=1.0", "gru_calg125": "GRU\n補正後\ng=1.25",
                                 "ddpm_tf96": "DDPM\nTransformer\n型",
                                 "ddpm_noclock": "DDPM\n時刻符号\nなし"}
 # ★色は arm ごとに固定する（図によって系列の数が違っても同じ arm は同じ色）。
@@ -144,13 +164,18 @@ SHORT_LABELS: dict[str, str] = {"gru": "GRU", "gru_cal": "GRU\n補正後\ng=1.0"
 #   gru_cal の赤紫は、この 4 色の並びで validate_palette（色覚の検査）を通った色
 #   ★5 色目は検査を通る色が無かったので、GRU 補正後は g によらず同じ赤紫にし、印で分ける
 #     （ARM_HOLLOW の arm は白抜きの印。色 = モデルの種類、印 = 補正の g）
-ARM_COLOR: dict[str, str] = {"gru": "#2a78d6", "gru_cal": "#b5179e", "gru_calg125": "#b5179e",
-                             "ddpm_tf96": "#eb6834", "ddpm_noclock": "#1baf7a"}
+#   ★gru_no_slot_bias の紫は、gru の青との 2 色で validate_palette の全検査を通る（CVD ΔE 13.0・通常 16.3）。
+#     赤紫とは色覚の検査で近いので、両方を載せる図では横軸の位置と目盛りの名前で区別する
+ARM_COLOR: dict[str, str] = {"gru": "#2a78d6", "gru_no_slot_bias": "#4a3aa7",
+                             "gru_cal": "#b5179e", "gru_calg125": "#b5179e",
+                             "ddpm_tf96": "#eb6834", "ddpm_noclock": "#1baf7a", "lstm": "#11a3a3"}
+#   ★lstm の青緑は、gru の青・ddpm_tf96 の橙との 3 色で validate_palette の全検査を通る（CVD ΔE 15.1）。
+#     LSTM_Aggregate/eval_curves.py の図で使う
 ARM_HOLLOW: frozenset[str] = frozenset({"gru_cal"})
 # GRU 補正後の arm → (補正に使った g, 生成の g)
 GRU_CALIB: dict[str, tuple[float, float]] = {"gru_cal": (1.0, 1.0), "gru_calg125": (1.25, 1.25)}
 # 判定をかける候補
-CANDIDATES: tuple[str, ...] = ("gru", "gru_cal", "gru_calg125")
+CANDIDATES: tuple[str, ...] = ("gru", "gru_no_slot_bias", "gru_cal", "gru_calg125")
 # CFG の比較（種 42 のみ。判定には使わない）
 GRU_CFG_COMPARE = 1.25
 
@@ -167,15 +192,22 @@ DDPM_WINDOW: int = rd.H4_WINDOW                  # 最良 epoch ± 200
 GRU_WINDOW: int = gm.EARLY_STOP_PATIENCE         # 最良 epoch ± 30（早期終了が見た範囲）
 # MSE の床: 完全なモデルの生成プール（ATUS 実から群ごとに POOL_N 本を引く）を作る回数
 N_FLOOR_POOL = 50
-MSE_METRICS: tuple[str, ...] = ("curve_mse_us", "curve_mse_jp", "group_mse_atus", "rate_mse_astar")
+MSE_METRICS: tuple[str, ...] = ("curve_mse_us", "curve_mse_jp", "group_mse_atus", "group_mse_atus_us",
+                                "group_mse_atus_jp", "rate_mse_astar")
+# Q4 の誤差の表と図に並べる arm（plot_curves と同じ）
+CURVE_ERROR_ARMS: tuple[str, ...] = ("gru", "gru_calg125", "ddpm_tf96")
+FLOOR_BAND_COLOR = "#6f6e69"                     # 床の帯の灰色（plot_stage1_curves.COLOR_STULA と同じ）
 # 群別と CFG の強さ（判定には使わない）
 GROUP_FLOOR_SIMS = 50                            # 群ごとの床の見積もりの反復回数
 CFG_SWEEP: tuple[float, ...] = (1.0, 1.25, 1.5, 2.0)
 DDPM_TRAIN_G = 1.25                              # DDPM の学習時のプールの CFG の強さ
 DDPM_G1_SEEDS: tuple[int, ...] = (42, 43, 44)    # DDPM の g = 1.0 のプールがある種（H7 で作成）
 # 群ごとの表と図に並べる (arm, g)
-GROUP_ARMS: tuple[tuple[str, float], ...] = (("gru", 1.0), ("gru_cal", 1.0), ("gru_calg125", 1.25),
-                                             ("ddpm_tf96", 1.25))
+GROUP_ARMS: tuple[tuple[str, float], ...] = (("gru", 1.0), ("gru_no_slot_bias", 1.0), ("gru_cal", 1.0),
+                                             ("gru_calg125", 1.25), ("ddpm_tf96", 1.25))
+# 群ごとの図に並べる (arm, g)（gru_no_slot_bias は表だけ。紫と赤紫が隣り合うため）
+GROUP_PLOT_ARMS: tuple[tuple[str, float], ...] = (("gru", 1.0), ("gru_cal", 1.0), ("gru_calg125", 1.25),
+                                                  ("ddpm_tf96", 1.25))
 AGE_LABELS: tuple[str, ...] = ("15-24", "25-34", "35-44", "45-54", "55-64", "65-74", "75+")
 # 小プールの生成の乱数だけによる揺れを測る種の数（GRU 種 42 の最良の ckpt で引き直す）
 NOISE_DRAWS = 8
@@ -188,6 +220,8 @@ def pool_csv(arm: str, seed: int) -> Path:
     """arm と種の生成プール CSV（存在は確かめない）"""
     if arm == "gru":
         return gm.pool_path(seed)
+    if arm == "gru_no_slot_bias":
+        return gm.pool_path(seed, use_slot_bias=False)
     if arm == "gru_g1.25":
         return gm.pool_path(seed, GRU_CFG_COMPARE)
     if arm in GRU_CALIB:
@@ -200,6 +234,8 @@ def ckpt_file(arm: str, seed: int) -> Path:
     """arm と種の最良の ckpt"""
     if arm in GRU_CALIB:
         return gm.ckpt_path(seed, calib_guidance=GRU_CALIB[arm][0])
+    if arm == "gru_no_slot_bias":
+        return gm.ckpt_path(seed, use_slot_bias=False)
     if arm.startswith("gru"):
         return gm.ckpt_path(seed)
     return rep.ckpt_path(DDPM_ARMS[arm], seed)
@@ -663,8 +699,134 @@ def plot_curves(curves: dict[str, list[FloatArr]], real_curve: FloatArr, out: Pa
     print(f"[gru_compare] 図: {out}")
 
 
+def perfect_model_curves(real: People, pi_atus: FloatArr, n_seeds: int, resample_atus: bool,
+                         n_draws: int = N_FLOOR_POOL, seed: int = 0) -> FloatArr:
+    """完全なモデルの米国加重の時刻別行動者率を n_draws 回作る（Q4 の誤差の床）
+
+    Note:
+        ★1 回ぶん = 群ごとに gm.POOL_N 本を群内の TUFINLWGT で引いたプールを n_seeds 個作り、曲線を平均したもの
+        ★resample_atus = False: ATUS 実からそのまま引く（下限側。mse_floors の floor_pool と同じ）
+          resample_atus = True: 回ごとに ATUS の回答者を復元抽出してから引く（上限側。floor_real + floor_pool）
+        ★モデルの誤差は種平均の曲線で測るので、床も同じ本数の種を平均する
+
+    Args:
+        real: ATUS 実 (sched, d, w)
+        pi_atus: 群の重み, (28,)
+        n_seeds: 平均する種の本数（比べる arm の種の本数）
+        resample_atus: True なら回ごとに ATUS を復元抽出する
+        n_draws: 作る回数
+        seed: 乱数の種
+
+    Returns:
+        floor_curves, (n_draws, 12, 96)
+    """
+    sched, d, w = real
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(n_draws):
+        i = rng.integers(0, len(sched), len(sched)) if resample_atus else np.arange(len(sched))
+        sched_b, d_b, w_b = sched[i], d[i], w[i]
+        by_d = [np.flatnonzero(d_b == g) for g in range(sm.D_GROUPS)]
+        seed_curves = []
+        for _ in range(n_seeds):
+            pool = np.stack([sched_b[rng.choice(ix, gm.POOL_N, p=w_b[ix] / w_b[ix].sum())] for ix in by_d])
+            seed_curves.append(us_weighted_slot_rates(np.asarray(cur.pool_to_slot_rates(pool), dtype=np.float64),
+                                                      pi_atus))
+        out.append(np.mean(seed_curves, axis=0))
+    return np.asarray(out, dtype=np.float64)
+
+
+# 床の段の名前 → perfect_model_curves の resample_atus
+FLOOR_LEVELS: dict[str, bool] = {"low": False, "high": True}
+Floors = dict[str, dict[str, FloatArr]]          # 段の名前（low / high）→ sre.floor_errors の戻り値
+
+
+def curve_error_tables(curves: dict[str, list[FloatArr]], real_curve: FloatArr, real: People,
+                       pi_atus: FloatArr) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, Floors]]:
+    """arm ごとに活動ごとの誤差の表（MAE・最大誤差）と Top-k の表を作る
+
+    Note:
+        ★床は arm の種の本数ごとに作る（種 5 本と 3 本では種平均の雑音が違う）
+
+    Returns:
+        (列 arm + sre.activity_error_table の列, 列 arm + sre.topk_error_table の列,
+         種の本数 → 2 段の床)
+    """
+    floors: dict[int, Floors] = {}
+    act_rows, topk_rows = [], []
+    for arm, cs in curves.items():
+        n = len(cs)
+        if n not in floors:
+            floors[n] = {level: sre.floor_errors(real_curve, perfect_model_curves(real, pi_atus, n, resample))
+                         for level, resample in FLOOR_LEVELS.items()}
+        stack = np.asarray(cs, dtype=np.float64)
+        lo, hi = floors[n]["low"], floors[n]["high"]
+        act_rows.append(sre.activity_error_table(real_curve, stack, cur.ACT_NAMES, lo, hi).assign(arm=arm))
+        topk_rows.append(sre.topk_error_table(real_curve, stack, cur.ACT_NAMES, lo, hi).assign(arm=arm))
+
+    def _arm_first(df: pd.DataFrame) -> pd.DataFrame:
+        return cast(pd.DataFrame, df[["arm", *[c for c in df.columns if c != "arm"]]])
+    return _arm_first(pd.concat(act_rows, ignore_index=True)), _arm_first(pd.concat(topk_rows, ignore_index=True)), floors
+
+
+def plot_curve_errors(curves: dict[str, list[FloatArr]], real_curve: FloatArr, topk: pd.DataFrame,
+                      floors: dict[int, Floors], out: Path, arms: tuple[str, ...] = CURVE_ERROR_ARMS,
+                      band_seeds: int | None = None, colors: dict[str, str] | None = None,
+                      labels: dict[str, str] | None = None, ref_name: str = "実") -> None:
+    """12 活動の誤差（生成 − 実、pt）の曲線に、床の帯と Top-k の印を重ねる
+
+    Note:
+        ★線は種平均の曲線の誤差。灰色の帯は 15 分区間ごとの |誤差| の床（±、種 band_seeds 本の床。
+          None なら floors のうち種の本数が最大のもの）。濃い帯 = 下限側、薄い帯 = 上限側
+        ★丸印は arm ごとの Top-k の区間
+        ★活動ごとに y 軸を独立させる
+        ★colors / labels を渡さなければ ARM_COLOR / ARM_LABELS を使う。ref_name は縦軸の「生成 − {ref_name}」
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fm = rd._figure_module()
+    fm.setup_fonts()
+    colors = ARM_COLOR if colors is None else colors
+    labels = ARM_LABELS if labels is None else labels
+    arms = tuple(a for a in arms if a in curves)
+    n_band = max(floors) if band_seeds is None else band_seeds
+    band_lo, band_hi = floors[n_band]["low"]["slot_pt"], floors[n_band]["high"]["slot_pt"]   # (12, 96)
+    hours = cur.slot_hours()
+    fig, axes = plt.subplots(4, 3, figsize=(15, 13.2))
+    for c, name in enumerate(cur.ACT_NAMES):
+        ax = axes[c // 3][c % 3]
+        ax.fill_between(hours, -band_hi[c], band_hi[c], color=FLOOR_BAND_COLOR, alpha=0.12, lw=0,
+                        label=f"床の上限側（種 {n_band} 本）")
+        ax.fill_between(hours, -band_lo[c], band_lo[c], color=FLOOR_BAND_COLOR, alpha=0.30, lw=0,
+                        label=f"床の下限側（種 {n_band} 本）")
+        ax.axhline(0.0, color=fm.COLOR_ATUS, lw=0.8)
+        for arm in arms:
+            err = sre.error_pt(real_curve, np.asarray(curves[arm], dtype=np.float64)).mean(axis=0)
+            ax.plot(hours, err[c], color=colors[arm], lw=1.6, label=labels[arm],
+                    solid_capstyle="round", solid_joinstyle="round")
+            slots = _rows(topk, arm=arm, activity=name)["slot"].to_numpy(dtype=np.int64)
+            ax.scatter(hours[slots], err[c, slots], s=36, color=colors[arm], edgecolors="white",
+                       linewidths=1.2, zorder=3)
+        fm.style_axis(ax, 4.0, 28.0, 4.0)
+        ax.set_title(f"{cur.ACT_JA[name]}（{name}）", fontsize=11)
+        if c // 3 == 3:
+            ax.set_xlabel("時刻", fontsize=10)
+        if c % 3 == 0:
+            ax.set_ylabel(f"生成 − {ref_name}（pt）", fontsize=10)
+    fig.suptitle("12 活動の時刻別行動者率の誤差", fontsize=15, y=0.995)
+    handles, legend_labels = fig.axes[0].get_legend_handles_labels()
+    fig.legend(handles, legend_labels, loc="upper center", ncol=len(legend_labels), frameon=False,
+               bbox_to_anchor=(0.5, 0.972), fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.945))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"[gru_compare] 図: {out}")
+
+
 # ============================================================
-# MSE を 4 通りの粒度で（判定には使わない）
+# MSE を 6 通りの粒度で（判定には使わない）
 # ============================================================
 def mse_refs(real: People, pi_atus: FloatArr, tgt: dict) -> dict[str, FloatArr]:
     """ATUS 実の群別の値と、米国加重・日本人口加重の曲線（mse_values の基準）"""
@@ -673,10 +835,31 @@ def mse_refs(real: People, pi_atus: FloatArr, tgt: dict) -> dict[str, FloatArr]:
             "jp": np.asarray(cur.weighted_slot_rates(group, tgt), dtype=np.float64)}
 
 
-def mse_values(rates: FloatArr, refs: dict[str, FloatArr], pi_atus: FloatArr, tgt: dict) -> dict[str, float]:
-    """群別の時刻別行動者率 (28, 12, 96) の MSE を 4 通りで返す
+def group_weighted_mse(err2: FloatArr, pi_d: FloatArr) -> float:
+    """全セルの 2 乗誤差を、群の中で一様に平均してから群の重み pi_d で平均する
 
     Note:
+        ★pi_d が一様なら group_mse_atus（全セルの一様平均）と一致する（どの群も 12 × 96 セル）
+        ★NaN だけの群は除いて pi_d を正規化し直す（us_weighted_slot_rates と同じ扱い）
+
+    Args:
+        err2: セルごとの 2 乗誤差, (28, 12, 96)
+        pi_d: 群の重み, (28,)
+
+    Returns:
+        群の重みで平均した MSE
+    """
+    per_group = np.nanmean(err2, axis=(1, 2))                                     # (28,)
+    ok = ~np.isnan(per_group)
+    return float(np.sum(pi_d[ok] * per_group[ok]) / pi_d[ok].sum())
+
+
+def mse_values(rates: FloatArr, refs: dict[str, FloatArr], pi_atus: FloatArr, tgt: dict) -> dict[str, float]:
+    """群別の時刻別行動者率 (28, 12, 96) の MSE を 6 通りで返す
+
+    Note:
+        ★group_mse_atus_us / _jp の重みは、curve_mse_us / _jp で群を 1 本に畳む重みと同じ
+          （米国加重 pi_atus、日本人口加重 tgt["pop"] の比）
         ★rate_mse_astar は stage2_targets.eval_against と同じ（公表のあるセルの単純平均、mask_12act）。
           日米の生活の違いを含むので、Stage 1 の良し悪しの判定には使わない
 
@@ -689,10 +872,14 @@ def mse_values(rates: FloatArr, refs: dict[str, FloatArr], pi_atus: FloatArr, tg
     Returns:
         MSE_METRICS の各値
     """
+    err2 = (refs["group"] - rates) ** 2                                           # (28, 12, 96)
+    pop = np.asarray(tgt["pop"], dtype=np.float64).reshape(sm.D_GROUPS)
     return {
         "curve_mse_us": float(np.mean((refs["us"] - us_weighted_slot_rates(rates, pi_atus)) ** 2)),
         "curve_mse_jp": float(np.mean((refs["jp"] - cur.weighted_slot_rates(rates, tgt)) ** 2)),
-        "group_mse_atus": float(np.nanmean((refs["group"] - rates) ** 2)),
+        "group_mse_atus": float(np.nanmean(err2)),
+        "group_mse_atus_us": group_weighted_mse(err2, pi_atus),
+        "group_mse_atus_jp": group_weighted_mse(err2, pop / pop.sum()),
         "rate_mse_astar": float(st.eval_against(rates.reshape(sm.D_GROUPS, -1), tgt, st.mask_12act())["rate_mse"]),
     }
 
@@ -728,7 +915,7 @@ def mse_floors(real: People, pi_atus: FloatArr, tgt: dict, refs: dict[str, Float
 
 
 def mse_long(real: People, pi_atus: FloatArr, tgt: dict) -> pd.DataFrame:
-    """(arm, 種) ごとの 4 通りの MSE と、床・ATUS 実そのものの行
+    """(arm, 種) ごとの 6 通りの MSE と、床・ATUS 実そのものの行
 
     Returns:
         列 arm / seed / MSE_METRICS。arm = atus_real の行は ATUS 実そのもの（rate_mse_astar だけが意味を持つ）
@@ -824,6 +1011,8 @@ def pool_csv_g(arm: str, seed: int, g: float) -> Path:
     """arm・種・CFG の強さ g の生成プール CSV（存在は確かめない）"""
     if arm == "gru":
         return gm.pool_path(seed, g)
+    if arm == "gru_no_slot_bias":
+        return gm.pool_path(seed, g, use_slot_bias=False)
     if arm in GRU_CALIB:
         return gm.pool_path(seed, g, calib_guidance=GRU_CALIB[arm][0])
     label = DDPM_ARMS[arm] if g == DDPM_TRAIN_G else f"{DDPM_ARMS[arm]}@g{g:g}"
@@ -841,7 +1030,8 @@ def load_pool_g(arm: str, seed: int, g: float) -> IntArr:
 
 def group_runs() -> list[tuple[str, float, int]]:
     """群別・CFG の部で読む (arm, g, 種) の並び"""
-    runs = [("gru", 1.0, s) for s in ARM_SEEDS["gru"]]
+    runs = [("gru", g, s) for g in (1.0, GRU_CFG_COMPARE) for s in ARM_SEEDS["gru"]]
+    runs += [("gru_no_slot_bias", g, s) for g in (1.0, GRU_CFG_COMPARE) for s in ARM_SEEDS["gru_no_slot_bias"]]
     runs += [("gru_cal", g, s) for g in CFG_SWEEP for s in ARM_SEEDS["gru_cal"]]
     runs += [("gru_calg125", 1.25, s) for s in ARM_SEEDS["gru_calg125"]]
     runs += [("ddpm_tf96", DDPM_TRAIN_G, s) for s in ARM_SEEDS["ddpm_tf96"]]
@@ -946,7 +1136,7 @@ def plot_groups(table: pd.DataFrame, out: Path) -> None:
     fig, ax = plt.subplots(figsize=(15, 5.2))
     xs = np.arange(len(table))
     ax.axhline(1.0, color="#8f8f8b", lw=1.2)
-    for k, (arm, g) in enumerate(GROUP_ARMS):
+    for k, (arm, g) in enumerate(GROUP_PLOT_ARMS):
         ax.plot(xs + (k - 1.5) * 0.18, table[f"{arm}@g{g:g}_ratio"], "o", color=ARM_COLOR[arm], ms=7,
                 markerfacecolor="white" if arm in ARM_HOLLOW else ARM_COLOR[arm],
                 markeredgecolor=ARM_COLOR[arm] if arm in ARM_HOLLOW else "white",
@@ -958,7 +1148,7 @@ def plot_groups(table: pd.DataFrame, out: Path) -> None:
     ax.grid(axis="y", color="#e6e6e3", lw=0.6)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.13), ncol=len(GROUP_ARMS), frameon=False, fontsize=10)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.13), ncol=len(GROUP_PLOT_ARMS), frameon=False, fontsize=10)
     fig.suptitle("群ごとの MSE", y=1.02, fontsize=13)
     fig.tight_layout()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1034,9 +1224,9 @@ def run_totals() -> None:
         print(f"[{cand}] C2（|比 − 1| ≤ 床、{_count(summary, f'{cand}_c2_pass')}/5 活動）: "
               f"{'合格' if verdict['C2'] else '不合格'}")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    long.to_csv(OUT_DIR / "stage1_gru_totals_long.csv", index=False)
-    summary.to_csv(OUT_DIR / "stage1_gru_totals.csv", index=False)
-    plot_totals(long, summary, FIG_DIR / "stage1_gru_totals.png")
+    long.to_csv(out_csv("totals_long"), index=False)
+    summary.to_csv(out_csv("totals"), index=False)
+    plot_totals(long, summary, out_fig("totals"))
 
 
 def run_trajectory() -> None:
@@ -1046,9 +1236,9 @@ def run_trajectory() -> None:
     long = trajectory_long(pi_atus, real_prof)
     summary = trajectory_summary(long, pi_atus, real_prof)
     _show("Q1 途中の ckpt の総量の比（64 人/群）", summary)
-    long.to_csv(OUT_DIR / "stage1_gru_trajectory_long.csv", index=False)
-    summary.to_csv(OUT_DIR / "stage1_gru_trajectory.csv", index=False)
-    plot_trajectory(long, FIG_DIR / "stage1_gru_trajectory.png")
+    long.to_csv(out_csv("trajectory_long"), index=False)
+    summary.to_csv(out_csv("trajectory"), index=False)
+    plot_trajectory(long, out_fig("trajectory"))
 
 
 def run_teacher() -> None:
@@ -1058,7 +1248,7 @@ def run_teacher() -> None:
     _show("Q2 総量: 実データの履歴で条件付けた予測（tf）と自分で生成した値", table)
     agg = table.groupby(["arm", "activity"], sort=False)[["gen_minus_tf", "gen_over_tf"]].agg(["mean", "std"])
     print(agg.to_string())
-    table.to_csv(OUT_DIR / "stage1_gru_teacher.csv", index=False)
+    table.to_csv(out_csv("teacher"), index=False)
 
 
 def run_guard() -> None:
@@ -1070,8 +1260,8 @@ def run_guard() -> None:
     _show("Q3 種の最大値と C3", summary)
     for cand, ok in c3.items():
         print(f"[{cand}] C3（4 指標で候補の最大 ≤ noclock の最大、暗記 0 本）: {'合格' if ok else '不合格'}")
-    long.to_csv(OUT_DIR / "stage1_gru_guard_long.csv", index=False)
-    summary.to_csv(OUT_DIR / "stage1_gru_guard.csv", index=False)
+    long.to_csv(out_csv("guard_long"), index=False)
+    summary.to_csv(out_csv("guard"), index=False)
 
 
 def run_curves() -> None:
@@ -1081,25 +1271,31 @@ def run_curves() -> None:
     curves = arm_curves(pi_atus)
     table = curve_table(curves, real_curve)
     _show("Q4 ‖実 − 生成‖²（活動ごと）と代表点", table)
-    table.to_csv(OUT_DIR / "stage1_gru_curves.csv", index=False)
-    plot_curves(curves, real_curve, FIG_DIR / "stage1_gru_curves.png")
+    table.to_csv(out_csv("curves"), index=False)
+    plot_curves(curves, real_curve, out_fig("curves"))
+    errors, topk, floors = curve_error_tables(curves, real_curve, real, pi_atus)
+    _show("Q4 活動ごとの MAE・最大誤差（pt、種平均の曲線）と床", errors)
+    _show(f"Q4 活動ごとの Top-{sre.TOP_K} の 15 分区間（pt）", topk)
+    errors.to_csv(out_csv("curve_errors"), index=False)
+    topk.to_csv(out_csv("curve_topk"), index=False)
+    plot_curve_errors(curves, real_curve, topk, floors, out_fig("curve_errors"))
 
 
 def run_mse() -> None:
-    """MSE を 4 通りの粒度で並べる"""
+    """MSE を 6 通りの粒度で並べる"""
     real, pi_atus, _ = setup()
     tgt = cur.st.load_stula_targets()
     long = mse_long(real, pi_atus, tgt)
     summary = mse_summary(long)
     with pd.option_context("display.width", 200, "display.float_format", "{:.3e}".format):
-        print("\n=== MSE（4 通りの粒度）===")
+        print("\n=== MSE（6 通りの粒度）===")
         print(summary.to_string(index=False))
-    for k in MSE_METRICS[:3]:
+    for k in (m for m in MSE_METRICS if m != "rate_mse_astar"):          # 床は ATUS 実と比べる指標だけ
         lo = float(_rows(summary, arm="floor_pool", metric=k)["mean"].iloc[0])
         hi = lo + float(_rows(summary, arm="floor_real", metric=k)["mean"].iloc[0])
         print(f"完全なモデルの {k}: {lo:.3e} 〜 {hi:.3e}")
-    long.to_csv(OUT_DIR / "stage1_gru_mse_long.csv", index=False)
-    summary.to_csv(OUT_DIR / "stage1_gru_mse.csv", index=False)
+    long.to_csv(out_csv("mse_long"), index=False)
+    summary.to_csv(out_csv("mse"), index=False)
 
 
 def run_groups_and_cfg() -> None:
@@ -1117,12 +1313,22 @@ def run_groups_and_cfg() -> None:
         print("\n=== CFG の強さ（(arm, g) ごとの種平均・最小・最大）===")
         print(cfg.to_string(index=False))
     print(f"完全なモデルの separation_ratio: 平均 {sep_ref.mean():.3f}（{sep_ref.min():.3f}〜{sep_ref.max():.3f}）")
-    long.to_csv(OUT_DIR / "stage1_gru_groups_long.csv", index=False)
-    table.to_csv(OUT_DIR / "stage1_gru_groups.csv", index=False)
-    runs.to_csv(OUT_DIR / "stage1_gru_cfg_long.csv", index=False)
-    cfg.to_csv(OUT_DIR / "stage1_gru_cfg.csv", index=False)
-    plot_groups(table, FIG_DIR / "stage1_gru_groups.png")
-    plot_cfg(runs, sep_ref, FIG_DIR / "stage1_gru_cfg.png")
+    long.to_csv(out_csv("groups_long"), index=False)
+    table.to_csv(out_csv("groups"), index=False)
+    runs.to_csv(out_csv("cfg_long"), index=False)
+    cfg.to_csv(out_csv("cfg"), index=False)
+    plot_groups(table, out_fig("groups"))
+    plot_cfg(runs, sep_ref, out_fig("cfg"))
+
+
+def out_csv(name: str) -> Path:
+    """表の出力先 data/processed/aggregates/stage1_gru_{name}{OUT_TAG}.csv"""
+    return OUT_DIR / f"stage1_gru_{name}{OUT_TAG}.csv"
+
+
+def out_fig(name: str) -> Path:
+    """図の出力先 src/models/GRU_Aggregate/figures/stage1_gru_{name}{OUT_TAG}.png"""
+    return FIG_DIR / f"stage1_gru_{name}{OUT_TAG}.png"
 
 
 PARTS = {"totals": run_totals, "trajectory": run_trajectory, "teacher": run_teacher,
@@ -1136,7 +1342,10 @@ def main() -> None:
     ap.add_argument("--part", choices=[*PARTS, "all"], required=True)
     ap.add_argument("--gru-seeds", type=int, nargs="+", default=None,
                     help="GRU の種を絞る（学習が揃う前の途中経過用。判定 C1〜C3 は既定の 5 本で出す）")
+    ap.add_argument("--tag", default="", help="出力の表と図のファイル名の接尾辞（例: _h256）。既定は付けない")
     args = ap.parse_args()
+    global OUT_TAG
+    OUT_TAG = args.tag
     if args.gru_seeds is not None:
         ARM_SEEDS["gru"] = tuple(args.gru_seeds)
     for name, fn in PARTS.items():
