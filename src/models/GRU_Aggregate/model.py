@@ -17,6 +17,11 @@ model.py
     ★厳密には、学習で条件を落とした行（確率 P_UNCOND）の予測を含めた混合で成り立つ。
       学習後の実測は teacher_forced_gap で出す（ckpt の config では calib_gap_max / calib_gap_mean）
 
+slot_bias なしの構造（計画書 §12、--no-slot-bias）:
+    slot_bias を 0 に固定し、定数成分は out_proj の bias（活動ごとの 12 個、時刻によらない）が持つ。
+    勾配が 0 の点で一致するのは Σ_s Σ_i w_i p_θ[i, s, c] = Σ_s Σ_i w_i 1[a_{i,s} = c]（96 スロットの和）だけになる。
+    学習後の slot_bias の補正はできない
+
 学習後の slot_bias の補正（計画書 §9、--calibrate）:
     交差エントロピーが縛るのは「実データの履歴で予測した総量」だけで、自分で生成した総量は種ごとに揺れる。
     そこで学習後に、生成した総量 gen が学習分割の行動者率 target に合うよう slot_bias だけを反復で動かす:
@@ -35,6 +40,8 @@ flowchart LR
     X --> GRU["gru<br/>GRU(HIDDEN, HIDDEN, NUM_LAYERS)"]
     GRU --> OUT["out_proj(h) + slot_bias<br/>logits (B, S, 12)"]
 ```
+
+    ★use_slot_bias=False（--no-slot-bias）では slot_bias は 0 の buffer で、out_proj は bias（12）を持つ
 
 学習と生成:
 
@@ -63,6 +70,9 @@ flowchart TD
     .venv/bin/python src/models/GRU_Aggregate/model.py --seed 42 --calibrate                   # g = 1.0 → _cal
     .venv/bin/python src/models/GRU_Aggregate/model.py --seed 42 --calibrate --guidance 1.25   # → _calg1.25
 
+    # slot_bias なしの構造で学習して生成プールを書く（計画書 §12）
+    .venv/bin/python src/models/GRU_Aggregate/model.py --seed 42 --no-slot-bias
+
     フラグ:
         --seed S       : 学習の乱数の種（既定 42）。分割は変えない。42 以外は保存先に _s{S}
         --epochs N     : 学習 epoch の上限（既定 EPOCHS=300）
@@ -72,6 +82,8 @@ flowchart TD
         --pool-only    : 学習せず、保存済みの ckpt から生成プールだけを作る
         --calibrate    : 学習せず、保存済みの ckpt の slot_bias を --guidance の g で補正して、補正した ckpt と
                          生成プール（同じ g）を書く。接尾辞は g = 1.0 なら _cal、それ以外は _calg{G}
+        --no-slot-bias : slot_bias なしの構造（計画書 §12）。学習・--pool-only・--smoke に効く。
+                         保存先の stem の直後に _no_slot_bias を付ける。--calibrate とは併用できない
         --smoke        : 短時間の動作確認
 
 出力:
@@ -81,6 +93,8 @@ flowchart TD
     outputs/checkpoints/gru_aggregate{接尾辞}{補正}.pt              slot_bias を補正した ckpt（config に補正の記録）
     outputs/generated/gru_aggregate_samples{接尾辞}{補正}{_gG}.csv  補正した ckpt の生成プール
         {補正} = _cal（g = 1.0 で補正）/ _calg1.25（g = 1.25 で補正）。{_gG} は生成の g（1.0 なら付けない）
+    outputs/checkpoints/gru_aggregate_no_slot_bias{接尾辞}.pt          slot_bias なしの構造（--no-slot-bias）
+    outputs/generated/gru_aggregate_samples_no_slot_bias{接尾辞}{_gG}.csv
 """
 import argparse
 import copy
@@ -131,8 +145,9 @@ NUM_ACT: int = sm.NUM_ACT            # 12（共通 12 分類）
 D_GROUPS: int = sm.D_GROUPS          # 28
 BOS = NUM_ACT                        # s = 0 の直前の活動の代わりに入れる記号
 
-# 構造。H=384 でパラメータ 182.9 万（比べる DDPM clock_tf96 は 187.7 万）
-HIDDEN = 384
+# 構造。H=128 でパラメータ 21.7 万（比べる DDPM clock_tf96 は 187.7 万）。
+# ★当初の H=384（182.9 万、DDPM と揃えた値）から、幅と weight decay の掃引で変えた（計画書 §10）
+HIDDEN = 128
 NUM_LAYERS = 2
 # 生成するスロットの時刻符号。DDPM の clock_tf96 と同じ Transformer 型 96 次元の φ
 TIME_ARCH: Any = sm.ArchSpec(clock_kind="transformer")
@@ -146,7 +161,8 @@ GUIDANCE_SCALE = 1.0
 
 # 学習
 LR = 1e-3
-WEIGHT_DECAY = 0.0
+# 重み行列だけに掛ける（slot_bias と 1 次元のパラメータには掛けない。param_groups）。掃引で選んだ値（計画書 §10）
+WEIGHT_DECAY = 1.0
 GRAD_CLIP = 1.0
 BATCH_SIZE = 256
 EPOCHS = 300
@@ -169,6 +185,7 @@ CALIB_SEED = 20000                   # 反復 k のプールの種は CALIB_SEED
 CALIB_STEP = 0.5
 CALIB_EPS = 1e-4                     # 行動者率 0 のセルで log を発散させない値
 CALIB_TAG = "_cal"                   # 補正した ckpt・プールの接尾辞（g ≠ 1.0 で補正したものは _calg{G}）
+NO_SLOT_BIAS_TAG = "_no_slot_bias"   # slot_bias なしの構造の ckpt・プールの接尾辞（計画書 §12）
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu"
 
@@ -200,11 +217,11 @@ def make_loader(part: SplitPart, shuffle: bool) -> DataLoader:
 
     Note:
         ★DDPM は TUFINLWGT に比例した復元抽出でミニバッチを作る。ここでは全員を使い、
-          損失を重みで掛ける。学習の目標は同じ分布で、少ない活動の行動者を毎 epoch 必ず見る
+            損失を重みで掛ける。学習の目標は同じ分布で、少ない活動の行動者を毎 epoch 必ず見る
     """
     ds = TensorDataset(torch.as_tensor(part.cond_idx, dtype=torch.long),
-                       torch.as_tensor(part.sched, dtype=torch.long),
-                       torch.as_tensor(part.weight, dtype=torch.float32))
+                        torch.as_tensor(part.sched, dtype=torch.long),
+                        torch.as_tensor(part.weight, dtype=torch.float32))
     return DataLoader(ds, batch_size=BATCH_SIZE, shuffle=shuffle)
 
 
@@ -226,27 +243,34 @@ class GRUScheduler(nn.Module):
     Note:
         1. 生成するスロットの時刻 φ[s] を、そのステップだけの入力として足す（time_proj）
         2. slot_bias（96 × 12）が総量を縛る仕組みの本体。φ の線形写像では各スロットの任意の値を
-           作れない（Transformer 型 96 次元でも独立な成分は 34 個）ので、自由なバイアスを持つ
-        3. out_proj は零初期化する。学習前の予測は softmax(slot_bias) = 行動者率になる（init_slot_bias）
+            作れない（Transformer 型 96 次元でも独立な成分は 34 個）ので、自由なバイアスを持つ
+        3. out_proj は零初期化する。学習前の予測は softmax(slot_bias) = 行動者率になる（init_output_bias）
+        4. use_slot_bias=False（計画書 §12）では slot_bias を 0 の buffer にして forward・step を共有し、
+            out_proj に bias（12）を持たせる。学習前の予測は 1 日平均の活動シェア（全スロットで同じ）になる
 
     Attributes:
         hidden: 隠れ層の幅 H
         num_layers: GRU の層数
+        use_slot_bias: slot_bias を学習するか。False なら slot_bias は 0 に固定した buffer
         phi: 時刻符号 φ, (96 スロット, 96 次元)。保存しない buffer（sm.time_features から毎回作る）
+        slot_bias: スロット × 活動のバイアス, (96, 12)。use_slot_bias=False では 0 の buffer
     """
 
     phi: torch.Tensor
+    slot_bias: torch.Tensor
 
-    def __init__(self, hidden: int = HIDDEN, num_layers: int = NUM_LAYERS) -> None:
+    def __init__(self, hidden: int = HIDDEN, num_layers: int = NUM_LAYERS, use_slot_bias: bool = True) -> None:
         """部品を作る
 
         Args:
-            hidden: 隠れ層の幅 H, default=HIDDEN=384
+            hidden: 隠れ層の幅 H, default=HIDDEN=128
             num_layers: GRU の層数, default=NUM_LAYERS=2
+            use_slot_bias: slot_bias を学習するか, default=True。False は計画書 §12 の構造
         """
         super().__init__()
         self.hidden = hidden
         self.num_layers = num_layers
+        self.use_slot_bias = use_slot_bias
         self.act_embed = nn.Embedding(NUM_ACT + 1, hidden)               # 12 活動 + BOS
         self.register_buffer("phi", sm.time_features(TIME_ARCH).T.contiguous(), persistent=False)
         self.time_proj = nn.Linear(TIME_ARCH.clock_dim, hidden)
@@ -254,22 +278,33 @@ class GRUScheduler(nn.Module):
         self.cond_proj = nn.Linear(sum(sm.EMB_DIMS), hidden)
         self.cond_null = nn.Parameter(torch.zeros(hidden))
         self.gru = nn.GRU(hidden, hidden, num_layers=num_layers, batch_first=True)
-        # 定数成分は slot_bias が持つので bias は付けない
-        self.out_proj = nn.Linear(hidden, NUM_ACT, bias=False)
+        # 定数成分は slot_bias が持つので bias は付けない。slot_bias なしの構造では out_proj の bias が持つ
+        self.out_proj = nn.Linear(hidden, NUM_ACT, bias=not use_slot_bias)
         nn.init.zeros_(self.out_proj.weight)
-        self.slot_bias = nn.Parameter(torch.zeros(NUM_SLOTS, NUM_ACT))
+        if use_slot_bias:
+            self.slot_bias = nn.Parameter(torch.zeros(NUM_SLOTS, NUM_ACT))
+        else:
+            self.register_buffer("slot_bias", torch.zeros(NUM_SLOTS, NUM_ACT))
 
     @torch.no_grad()
-    def init_slot_bias(self, rates: torch.Tensor) -> None:
-        """slot_bias を log(行動者率) で初期化する（学習の初期を速めるため。§3.2 の一致には影響しない）
+    def init_output_bias(self, rates: torch.Tensor) -> None:
+        """出力のバイアスを log(行動者率) で初期化する（学習の初期を速めるため。§3.2 の一致には影響しない）
+
+        Note:
+            use_slot_bias=True なら slot_bias[s, c] = log(rates[c, s])。
+            False なら out_proj.bias[c] = log(rates[c] の 96 スロット平均)（1 日平均の活動シェア）
 
         Args:
             rates: スロットごとの行動者率, (NUM_ACT, NUM_SLOTS)。sm.population_rates の戻り値
         """
-        self.slot_bias.copy_(rates.T.clamp_min(RATE_FLOOR).log().to(self.slot_bias))
+        if self.use_slot_bias:
+            self.slot_bias.copy_(rates.T.clamp_min(RATE_FLOOR).log().to(self.slot_bias))
+            return
+        assert self.out_proj.bias is not None
+        self.out_proj.bias.copy_(rates.mean(dim=1).clamp_min(RATE_FLOOR).log().to(self.out_proj.bias))
 
     def embed_cond(self, cond_idx: torch.Tensor | None, batch: int,
-                   drop_mask: torch.Tensor | None = None) -> torch.Tensor:
+                    drop_mask: torch.Tensor | None = None) -> torch.Tensor:
         """条件（性・年齢・就業）を埋め込む, -> (B, HIDDEN)
 
         Args:
@@ -302,8 +337,8 @@ class GRUScheduler(nn.Module):
         """
         batch, length = a_prev.shape
         x = (self.act_embed(a_prev)
-             + self.time_proj(self.phi[:length])[None]
-             + self.embed_cond(cond_idx, batch, drop_mask)[:, None, :])     # (B, S, H)
+                + self.time_proj(self.phi[:length])[None]
+                + self.embed_cond(cond_idx, batch, drop_mask)[:, None, :])     # (B, S, H)
         h, _ = self.gru(x)
         return self.out_proj(h) + self.slot_bias[:length]
 
@@ -382,8 +417,35 @@ def run_epoch(model: GRUScheduler, loader: DataLoader,
     return total / wsum
 
 
+def param_groups(model: GRUScheduler, weight_decay: float) -> list[dict[str, Any]]:
+    """AdamW のパラメータ群。weight decay は重み行列（Linear・GRU・Embedding）だけに掛ける
+
+    Note:
+        1. ★slot_bias には掛けない。掛けると学習が止まった点で slot_bias の勾配が 0 にならず、
+           §3.2 の一致（予測確率の加重平均 = 行動者率）が崩れる。slot_bias は log(行動者率) の値
+           （−14〜0）を持つので、0 へ引くと少ない活動ほど logits が持ち上がる
+        2. 1 次元のパラメータ（bias・cond_null）にも掛けない（慣例どおり）。slot_bias なしの構造の
+           out_proj.bias もこちらに入る
+
+    Args:
+        model: 学習するモデル
+        weight_decay: 重み行列に掛ける AdamW の weight decay
+
+    Returns:
+        [{"params": 重み行列, "weight_decay": weight_decay}, {"params": slot_bias と 1 次元, "weight_decay": 0}]
+    """
+    decay: list[nn.Parameter] = []
+    no_decay: list[nn.Parameter] = []
+    for name, p in model.named_parameters():
+        (no_decay if name == "slot_bias" or p.ndim < 2 else decay).append(p)
+    return [{"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0}]
+
+
 def train(epochs: int = EPOCHS, seed: int = SEED, save_path: Path | None = MODEL_SAVE_PATH,
-          save_every: int = SAVE_EVERY, device: str = DEVICE) -> tuple[GRUScheduler, dict[str, list[float]]]:
+          save_every: int = SAVE_EVERY, device: str = DEVICE, hidden: int = HIDDEN,
+          weight_decay: float = WEIGHT_DECAY,
+          use_slot_bias: bool = True) -> tuple[GRUScheduler, dict[str, list[float]]]:
     """学習し、val の重み付き交差エントロピーが最良の重みのモデルを返す
 
     Args:
@@ -392,6 +454,9 @@ def train(epochs: int = EPOCHS, seed: int = SEED, save_path: Path | None = MODEL
         save_path: 最良の ckpt の保存先。None なら何も保存しない
         save_every: 正なら N epoch ごとに sm.epoch_ckpt_path(save_path, ep) へ保存する, default=SAVE_EVERY=5
         device: 学習するデバイス, default=DEVICE
+        hidden: 隠れ層の幅 H, default=HIDDEN
+        weight_decay: 重み行列に掛ける weight decay（param_groups）, default=WEIGHT_DECAY
+        use_slot_bias: slot_bias を学習するか, default=True。False は計画書 §12 の構造
 
     Returns:
         (最良の重みを戻したモデル, 学習曲線 {"epoch", "train", "val", "sec"})
@@ -408,12 +473,13 @@ def train(epochs: int = EPOCHS, seed: int = SEED, save_path: Path | None = MODEL
 
     torch.manual_seed(seed)
     train_part, val_part = load_split()
-    model = GRUScheduler().to(device)
-    model.init_slot_bias(sm.population_rates(train_part.sched, train_part.weight))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    model = GRUScheduler(hidden=hidden, use_slot_bias=use_slot_bias).to(device)
+    model.init_output_bias(sm.population_rates(train_part.sched, train_part.weight))
+    optimizer = torch.optim.AdamW(param_groups(model, weight_decay), lr=LR)
     train_loader = make_loader(train_part, shuffle=True)
     val_loader = make_loader(val_part, shuffle=False)
     print(f"device={device}  train={len(train_part.sched)}  val={len(val_part.sched)}  "
+          f"hidden={hidden}  weight_decay={weight_decay:g}  use_slot_bias={use_slot_bias}  "
           f"params={count_params(model):,}", flush=True)
 
     history: dict[str, list[float]] = {"epoch": [], "train": [], "val": [], "sec": []}
@@ -430,7 +496,8 @@ def train(epochs: int = EPOCHS, seed: int = SEED, save_path: Path | None = MODEL
         if ep == 1 or ep % 5 == 0:
             print(f"epoch {ep:4d} | train {tr:.5f} | val {va:.5f} | {sec:.1f}s", flush=True)
         if save_path is not None and save_every > 0 and ep % save_every == 0:
-            save_ckpt(model, sm.epoch_ckpt_path(save_path, ep), seed, epoch=ep)
+            save_ckpt(model, sm.epoch_ckpt_path(save_path, ep), seed, epoch=ep,
+                      extra={"weight_decay": weight_decay})
         if va < best_val - EARLY_STOP_MIN_DELTA:
             best_val, best_epoch, no_improve = va, ep, 0
             best_state = copy.deepcopy(model.state_dict())
@@ -447,7 +514,7 @@ def train(epochs: int = EPOCHS, seed: int = SEED, save_path: Path | None = MODEL
           f"calibration gap on train: max {gap['max']:.2e}, mean {gap['mean']:.2e}", flush=True)
     if save_path is not None:
         save_ckpt(model, save_path, seed, extra={
-            "best_epoch": best_epoch, "best_val": best_val, "stopped_epoch": ep,
+            "weight_decay": weight_decay, "best_epoch": best_epoch, "best_val": best_val, "stopped_epoch": ep,
             "calib_gap_max": gap["max"], "calib_gap_mean": gap["mean"], "history": history})
         print(f"saved model to {save_path}")
     return model, history
@@ -471,6 +538,7 @@ def save_ckpt(model: GRUScheduler, path: Path, seed: int, epoch: int | None = No
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     config: dict[str, Any] = {"hidden": model.hidden, "num_layers": model.num_layers,
+                              "use_slot_bias": model.use_slot_bias,
                               "time_encoding": TIME_ARCH.clock_kind, "seed": seed}
     if epoch is not None:
         config["epoch"] = epoch
@@ -480,10 +548,15 @@ def save_ckpt(model: GRUScheduler, path: Path, seed: int, epoch: int | None = No
 
 
 def load_model(path: Path, device: str = DEVICE) -> GRUScheduler:
-    """save_ckpt で保存した ckpt から、同じ構造のモデルを eval モードで戻す"""
+    """save_ckpt で保存した ckpt から、同じ構造のモデルを eval モードで戻す
+
+    Note:
+        ★config に use_slot_bias が無い ckpt（計画書 §12 より前）は slot_bias ありの構造
+    """
     ckpt = torch.load(path, map_location=device)
     cfg = ckpt["config"]
-    model = GRUScheduler(hidden=cfg["hidden"], num_layers=cfg["num_layers"]).to(device)
+    model = GRUScheduler(hidden=cfg["hidden"], num_layers=cfg["num_layers"],
+                         use_slot_bias=cfg.get("use_slot_bias", True)).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model
@@ -688,7 +761,12 @@ def calibrate_slot_bias(model: GRUScheduler, target: FloatArr, pi_d: FloatArr,
     Returns:
         反復ごとの記録 [{"iter", "max_abs_gap", "mean_abs_gap", "total_ratio"（12 活動の 生成 / 目標）}]。
         長さは iters + 1
+
+    Raises:
+        ValueError: slot_bias なしの構造（use_slot_bias=False）のとき
     """
+    if not model.use_slot_bias:
+        raise ValueError("slot_bias なしの構造（計画書 §12）は補正できない")
     history: list[dict[str, Any]] = []
     for k in range(iters + 1):
         gen = generated_rates(group_pool(model, n_per_group, guidance_scale, seed=seed + k), pi_d)
@@ -737,23 +815,48 @@ def calib_tag(calib_guidance: float | None) -> str:
     return CALIB_TAG if calib_guidance == GUIDANCE_SCALE else f"{CALIB_TAG}g{calib_guidance:g}"
 
 
-def ckpt_path(seed: int, calib_guidance: float | None = None) -> Path:
-    """最良の ckpt のパス。calib_guidance を渡すと、その g で slot_bias を補正した ckpt"""
+def structure_tag(use_slot_bias: bool, calib_guidance: float | None) -> str:
+    """構造の接尾辞。slot_bias ありは空、なしは NO_SLOT_BIAS_TAG
+
+    Raises:
+        ValueError: slot_bias なしの構造に calib_guidance を渡したとき（補正できない構造）
+    """
+    if use_slot_bias:
+        return ""
+    if calib_guidance is not None:
+        raise ValueError("slot_bias なしの構造（計画書 §12）に補正した ckpt・プールは無い")
+    return NO_SLOT_BIAS_TAG
+
+
+def ckpt_path(seed: int, calib_guidance: float | None = None, use_slot_bias: bool = True) -> Path:
+    """最良の ckpt のパス
+
+    Args:
+        seed: 学習の種
+        calib_guidance: 渡すと、その g で slot_bias を補正した ckpt
+        use_slot_bias: False なら slot_bias なしの構造の ckpt（計画書 §12）
+    """
+    arch = structure_tag(use_slot_bias, calib_guidance)
     cal = calib_tag(calib_guidance)
-    return MODEL_SAVE_PATH.with_name(f"{MODEL_SAVE_PATH.stem}{run_suffix(seed)}{cal}{MODEL_SAVE_PATH.suffix}")
+    return MODEL_SAVE_PATH.with_name(
+        f"{MODEL_SAVE_PATH.stem}{arch}{run_suffix(seed)}{cal}{MODEL_SAVE_PATH.suffix}")
 
 
-def pool_path(seed: int, guidance_scale: float = GUIDANCE_SCALE, calib_guidance: float | None = None) -> Path:
+def pool_path(seed: int, guidance_scale: float = GUIDANCE_SCALE, calib_guidance: float | None = None,
+              use_slot_bias: bool = True) -> Path:
     """生成プールの CSV のパス
 
     Args:
         seed: 学習の種
         guidance_scale: 生成の CFG の強さ。既定以外なら _g{G} を付ける
         calib_guidance: 補正した ckpt のプールなら、補正に使った g（calib_tag の接尾辞を付ける）
+        use_slot_bias: False なら slot_bias なしの構造のプール（計画書 §12）
     """
+    arch = structure_tag(use_slot_bias, calib_guidance)
     cal = calib_tag(calib_guidance)
     tag = "" if guidance_scale == GUIDANCE_SCALE else f"_g{guidance_scale:g}"
-    return GEN_SAVE_PATH.with_name(f"{GEN_SAVE_PATH.stem}{run_suffix(seed)}{cal}{tag}{GEN_SAVE_PATH.suffix}")
+    return GEN_SAVE_PATH.with_name(
+        f"{GEN_SAVE_PATH.stem}{arch}{run_suffix(seed)}{cal}{tag}{GEN_SAVE_PATH.suffix}")
 
 
 def write_pool(model: GRUScheduler, path: Path, guidance_scale: float) -> None:
@@ -765,9 +868,9 @@ def write_pool(model: GRUScheduler, path: Path, guidance_scale: float) -> None:
           f"{time.perf_counter() - t0:.1f}s) to {path}", flush=True)
 
 
-def smoke() -> None:
+def smoke(use_slot_bias: bool = True) -> None:
     """2 epoch 学習し、生成と teacher forcing の行動者率の形を確かめる（何も保存しない）"""
-    model, history = train(epochs=2, save_path=None, save_every=0)
+    model, history = train(epochs=2, save_path=None, save_every=0, use_slot_bias=use_slot_bias)
     assert len(history["val"]) == 2 and all(math.isfinite(v) for v in history["val"])
     for g in (GUIDANCE_SCALE, 1.25):
         pool = group_pool(model, 2, g)
@@ -788,23 +891,27 @@ def main() -> None:
     ap.add_argument("--no-pool", action="store_true")
     ap.add_argument("--pool-only", action="store_true")
     ap.add_argument("--calibrate", action="store_true")
+    ap.add_argument("--no-slot-bias", action="store_true")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     if args.no_pool and args.pool_only:
         ap.error("--no-pool と --pool-only は併用できない")
     if args.calibrate and (args.pool_only or args.no_pool):
         ap.error("--calibrate は --pool-only / --no-pool と併用できない")
+    if args.calibrate and args.no_slot_bias:
+        ap.error("--calibrate は --no-slot-bias と併用できない（補正する slot_bias が無い）")
+    use_slot_bias = not args.no_slot_bias
 
-    ckpt = ckpt_path(args.seed)
-    pool = pool_path(args.seed, args.guidance)
+    ckpt = ckpt_path(args.seed, use_slot_bias=use_slot_bias)
+    pool = pool_path(args.seed, args.guidance, use_slot_bias=use_slot_bias)
     if args.calibrate:                        # 補正は読み込む ckpt と書く ckpt・プールが別
         pool = pool_path(args.seed, args.guidance, calib_guidance=args.guidance)
         print(f"[config] calibrated ckpt={ckpt_path(args.seed, calib_guidance=args.guidance).name}")
     print(f"[config] seed={args.seed} epochs={args.epochs} save_every={args.save_every} "
-          f"guidance={args.guidance:g}")
+          f"guidance={args.guidance:g} use_slot_bias={use_slot_bias}")
     print(f"[config] ckpt={ckpt.name}  pool={pool.name}")
     if args.smoke:
-        smoke()
+        smoke(use_slot_bias)
         return
     if args.calibrate:
         run_calibration(args.seed, args.guidance)
@@ -812,7 +919,8 @@ def main() -> None:
     if args.pool_only:
         model = load_model(ckpt)
     else:
-        model, _ = train(epochs=args.epochs, seed=args.seed, save_path=ckpt, save_every=args.save_every)
+        model, _ = train(epochs=args.epochs, seed=args.seed, save_path=ckpt, save_every=args.save_every,
+                         use_slot_bias=use_slot_bias)
     if not args.no_pool:
         write_pool(model, pool, args.guidance)
 

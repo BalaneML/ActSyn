@@ -4,14 +4,19 @@ GRU_Aggregate の単体テスト（計画書 §7）
     a. 因果性      : スロット s の logits が a_{≥s} に依存しない。step を 96 回回すと forward と同じ logits になる
     b. 損失        : weighted_ce が手で書いた重み付き交差エントロピーと一致する
     c. 総量の仕組み : slot_bias の勾配が Σ_i w_i (p − y) / (96 Σ w) と一致する。
-                     学習前（out_proj 零初期化）の予測が init_slot_bias に渡した行動者率と一致する
+                     学習前（out_proj 零初期化）の予測が init_output_bias に渡した行動者率と一致する
     d. CFG         : 条件を落とした行は cond_idx=None と一致する。g = 1.0 の CFG は条件付きの logits と一致する
     e. 生成        : 同じ種で再現する。値域は [0, 12)。draw_categorical の頻度が確率に合う。
                      write_pool_csv → load_sample_pool で往復する
     f. teacher forcing の行動者率 : teacher_forced_rates が手で計算した加重平均と一致する（分割して通しても同じ）
-    g. 保存と読み込み : 同じ構造・同じ出力が戻る。本番の幅でパラメータ数が 1,829,064
+    g. 保存と読み込み : 同じ構造・同じ出力が戻る。本番の幅（H = 128）でパラメータ数が 217,288
     h. slot_bias の補正（§9） : 履歴に依らない分布なら bias_update の 1 回で目標に一致する。
                      generated_rates が手計算と一致する。calibrate_slot_bias は slot_bias だけを変える
+    i. weight decay の範囲（§10） : param_groups は slot_bias と 1 次元のパラメータに weight decay を掛けない。
+                     weight decay だけを効かせた 1 step で、slot_bias は動かず重み行列は縮む
+    j. slot_bias なしの構造（§12） : slot_bias は 0 の buffer で学習しない。out_proj.bias の勾配が
+                     Σ_i w_i Σ_s (p − y) / (96 Σ w) と一致する。学習前の予測は全スロットで 1 日平均の活動シェア。
+                     step と forward が一致する。保存と読み込みで構造が戻る。補正と補正の保存先は ValueError
 
 ★ out_proj は零初期化なので、そのままでは logits が slot_bias だけになり a・d が何も測れない。
   _wake_up で out_proj を小さな乱数で埋めてから測る（テスト用の細工で、学習経路は変えない）。
@@ -124,7 +129,7 @@ def test_slot_bias_gradient() -> None:
     # 学習前: out_proj が零なので softmax(slot_bias) = 行動者率（和が 1 なら log の往復で戻る）
     fresh = gm.GRUScheduler(hidden=SMALL)
     rates = gm.sm.population_rates(sched.numpy(), weight.double().numpy())          # (12, 96)
-    fresh.init_slot_bias(rates)
+    fresh.init_output_bias(rates)
     tf = gm.teacher_forced_rates(fresh, sched.numpy(), cond.numpy(), weight.double().numpy())
     floor = rates.clamp_min(gm.RATE_FLOOR)
     target = (floor / floor.sum(0, keepdim=True)).double().numpy()
@@ -215,7 +220,7 @@ def test_save_load() -> None:
     assert back.hidden == SMALL and back.num_layers == gm.NUM_LAYERS and not back.training
     with torch.no_grad():
         assert torch.equal(back(gm.shift_right(sched), cond), m(gm.shift_right(sched), cond))
-    assert gm.count_params(gm.GRUScheduler()) == 1_829_064
+    assert gm.count_params(gm.GRUScheduler()) == 217_288          # H = 128（計画書 §10）
     assert gm.ckpt_path(42).name == "gru_aggregate.pt" and gm.ckpt_path(43).name == "gru_aggregate_s43.pt"
     assert gm.pool_path(42, 1.25).name == "gru_aggregate_samples_g1.25.csv"
     assert gm.ckpt_path(43, calib_guidance=1.0).name == "gru_aggregate_s43_cal.pt"
@@ -256,6 +261,98 @@ def test_calibration() -> None:
     print("  h. slot_bias の補正（1 回で目標に一致・slot_bias だけを変える）: OK")
 
 
+def test_param_groups() -> None:
+    """i. weight decay は重み行列だけに掛かり、slot_bias と 1 次元のパラメータには掛からない"""
+    m = _model()
+    decay, no_decay = gm.param_groups(m, 0.5)
+    assert decay["weight_decay"] == 0.5 and no_decay["weight_decay"] == 0.0
+    ids = {name: id(p) for name, p in m.named_parameters()}
+    decay_ids = {id(p) for p in decay["params"]}
+    no_decay_ids = {id(p) for p in no_decay["params"]}
+    assert decay_ids.isdisjoint(no_decay_ids) and decay_ids | no_decay_ids == set(ids.values()), "漏れか重複がある"
+    assert ids["slot_bias"] in no_decay_ids, "slot_bias に weight decay が掛かっている"
+    assert ids["cond_null"] in no_decay_ids and ids["gru.bias_hh_l0"] in no_decay_ids
+    assert ids["out_proj.weight"] in decay_ids and ids["act_embed.weight"] in decay_ids
+
+    # 勾配 0 で 1 step: AdamW の更新は weight decay だけになる
+    opt = torch.optim.AdamW(gm.param_groups(m, 0.5), lr=0.1)
+    before = {k: v.detach().clone() for k, v in m.named_parameters()}
+    for p in m.parameters():
+        p.grad = torch.zeros_like(p)
+    opt.step()
+    after = dict(m.named_parameters())
+    assert torch.equal(after["slot_bias"], before["slot_bias"]), "weight decay で slot_bias が動いた"
+    assert torch.allclose(after["out_proj.weight"], before["out_proj.weight"] * (1 - 0.1 * 0.5))
+    print("  i. weight decay の範囲（slot_bias と 1 次元には掛けない）: OK")
+
+
+def test_no_slot_bias() -> None:
+    """j. slot_bias なしの構造: 0 の buffer・out_proj.bias の勾配・学習前の予測・step・保存・補正の禁止"""
+    torch.manual_seed(0)
+    m = gm.GRUScheduler(hidden=SMALL, use_slot_bias=False)
+    names = {name for name, _ in m.named_parameters()}
+    assert "slot_bias" not in names and "out_proj.bias" in names, f"パラメータの構成が違う: {sorted(names)}"
+    assert torch.equal(m.slot_bias, torch.zeros(gm.NUM_SLOTS, gm.NUM_ACT))
+    assert gm.count_params(gm.GRUScheduler(use_slot_bias=False)) == 217_288 - gm.NUM_SLOTS * gm.NUM_ACT + gm.NUM_ACT
+    no_decay = {id(p) for p in gm.param_groups(m, 0.5)[1]["params"]}
+    assert m.out_proj.bias is not None and id(m.out_proj.bias) in no_decay, "out_proj.bias に weight decay が掛かる"
+
+    # 学習前: out_proj.weight が零なので、全スロットで softmax(out_proj.bias) = 1 日平均の活動シェア
+    cond, sched, weight = _inputs()
+    rates = gm.sm.population_rates(sched.numpy(), weight.double().numpy())          # (12, 96)
+    m.init_output_bias(rates)
+    tf = gm.teacher_forced_rates(m, sched.numpy(), cond.numpy(), weight.double().numpy())
+    share = rates.mean(dim=1).clamp_min(gm.RATE_FLOOR)
+    share = (share / share.sum()).double().numpy()
+    assert np.allclose(tf, np.repeat(share[:, None], gm.NUM_SLOTS, axis=1), atol=1e-6), "学習前の予測がシェアと違う"
+
+    # ∂L/∂out_proj.bias = Σ_i w_i Σ_s (p − y) / (96 Σ w)（スロットの和だけを縛る）
+    g = torch.Generator().manual_seed(1)
+    with torch.no_grad():
+        m.out_proj.weight.copy_(torch.randn(m.out_proj.weight.shape, generator=g) * 0.5)
+    m.train(False)
+    loss = gm.batch_loss(m, cond, sched, weight)
+    loss.backward()
+    with torch.no_grad():
+        p = torch.softmax(m(gm.shift_right(sched), cond), dim=-1)                   # (B, 96, 12)
+        y = F.one_hot(sched, gm.NUM_ACT).float()
+        expected = (weight[:, None, None] * (p - y)).sum(dim=(0, 1)) / (gm.NUM_SLOTS * weight.sum())
+    assert m.out_proj.bias.grad is not None
+    err = float((m.out_proj.bias.grad - expected).abs().max())
+    assert err < 1e-7, f"out_proj.bias の勾配が式と違う (最大差 {err:.2e})"
+
+    # step の繰り返しは forward と一致する
+    with torch.no_grad():
+        logits = m(gm.shift_right(sched), cond)
+        c_emb = m.embed_cond(cond, cond.size(0))
+        a_prev = gm.shift_right(sched)
+        state = None
+        for s in range(gm.NUM_SLOTS):
+            ls, state = m.step(a_prev[:, s], s, c_emb, state)
+            assert torch.allclose(ls, logits[:, s], atol=1e-5), f"step と forward がスロット {s} で違う"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "gru.pt"
+        gm.save_ckpt(m, path, seed=7)
+        back = gm.load_model(path, DEVICE)
+    assert not back.use_slot_bias and "slot_bias" not in {n for n, _ in back.named_parameters()}
+    with torch.no_grad():
+        assert torch.equal(back(gm.shift_right(sched), cond), logits)
+
+    assert gm.ckpt_path(42, use_slot_bias=False).name == "gru_aggregate_no_slot_bias.pt"
+    assert gm.ckpt_path(43, use_slot_bias=False).name == "gru_aggregate_no_slot_bias_s43.pt"
+    assert gm.pool_path(43, 1.25, use_slot_bias=False).name == "gru_aggregate_samples_no_slot_bias_s43_g1.25.csv"
+    for call in (lambda: gm.ckpt_path(42, calib_guidance=1.0, use_slot_bias=False),
+                 lambda: gm.calibrate_slot_bias(m, rates.double().numpy(), np.full(gm.D_GROUPS, 1 / gm.D_GROUPS),
+                                                iters=1, n_per_group=1, verbose=False)):
+        try:
+            call()
+        except ValueError:
+            continue
+        raise AssertionError("slot_bias なしの構造で補正が通った")
+    print(f"  j. slot_bias なしの構造（out_proj.bias の勾配 最大差 {err:.1e}）: OK")
+
+
 if __name__ == "__main__":
     print("GRU_Aggregate tests")
     test_causality()
@@ -266,4 +363,6 @@ if __name__ == "__main__":
     test_teacher_forced_rates()
     test_save_load()
     test_calibration()
+    test_param_groups()
+    test_no_slot_bias()
     print("test_model: OK")
