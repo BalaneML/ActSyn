@@ -558,21 +558,21 @@ def test_agg_loss() -> None:
     y = _fake_onehot(q, n, gen)
 
     # (g) Ã 側も各 (群,時刻) で12チャネルの和が1（one-hot の平均なので厳密）
-    a_A, a_B = sl.group_rates_split(y, n)
-    for a in (a_A, a_B):
+    a_hat_1, a_hat_2 = sl.group_rates_split(y, n)
+    for a in (a_hat_1, a_hat_2):
         assert a.shape == (d_sub, sm.NUM_ACT, sm.NUM_SLOTS)
         assert float((a.sum(dim=1) - 1.0).abs().max()) == 0.0
     print("  (1) (g) Ã の12チャネル和が厳密に 1: OK")
 
     # A と B は重ならない（同じ本が両方の半分に入らない）
     grouped = y.view(d_sub, n, sm.NUM_ACT, sm.NUM_SLOTS)
-    assert torch.equal(a_A, grouped[:, :n // 2].mean(dim=1))
-    assert torch.equal(a_B, grouped[:, n // 2:].mean(dim=1))
+    assert torch.equal(a_hat_1, grouped[:, :n // 2].mean(dim=1))
+    assert torch.equal(a_hat_2, grouped[:, n // 2:].mean(dim=1))
     print("  (2) A/B が群ごとに前半・後半へ重なりなく分かれる: OK")
 
     # (i) ε=inf の χ² が素の MSE と一致する ＝ 1本のコードで両方走る
     w_inf = sl.chi2_weights(q, float("inf"))
-    plain = ((a_A - q) * (a_B - q)).mean()
+    plain = ((a_hat_1 - q) * (a_hat_2 - q)).mean()
     assert torch.allclose(sl.agg_loss(y, q, w_inf, n), plain, atol=0, rtol=0)
     print("  (3) (i) ε=inf の損失値が素の MSE と厳密一致: OK")
 
@@ -615,8 +615,8 @@ def test_split_batch_unbiased() -> None:
     split_vals, naive_vals = [], []
     for _ in range(reps):
         y = _fake_onehot(p, n, gen)
-        a_A, a_B = sl.group_rates_split(y, n)
-        split_vals.append(float(sl.agg_loss_from_rates(a_A, a_B, q, omega)))
+        a_hat_1, a_hat_2 = sl.group_rates_split(y, n)
+        split_vals.append(float(sl.agg_loss_from_rates(a_hat_1, a_hat_2, q, omega)))
         a_full = y.view(d_sub, n, sm.NUM_ACT, sm.NUM_SLOTS).mean(dim=1)
         naive_vals.append(float(((a_full - q) ** 2 * omega).mean()))
 
@@ -647,23 +647,23 @@ def test_loss_grad_and_diagnostics() -> None:
     omega = sl.chi2_weights(q, 0.01)
     gen = torch.Generator().manual_seed(3)
     y = _fake_onehot(q, n, gen)
-    a_A, a_B = sl.group_rates_split(y, n)
+    a_hat_1, a_hat_2 = sl.group_rates_split(y, n)
 
-    lhs_A = a_A.clone().requires_grad_(True)
-    lhs_B = a_B.clone().requires_grad_(True)
-    sl.agg_loss_from_rates(lhs_A, lhs_B, q, omega).backward()
-    g_A, g_B = sl.loss_grad(a_A, a_B, q, omega)
-    assert lhs_A.grad is not None and lhs_B.grad is not None
-    assert float((g_A - lhs_A.grad).abs().max()) < 1e-9, "g_A が autograd と一致しない"
-    assert float((g_B - lhs_B.grad).abs().max()) < 1e-9, "g_B が autograd と一致しない"
+    lhs_1 = a_hat_1.clone().requires_grad_(True)
+    lhs_2 = a_hat_2.clone().requires_grad_(True)
+    sl.agg_loss_from_rates(lhs_1, lhs_2, q, omega).backward()
+    g_1, g_2 = sl.loss_grad(a_hat_1, a_hat_2, q, omega)
+    assert lhs_1.grad is not None and lhs_2.grad is not None
+    assert float((g_1 - lhs_1.grad).abs().max()) < 1e-9, "g_1 が autograd と一致しない"
+    assert float((g_2 - lhs_2.grad).abs().max()) < 1e-9, "g_2 が autograd と一致しない"
     print("  (1) loss_grad の解析形が autograd と一致: OK")
 
     # ★A半分に流す勾配は B半分の誤差で決まる（split-batch の帰結）
     scale = d_sub * sm.NUM_ACT * sm.NUM_SLOTS      # 群・活動・時刻の3軸とも平均
-    assert torch.allclose(g_A, omega * (a_B - q) / scale)
-    print("  (2) g_A が B半分の誤差で決まる: OK")
+    assert torch.allclose(g_1, omega * (a_hat_2 - q) / scale)
+    print("  (2) g_1 が B半分の誤差で決まる: OK")
 
-    diag = sl.g_diagnostics(g_A, q, n, act_names=sm.ACT_NAMES)
+    diag = sl.g_diagnostics(g_1, q, n, act_names=sm.ACT_NAMES)
     for key in ("g_abs_mean", "g_abs_max", "g_frac_negligible",
                 "g_share_unidentifiable", "g_sign_pos_frac"):
         assert key in diag and math.isfinite(diag[key]), key
@@ -1585,8 +1585,8 @@ def test_two_pass_matches_full_batch() -> None:
         model.zero_grad(set_to_none=True)
         x0 = diff._sample_tail(model, x_K, K, cond, zs=zs)
         y = sm.straight_through(x0)
-        a_A, a_B = sl.group_rates_split(y, n)
-        ref_loss = sl.agg_loss_from_rates(a_A, a_B, q, omega)
+        a_hat_1, a_hat_2 = sl.group_rates_split(y, n)
+        ref_loss = sl.agg_loss_from_rates(a_hat_1, a_hat_2, q, omega)
         ref_loss.backward()
         ref = _grads(model)
         ref_val = float(ref_loss.detach())
@@ -1608,10 +1608,10 @@ def test_two_pass_matches_full_batch() -> None:
         for chunk in (total, 12, 6, 1):
             model.zero_grad(set_to_none=True)
             torch.manual_seed(7)          # zs と x_T を参照と同じに引き直す
-            loss, got_A, got_B, diag = ft._aggregate_step_two_pass(
+            loss, got_1, got_2, diag = ft._aggregate_step_two_pass(
                 diff, model, cond, K, n, q, omega, chunk, 1.0)
             assert abs(loss - ref_val) < 1e-6, f"損失が一致しない (chunk={chunk})"
-            assert torch.equal(got_A, a_A.detach()) and torch.equal(got_B, a_B.detach())
+            assert torch.equal(got_1, a_hat_1.detach()) and torch.equal(got_2, a_hat_2.detach())
             absd, rel = _max_grad_diff(_grads(model), ref)
             # float32 の丸め誤差レベル。設計書 §2.9 の実測は 5.96e-08（絶対）
             assert rel < 1e-5, f"勾配が一致しない (chunk={chunk}): 相対 {rel:.2e}"

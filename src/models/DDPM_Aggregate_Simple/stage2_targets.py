@@ -333,7 +333,7 @@ def eval_against(mu_hat: np.ndarray, tgt: dict,
       E[(ā − A*)²] = (E[ā] − A*)² + Var(ā) で、第2項に生成側のモンテカルロ雑音が
       床として残る。実測で n=2000 のとき rate_mae 換算 0.00271（zero-shot 比 9.6%）
       あり、λ 掃引で見たい差と同じ桁になる。独立な2つの半分から
-      E[(ā_A − A*)(ā_B − A*)] = (E[ā] − A*)² を推定すればこの項が落ちる。
+      E[(Â_1 − A*)(Â_2 − A*)] = (E[ā] − A*)² を推定すればこの項が落ちる。
       λ パレート曲線の横軸はこちらを使う。MAE は絶対値が非線形で同じ手が
       使えないため、rate_mae は補助として残す。
 
@@ -341,7 +341,7 @@ def eval_against(mu_hat: np.ndarray, tgt: dict,
         mu_hat: 群別行動者率 μ̂, dtype=float64, (D, 12*96) act-major
         tgt: 教師。group_rates_tbl (D,12,96) と pop (D,) を持つ
         mask_c: 採点対象の活動, dtype=bool, (12,)
-        mu_hat_split: プールを群ごとに二分して作った (μ̂_A, μ̂_B)。各 (D, 12*96)。
+        mu_hat_split: プールを群ごとに二分して作った (Â_1, Â_2)。各 (D, 12*96)。
             2つが独立であることが不偏性の条件で、群をまたいで分けると成立しない。
             None なら rate_mse_split を返さない, default=None
 
@@ -349,7 +349,7 @@ def eval_against(mu_hat: np.ndarray, tgt: dict,
         指標の dict。rate_mae / rate_mse / rate_rmse / max_abs_err / dev_mae /
         dev_rmse / n_cells / mask と、活動別の mae_* / rmse_* / rel_*。
         mu_hat_split を渡した場合は rate_mse_split を追加する。
-        ★rate_mse_split は負になりうる。ā_A と ā_B の誤差の符号が逆のセルでは
+        ★rate_mse_split は負になりうる。Â_1 と Â_2 の誤差の符号が逆のセルでは
         積が負になるためで、期待値が bias² で下限0なのは変わらない
         （推定量の分散が見えているだけ）。したがって平方根は取らない。
     """
@@ -394,7 +394,7 @@ def eval_against(mu_hat: np.ndarray, tgt: dict,
            **per_act}
 
     # ★学習側 stage2_loss.agg_loss_from_rates を ω=1 で呼んだ式と同一である
-    #   （L = mean (ā_A − A*)(ā_B − A*)）。あちらは torch、ここは numpy で、
+    #   （L = mean (Â_1 − A*)(Â_2 − A*)）。あちらは torch、ここは numpy で、
     #   さらに NaN セルと mask_c 外を m で除外する点だけが違う。
     if mu_hat_split is not None:
         mh_a = mu_hat_split[0].reshape(n_d, NUM_COMMON, NUM_SLOTS)

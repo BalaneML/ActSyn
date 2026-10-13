@@ -49,8 +49,8 @@ flowchart TB
                 O2["x0 = diffusion.sample_differentiable(model, cond, K, zs) :765"]
                 O3["diag = _x0_diagnostics(x0) :357<br/>x0_floor_frac / x0_max / st_p_max_mean"]
                 O4["y = sm.straight_through(x0, tau=1.0) :785<br/>前向きは one-hot、後ろ向きは softmax の微分"]
-                O5["a_A, a_B = sl.group_rates_split(y, n) :87<br/>群ごとに前半 n/2 と後半 n/2 へ二分"]
-                O6["l_agg = sl.agg_loss_from_rates(a_A, a_B, a_star, omega) :123<br/>((a_A - A*)*(a_B - A*)*omega).mean() — 群 d・活動 c・時刻 s の3軸とも平均"]
+                O5["a_hat_1, a_hat_2 = sl.group_rates_split(y, n) :87<br/>群ごとに前半 n/2 と後半 n/2 へ二分"]
+                O6["l_agg = sl.agg_loss_from_rates(a_hat_1, a_hat_2, a_star, omega) :123<br/>((a_hat_1 - A*)*(a_hat_2 - A*)*omega).mean() — 群 d・活動 c・時刻 s の3軸とも平均"]
                 O7["l_agg.backward()"]
                 O1 --> O2 --> O3 --> O4 --> O5 --> O6 --> O7
             end
@@ -59,8 +59,8 @@ flowchart TB
                 direction TB
                 T1["zs = _draw_tail_noise(total, K, dev)<br/>★1パス側でも同じ順で引く。chunk で軌跡が変わらないため"]
                 T2["x_K = diffusion._sample_head(model, cond, K) :720<br/>t = 999 から K まで no_grad で進める<br/>★2パス間で唯一キャッシュするテンソル"]
-                T3["no_grad で _sample_tail → _x0_diagnostics → straight_through → y<br/>a_A, a_B = sl.group_rates_split(y, n)<br/>l_agg = float(sl.agg_loss_from_rates(...))"]
-                T4["g_A, g_B = sl.loss_grad(a_A, a_B, a_star, omega) :194<br/>g_A = omega*(a_B - A*)/scale, scale = |D_sub|*12*96 (交差ペア)<br/>g_per = sl.per_sample_grad(g_A, g_B, n) :215 → (B,12,96)"]
+                T3["no_grad で _sample_tail → _x0_diagnostics → straight_through → y<br/>a_hat_1, a_hat_2 = sl.group_rates_split(y, n)<br/>l_agg = float(sl.agg_loss_from_rates(...))"]
+                T4["g_1, g_2 = sl.loss_grad(a_hat_1, a_hat_2, a_star, omega) :194<br/>g_1 = omega*(a_hat_2 - A*)/scale, scale = |D_sub|*12*96 (交差ペア)<br/>g_per = sl.per_sample_grad(g_1, g_2, n) :215 → (B,12,96)"]
                 T5["for start in range(0, total, chunk):<br/>x0_c = _sample_tail(model, x_K[start:end], K, cond[start:end], zs_c) :739<br/>末尾 K ステップだけ再計算 (ここだけグラフを作る)"]
                 T6["y_c = sm.straight_through(x0_c, tau)<br/>y_c.backward(gradient=g_per[start:end])<br/>キャッシュした上流勾配を VJP として注入<br/>start を chunk ずつ進めて T5 と T6 を繰り返す"]
                 T1 --> T2 --> T3 --> T4 --> T5 --> T6
@@ -83,7 +83,7 @@ flowchart TB
 
         GN2["total_gnorm = grad_norms(optimizer, 'total') :669<br/>集計側 + リハーサル側を足した後の勾配ノルム<br/>★agg との比が「集計がどれだけ効いているか」そのもの"]
         UPD["optimizer.step() :670"]
-        LOG["ログ :673-702<br/>a_full = 0.5*(a_A + a_B)<br/>rate_mae, other_x_share, agg_gnorm, total_gnorm, x0_diag<br/>sl.g_diagnostics(g_A, a_star, n) :258 (jsd では呼ばない)"]
+        LOG["ログ :673-702<br/>a_full = 0.5*(a_hat_1 + a_hat_2)<br/>rate_mae, other_x_share, agg_gnorm, total_gnorm, x0_diag<br/>sl.g_diagnostics(g_1, a_star, n) :258 (jsd では呼ばない)"]
         VAL["val_every ごとに L_atus_val = val_epsilon_mse(...) :690 / :453<br/>ATUS val 分割の ε-MSE。固定 seed で毎回同じ (t, ε)<br/>★大域 RNG を退避・復元するので学習の乱数列を汚さない<br/>300 更新は学習分割の約23エポック相当"]
         SV{"step が save_every(25) の倍数、または最終 step か"}
         CK["ck.save_ckpt(..., {**base_config, 'lam': lam}, np_rng=rng) :705<br/>outputs/checkpoints/stage2/stage2_step(step).pt<br/>config に holdout / stage1_ckpt / lr / guidance を入れて事後選択へ渡す<br/>★np_rng も保存する。torch だけでは再開後の d_pick が別系列になる"]

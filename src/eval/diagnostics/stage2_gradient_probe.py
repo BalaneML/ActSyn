@@ -208,8 +208,8 @@ def depth_check(ckpt: Path, d_sub: int = 2, n: int = 8, seed: int = 0,
             zs_tail = {ti: zs[ti] for ti in range(1, k)}
             x0 = diff._sample_tail(model, state[k], k, cond, sm.GUIDANCE_SCALE, zs_tail)
             y = sm.straight_through(x0)
-            a_A, a_B = sl.group_rates_split(y, n)
-            sl.agg_loss_from_rates(a_A, a_B, a_star, omega).backward()
+            a_hat_1, a_hat_2 = sl.group_rates_split(y, n)
+            sl.agg_loss_from_rates(a_hat_1, a_hat_2, a_star, omega).backward()
             out[k] = torch.cat([p.grad.flatten() for p in model.parameters()
                                 if p.grad is not None])
         return out
