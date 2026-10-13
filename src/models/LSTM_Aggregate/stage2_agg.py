@@ -4,6 +4,9 @@ stage2_agg.py
 LSTM_Aggregate の Stage 2: 生成プールの時刻別行動者率と教師 A* の距離を、生成の連鎖（96 スロット）を通して
 逆伝播し、LSTM の重みを更新する。DDPM_Aggregate_Simple/stage2_finetune.py の LSTM 版（2026-10-08 ユーザー決定）
 
+--cell gru_minimal で、LSTM とセルだけが違う GRU（GRU_Minimal）に同じ手順・同じ設定を当てる（2026-10-10 ユーザー指示）。
+GRU_Aggregate の Stage 2（δ・傾けたリハーサル）とは別物で、保存先の頭も stage2_gru_minimal にして分ける
+
 1 更新でやること:
     1. 教師群から D_SUB 群を一様に抜き、群あたり N 本を生成する
     2. 各スロットの活動は Gumbel-max で引く（前向きは p_θ からの厳密な標本）。後ろ向きは
@@ -30,7 +33,7 @@ DDPM 版との対応:
 
 ```mermaid
 flowchart TD
-    CK["lm.load_model(stage1_ckpt(seed))<br/>Pre-trained（H=64・wd=0.01・学習型の時刻符号）"] --> M["model"]
+    CK["CELLS[cell].load_model(stage1_ckpt(seed, cell))<br/>Pre-trained（H=64・wd=0.01・学習型の時刻符号）<br/>cell = lstm / gru_minimal"] --> M["model"]
     M --> SS["sample_soft(model, cond, gumbel)<br/>y (B, 12, 96)・acts (B, 96)<br/>B = d_sub × n"]
     SS --> SP["sl.group_rates_split(y, n)<br/>a_A, a_B (d_sub, 12, 96)"]
     TGT["sl.teacher_tensor(tgt)<br/>a_star_all (28, 12, 96)"] --> LA
@@ -59,8 +62,10 @@ flowchart TD
     .venv/bin/python src/models/LSTM_Aggregate/stage2_agg.py --seed 42 --lam 0.01
     .venv/bin/python src/models/LSTM_Aggregate/stage2_agg.py --seed 42 --lam 0.01 --fold 3
     .venv/bin/python src/models/LSTM_Aggregate/stage2_agg.py --judge --lam 0.01
+    .venv/bin/python src/models/LSTM_Aggregate/stage2_agg.py --cell gru_minimal --seed 42 --zero-shot
 
     フラグ:
+        --cell K         再帰の層 lstm / gru_minimal（既定 lstm）。保存先の頭が stage2_{K} になる
         --lam V          リハーサルの重み λ（既定 LAM = 0.01）
         --tau V          Gumbel-softmax の温度 τ（既定 1.0）。既定以外は保存先に _tau{V}
         --bptt K         K スロットごとに履歴の勾配を切る。0 は切らない（既定）。既定以外は保存先に _bptt{K}
@@ -68,11 +73,12 @@ flowchart TD
         --eval-step S    学習せず、保存済みの step S の ckpt を採点する
 
 出力:
-    outputs/checkpoints/stage2_lstm{Stage1}{変種}{種}_{実行}/stage2_step{S}.pt   SAVE_EVERY ごとの ckpt
-    outputs/checkpoints/stage2_lstm{Stage1}{変種}{種}_{実行}/history.csv        1 更新ごとの記録
-    data/processed/aggregates/stage2_lstm{Stage1}{変種}{種}_{実行}.csv           採点（GRU と同じ縦持ち）
-    outputs/generated/stage2_lstm{Stage1}{変種}{種}_{実行}_rates.npz             評価のプールの時刻別行動者率 (28, 12, 96)
-        {Stage1} = _time_learned_h64_wd0.01、{変種} = _lam{λ}[_tau{τ}][_bptt{K}]（E0 は空）、
+    outputs/checkpoints/stage2_{セル}{Stage1}{変種}{種}_{実行}/stage2_step{S}.pt   SAVE_EVERY ごとの ckpt
+    outputs/checkpoints/stage2_{セル}{Stage1}{変種}{種}_{実行}/history.csv        1 更新ごとの記録
+    data/processed/aggregates/stage2_{セル}{Stage1}{変種}{種}_{実行}.csv           採点（GRU と同じ縦持ち）
+    outputs/generated/stage2_{セル}{Stage1}{変種}{種}_{実行}_rates.npz             評価のプールの時刻別行動者率 (28, 12, 96)
+        {セル} = lstm / gru_minimal、{Stage1} = _time_learned_h64_wd0.01、
+        {変種} = _lam{λ}[_tau{τ}][_bptt{K}][_lr{値}][_steps{N}]（E0 は空）、
         {種} は 42 なら空・それ以外は _s{seed}、{実行} = zeroshot / all / fold{K}
 """
 import argparse
@@ -109,6 +115,7 @@ def _load(name: str, path: Path) -> Any:
 
 
 lm: Any = _load("lstm_aggregate_model", Path(__file__).resolve().parent / "model.py")
+gmin: Any = _load("gru_minimal_model", REPO_ROOT / "src" / "models" / "GRU_Minimal" / "model.py")
 gm: Any = lm.gm
 sm: Any = lm.sm
 # 採点・判定は GRU の Stage 2 と同じ関数（score_pool・judge・fold_masks）
@@ -127,7 +134,13 @@ BoolArr = npt.NDArray[np.bool_]
 # ============================================================
 # 設定（2026-10-08。結果を見る前に固定）
 # ============================================================
-# Stage 1 の構成（ユーザー指定）: H = 64・1 層・weight decay 0.01・学習型の時刻符号
+# 再帰の層（セル）。名前 → (Stage 1 のモジュール, モデルのクラス)。名前は eval_curves.CELL_MODULES と同じ
+# ★どちらのモジュールも ckpt_path・load_model を同じ引数で持ち、モデルは step_embedded を持つ
+CELLS: dict[str, Any] = {"lstm": lm, "gru_minimal": gmin}
+CELL_CLASSES: dict[str, Any] = {"lstm": lm.LSTMScheduler, "gru_minimal": gmin.GRUMinimalScheduler}
+CELL = "lstm"
+
+# Stage 1 の構成（ユーザー指定）: H = 64・1 層・weight decay 0.01・学習型の時刻符号。GRU にも同じ値を使う
 STAGE1_TIME_ENC: Any = "learned"
 STAGE1_HIDDEN = 64
 STAGE1_NUM_LAYERS = 1
@@ -145,7 +158,7 @@ EPS = float("inf")               # 損失の重み ω の床。inf は素の MSE
 # 全員・全スロットに共通の部品（活動の埋め込み・LSTM・出力層）を遅く動かす
 LR_COND = 1e-4                   # cond_embeds・cond_proj
 LR_TIME = 1e-4                   # time_input（学習型の時刻符号）
-LR_REST = 1e-5                   # act_embed・lstm・out_proj
+LR_REST = 1e-5                   # act_embed・lstm（gru）・out_proj
 GRAD_CLIP: float = lm.GRAD_CLIP  # 1.0。Stage 1 と同じ（96 スロットの逆伝播で勾配が跳ねたときの保険）
 SAVE_EVERY = 25
 VAL_EVERY = 10                   # ATUS の val の交差エントロピーを測る間隔（リハーサルの過学習の監視）
@@ -196,6 +209,13 @@ def straight_through_gumbel(logits: torch.Tensor, generator: torch.Generator,
     return hard + (soft - soft.detach()), a
 
 
+def detach_state(state: Any) -> Any:
+    """再帰の層の状態から勾配を切る。LSTM は (h, c) の tuple、GRU は h の Tensor"""
+    if isinstance(state, tuple):
+        return tuple(t.detach() for t in state)
+    return state.detach()
+
+
 def sample_soft(model: Any, cond_idx: torch.Tensor, generator: torch.Generator, tau: float = TAU,
                 bptt: int = BPTT) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """s = 0..95 の順に引き、勾配が 96 スロットの履歴を通る 1 日を作る
@@ -203,11 +223,11 @@ def sample_soft(model: Any, cond_idx: torch.Tensor, generator: torch.Generator, 
     Note:
         1. スロット s の入力は y_{s−1} @ act_embed.weight[:12]（s = 0 は BOS の埋め込み）。
            y が厳密な one-hot なので、前向きの値は model.step（act_embed(a_prev)）と同じ
-        2. bptt > 0 なら、s が bptt の倍数のスロットで LSTM の状態と入力の勾配を切る
+        2. bptt > 0 なら、s が bptt の倍数のスロットで再帰の層の状態と入力の勾配を切る
            （そこより前の履歴へは勾配が戻らない。切り詰めた BPTT）
 
     Args:
-        model: lm.LSTMScheduler（step_embedded を持つ）
+        model: lm.LSTMScheduler か gmin.GRUMinimalScheduler（どちらも step_embedded を持つ）
         cond_idx: 条件インデックス, dtype=int64, (B, 3)。モデルと同じデバイス
         generator: Gumbel 雑音の CPU の torch.Generator
         tau: 温度, default=TAU=1.0
@@ -227,7 +247,7 @@ def sample_soft(model: Any, cond_idx: torch.Tensor, generator: torch.Generator, 
     for s in range(sm.NUM_SLOTS):
         if bptt > 0 and s > 0 and s % bptt == 0:
             e_prev = e_prev.detach()
-            state = (state[0].detach(), state[1].detach())
+            state = detach_state(state)
         logits, state = model.step_embedded(e_prev, c_emb, state, s)
         y, a = straight_through_gumbel(logits, generator, tau)
         ys.append(y)
@@ -247,7 +267,7 @@ def split_param_groups(model: nn.Module) -> dict[str, list[nn.Parameter]]:
         time は時刻符号が none のモデルでは空なので、dict から除く
 
     Args:
-        model: lm.LSTMScheduler
+        model: lm.LSTMScheduler か gmin.GRUMinimalScheduler
 
     Returns:
         {群名: パラメータの list}。並びは cond, time, rest
@@ -272,10 +292,10 @@ def build_optimizer(model: nn.Module, lr_cond: float = LR_COND, lr_time: float =
     """層別学習率の AdamW（weight decay 0。DDPM の Stage 2 と同じ）。各 param_group は "name" を持つ
 
     Args:
-        model: lm.LSTMScheduler
+        model: lm.LSTMScheduler か gmin.GRUMinimalScheduler
         lr_cond: cond_embeds・cond_proj の学習率, default=LR_COND=1e-4
         lr_time: time_input の学習率, default=LR_TIME=1e-4
-        lr_rest: act_embed・lstm・out_proj の学習率, default=LR_REST=1e-5
+        lr_rest: act_embed・lstm（gru）・out_proj の学習率, default=LR_REST=1e-5
 
     Returns:
         AdamW。ft.grad_norms が群名を読めるように param_groups[i]["name"] を持つ
@@ -293,10 +313,16 @@ def stage1_tag() -> str:
     return lm.time_tag(STAGE1_TIME_ENC) + lm.size_tag(STAGE1_HIDDEN, STAGE1_NUM_LAYERS, STAGE1_WEIGHT_DECAY)
 
 
-def stage1_ckpt(seed: int) -> Path:
-    """Pre-trained の ckpt のパス"""
-    return lm.ckpt_path(seed, time_enc=STAGE1_TIME_ENC, hidden=STAGE1_HIDDEN, num_layers=STAGE1_NUM_LAYERS,
-                        weight_decay=STAGE1_WEIGHT_DECAY)
+def stage1_ckpt(seed: int, cell: str = CELL) -> Path:
+    """Pre-trained の ckpt のパス（例: lstm_aggregate_time_learned_h64_wd0.01_s43.pt、
+    gru_minimal_time_learned_h64_wd0.01.pt）"""
+    return CELLS[cell].ckpt_path(seed, time_enc=STAGE1_TIME_ENC, hidden=STAGE1_HIDDEN,
+                                 num_layers=STAGE1_NUM_LAYERS, weight_decay=STAGE1_WEIGHT_DECAY)
+
+
+def load_pretrained(seed: int, cell: str = CELL) -> Any:
+    """Pre-trained のモデルを eval モードで戻す"""
+    return CELLS[cell].load_model(stage1_ckpt(seed, cell))
 
 
 def variant_tag(lam: float, tau: float = TAU, bptt: int = BPTT, steps: int = STEPS, lr_cond: float = LR_COND,
@@ -338,24 +364,24 @@ def run_name(zero_shot: bool, fold: int | None) -> str:
     return gs2.run_name(zero_shot, fold)
 
 
-def stem(seed: int, run: str, variant: str) -> str:
-    """保存先の共通の名前。E0 は variant を空にする"""
-    return f"stage2_lstm{stage1_tag()}{variant}{lm.run_suffix(seed)}_{run}"
+def stem(seed: int, run: str, variant: str, cell: str = CELL) -> str:
+    """保存先の共通の名前（頭は stage2_{cell}）。E0 は variant を空にする"""
+    return f"stage2_{cell}{stage1_tag()}{variant}{lm.run_suffix(seed)}_{run}"
 
 
-def run_dir(seed: int, run: str, variant: str) -> Path:
+def run_dir(seed: int, run: str, variant: str, cell: str = CELL) -> Path:
     """ckpt と学習の記録を置くディレクトリ"""
-    return CKPT_ROOT / stem(seed, run, variant)
+    return CKPT_ROOT / stem(seed, run, variant, cell)
 
 
-def csv_path(seed: int, run: str, variant: str) -> Path:
+def csv_path(seed: int, run: str, variant: str, cell: str = CELL) -> Path:
     """採点の CSV のパス。E0（run = zeroshot）は variant によらず同じファイル"""
-    return OUT_DIR / f"{stem(seed, run, '' if run == 'zeroshot' else variant)}.csv"
+    return OUT_DIR / f"{stem(seed, run, '' if run == 'zeroshot' else variant, cell)}.csv"
 
 
-def rates_path(seed: int, run: str, variant: str) -> Path:
+def rates_path(seed: int, run: str, variant: str, cell: str = CELL) -> Path:
     """評価のプールの時刻別行動者率の npz のパス"""
-    return RATES_DIR / f"{stem(seed, run, '' if run == 'zeroshot' else variant)}_rates.npz"
+    return RATES_DIR / f"{stem(seed, run, '' if run == 'zeroshot' else variant, cell)}_rates.npz"
 
 
 # ============================================================
@@ -372,7 +398,7 @@ def train_stage2(model: Any, tgt: dict, teacher_mask: BoolArr, seed: int, lam: f
                  steps: int = STEPS, d_sub: int = D_SUB, n: int = N, tau: float = TAU, bptt: int = BPTT,
                  lr_cond: float = LR_COND, lr_time: float = LR_TIME, lr_rest: float = LR_REST,
                  out_dir: Path | None = None, save_every: int = SAVE_EVERY,
-                 val_every: int = VAL_EVERY) -> list[dict[str, float]]:
+                 val_every: int = VAL_EVERY, cell: str = CELL) -> list[dict[str, float]]:
     """固定の step 数だけ微調整する（model を in-place で更新する）
 
     Note:
@@ -383,7 +409,7 @@ def train_stage2(model: Any, tgt: dict, teacher_mask: BoolArr, seed: int, lam: f
         3. 勾配のクリップは L_agg と λ·L_reh を足した後に 1 回だけ掛ける。記録の clip_norm はクリップ前のノルム
 
     Args:
-        model: Pre-trained の LSTM（学習するデバイスに載せたもの）
+        model: Pre-trained の LSTM か GRU（学習するデバイスに載せたもの）
         tgt: 教師（st.load_stula_targets）
         teacher_mask: L_agg に使う群, (28,)
         seed: 乱数の種
@@ -399,6 +425,7 @@ def train_stage2(model: Any, tgt: dict, teacher_mask: BoolArr, seed: int, lam: f
         out_dir: ckpt と history.csv の保存先。None なら何も保存しない
         save_every: ckpt を保存する間隔, default=SAVE_EVERY=25
         val_every: ATUS の val の交差エントロピーを測る間隔。0 で測らない, default=VAL_EVERY=10
+        cell: 再帰の層 lstm / gru_minimal（ckpt の config に書くだけ）, default=CELL="lstm"
 
     Returns:
         1 更新ごとの記録 list[dict]
@@ -431,11 +458,12 @@ def train_stage2(model: Any, tgt: dict, teacher_mask: BoolArr, seed: int, lam: f
             yield from train_loader
 
     atus = atus_batches()
-    config: dict[str, Any] = {"stage1_ckpt": stage1_ckpt(seed).name, "seed": seed, "lam": lam, "steps": steps,
+    config: dict[str, Any] = {"cell": cell, "stage1_ckpt": stage1_ckpt(seed, cell).name, "seed": seed, "lam": lam,
+                              "steps": steps,
                               "d_sub": d_sub, "n": n, "tau": tau, "bptt": bptt, "eps": EPS,
                               "lr_cond": lr_cond, "lr_time": lr_time, "lr_rest": lr_rest, "grad_clip": GRAD_CLIP,
                               "holdout": np.flatnonzero(~teacher_mask).tolist()}
-    print(f"[stage2] steps={steps} d_sub={d_sub} n={n} lam={lam:g} tau={tau:g} bptt={bptt} "
+    print(f"[stage2] cell={cell} steps={steps} d_sub={d_sub} n={n} lam={lam:g} tau={tau:g} bptt={bptt} "
           f"teacher_groups={len(teacher_groups)}/28 lr cond={lr_cond:g} time={lr_time:g} rest={lr_rest:g} "
           f"device={dev}", flush=True)
 
@@ -497,7 +525,7 @@ def evaluate(model: Any, tgt: dict, masks: dict[str, BoolArr], base: dict[str, A
     """評価のプールを作り、GRU の Stage 2 と同じ 3 つの軸で採点する
 
     Args:
-        model: 採点する LSTM
+        model: 採点する LSTM か GRU
         tgt: 教師
         masks: 名前 → 教師の群 (28,)
         base: 全行に付ける識別列
@@ -565,19 +593,21 @@ def jsd_rows(rates: FloatArr, tgt: dict, masks: dict[str, BoolArr], base: dict[s
     return rows
 
 
-def load_stage2(path: Path, device: str = DEVICE) -> Any:
-    """Stage 2 の ckpt（ck.save_ckpt の形式）から LSTM を eval モードで戻す"""
-    model = lm.LSTMScheduler(hidden=STAGE1_HIDDEN, num_layers=STAGE1_NUM_LAYERS, time_enc=STAGE1_TIME_ENC).to(device)
+def load_stage2(path: Path, device: str = DEVICE, cell: str = CELL) -> Any:
+    """Stage 2 の ckpt（ck.save_ckpt の形式）から LSTM か GRU を eval モードで戻す"""
+    model = CELL_CLASSES[cell](hidden=STAGE1_HIDDEN, num_layers=STAGE1_NUM_LAYERS,
+                               time_enc=STAGE1_TIME_ENC).to(device)
     ck.load_ckpt(path, model, map_location=device)
     return model.eval()
 
 
-def write_scores(rows: list[dict[str, Any]], rates: FloatArr, seed: int, run: str, variant: str) -> None:
+def write_scores(rows: list[dict[str, Any]], rates: FloatArr, seed: int, run: str, variant: str,
+                 cell: str = CELL) -> None:
     """採点の CSV と時刻別行動者率の npz を書く"""
-    out = csv_path(seed, run, variant)
+    out = csv_path(seed, run, variant, cell)
     out.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(out, index=False)
-    rp = rates_path(seed, run, variant)
+    rp = rates_path(seed, run, variant, cell)
     rp.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(rp, rates=rates)
     print(f"[stage2] 書いた: {out}\n[stage2] 書いた: {rp}", flush=True)
@@ -585,7 +615,7 @@ def write_scores(rows: list[dict[str, Any]], rates: FloatArr, seed: int, run: st
 
 def run(seed: int, fold: int | None, zero_shot: bool, lam: float = LAM, tau: float = TAU, bptt: int = BPTT,
         steps: int = STEPS, d_sub: int = D_SUB, n: int = N, lr_cond: float = LR_COND, lr_time: float = LR_TIME,
-        lr_rest: float = LR_REST, eval_step: int | None = None) -> None:
+        lr_rest: float = LR_REST, eval_step: int | None = None, cell: str = CELL) -> None:
     """E0 / E1 / E2 を 1 本回して採点の CSV を書く
 
     Args:
@@ -602,37 +632,38 @@ def run(seed: int, fold: int | None, zero_shot: bool, lam: float = LAM, tau: flo
         lr_time: time の学習率
         lr_rest: rest の学習率
         eval_step: 学習せず、保存済みのこの step の ckpt を採点する。None なら学習して最終 step を採点する
+        cell: 再帰の層 lstm / gru_minimal
     """
     tgt = st.load_stula_targets()
     name = run_name(zero_shot, fold)
     variant = "" if zero_shot else variant_tag(lam, tau, bptt, steps, lr_cond, lr_time, lr_rest)
     folds = gs2.fold_masks(tgt)
     if zero_shot:
-        model = lm.load_model(stage1_ckpt(seed))
+        model = load_pretrained(seed, cell)
         masks: dict[str, BoolArr] = {"all": np.ones(sm.D_GROUPS, dtype=bool), **folds}
         step = 0
     else:
         teacher = teacher_mask_of(tgt, fold)
         masks = {name: teacher}
-        out_dir = run_dir(seed, name, variant)
+        out_dir = run_dir(seed, name, variant, cell)
         if eval_step is None:
-            model = lm.load_model(stage1_ckpt(seed))
+            model = load_pretrained(seed, cell)
             train_stage2(model, tgt, teacher, seed, lam, steps, d_sub, n, tau, bptt, lr_cond, lr_time, lr_rest,
-                         out_dir=out_dir)
+                         out_dir=out_dir, cell=cell)
             step = steps
         else:
-            model = load_stage2(ck.ckpt_path(out_dir, eval_step))
+            model = load_stage2(ck.ckpt_path(out_dir, eval_step), cell=cell)
             step = eval_step
     model.eval()
-    base: dict[str, Any] = {"model": f"lstm{stage1_tag()}", "seed": seed, "run": name, "lam": lam if not zero_shot
+    base: dict[str, Any] = {"model": f"{cell}{stage1_tag()}", "seed": seed, "run": name, "lam": lam if not zero_shot
                             else float("nan"), "tau": tau, "bptt": bptt, "step": step,
                             "n_per_group": EVAL_N, "pool_seed": EVAL_SEED}
     rows, rates = evaluate(model, tgt, masks, base)
     suffix = "" if eval_step is None or eval_step == steps else f"_step{eval_step}"
-    write_scores(rows, rates, seed, name + suffix, variant)
+    write_scores(rows, rates, seed, name + suffix, variant, cell)
 
 
-def reference_rows(variant: str) -> list[dict[str, Any]]:
+def reference_rows(variant: str, cell: str = CELL) -> list[dict[str, Any]]:
     """判定表に足す MAE と JSD の参考行（合否は付けない）。J1 と同じ held-out 群、J6 と同じ 28 群
 
     Note:
@@ -642,9 +673,10 @@ def reference_rows(variant: str) -> list[dict[str, Any]]:
 
     Args:
         variant: variant_tag の印
+        cell: 再帰の層 lstm / gru_minimal。判定するモデルの値を入れる列の名前にもなる
 
     Returns:
-        行 list[dict]（列 item・lstm・zero_shot。pass は空）
+        行 list[dict]（列 item・{cell}・zero_shot。pass は空）
     """
     tgt = st.load_stula_targets()
     a_star = np.asarray(tgt["group_rates_tbl"], dtype=np.float64)
@@ -652,67 +684,69 @@ def reference_rows(variant: str) -> list[dict[str, Any]]:
     all_groups = np.ones(sm.D_GROUPS, dtype=bool)
 
     def rates_of(seed: int, run_: str) -> FloatArr:
-        return np.asarray(np.load(rates_path(seed, run_, variant))["rates"], dtype=np.float64)
+        return np.asarray(np.load(rates_path(seed, run_, variant, cell))["rates"], dtype=np.float64)
 
     rows: list[dict[str, Any]] = []
-    zs42 = pd.read_csv(csv_path(LGO_SEED, "zeroshot", variant))
+    zs42 = pd.read_csv(csv_path(LGO_SEED, "zeroshot", variant, cell))
     zs42_rates = rates_of(LGO_SEED, "zeroshot")
     for k in range(lgo.N_FOLDS):
         run_ = f"fold{k}"
-        e2 = pd.read_csv(csv_path(LGO_SEED, run_, variant))
+        e2 = pd.read_csv(csv_path(LGO_SEED, run_, variant, cell))
         held = ~folds[run_]
         rows.append({"item": f"MAE（参考）held-out {run_}",
-                     "lstm": gs2._value(e2, "rate_mae", eval_kind="held-out", mask="12act", mask_name=run_),
+                     cell: gs2._value(e2, "rate_mae", eval_kind="held-out", mask="12act", mask_name=run_),
                      "zero_shot": gs2._value(zs42, "rate_mae", eval_kind="held-out", mask="12act", mask_name=run_)})
-        rows.append({"item": f"JSD（参考）held-out {run_}", "lstm": slot_jsd(rates_of(LGO_SEED, run_), a_star, held),
+        rows.append({"item": f"JSD（参考）held-out {run_}", cell: slot_jsd(rates_of(LGO_SEED, run_), a_star, held),
                      "zero_shot": slot_jsd(zs42_rates, a_star, held)})
-    e1 = [pd.read_csv(csv_path(s, "all", variant)) for s in SEEDS]
-    zs = [pd.read_csv(csv_path(s, "zeroshot", variant)) for s in SEEDS]
+    e1 = [pd.read_csv(csv_path(s, "all", variant, cell)) for s in SEEDS]
+    zs = [pd.read_csv(csv_path(s, "zeroshot", variant, cell)) for s in SEEDS]
     rows.append({"item": "MAE（参考）28 群の rate_mae（5 種の中央値）",
-                 "lstm": float(np.median([gs2._value(d, "rate_mae", eval_kind="in-teacher", mask="12act")
+                 cell: float(np.median([gs2._value(d, "rate_mae", eval_kind="in-teacher", mask="12act")
                                           for d in e1])),
                  "zero_shot": float(np.median([gs2._value(d, "rate_mae", eval_kind="in-teacher", mask="12act",
                                                           mask_name="all") for d in zs]))})
     rows.append({"item": "JSD（参考）28 群の rate_jsd（5 種の中央値）",
-                 "lstm": float(np.median([slot_jsd(rates_of(s, "all"), a_star, all_groups) for s in SEEDS])),
+                 cell: float(np.median([slot_jsd(rates_of(s, "all"), a_star, all_groups) for s in SEEDS])),
                  "zero_shot": float(np.median([slot_jsd(rates_of(s, "zeroshot"), a_star, all_groups)
                                                for s in SEEDS]))})
     return rows
 
 
 def judge(lam: float = LAM, tau: float = TAU, bptt: int = BPTT, steps: int = STEPS, lr_cond: float = LR_COND,
-          lr_time: float = LR_TIME, lr_rest: float = LR_REST) -> pd.DataFrame:
+          lr_time: float = LR_TIME, lr_rest: float = LR_REST, cell: str = CELL) -> pd.DataFrame:
     """E0〜E2 の CSV から J1〜J6 を判定する（GRU の stage2.judge と同じ規則・同じ比較先の DDPM の値）
 
     Note:
-        判定の後に MAE・JSD の参考行（reference_rows）を足して、同じ CSV に書き直す
+        1. 判定の後に MAE・JSD の参考行（reference_rows）を足して、同じ CSV に書き直す
+        2. 判定するモデルの値の列の名前は cell（lstm / gru_minimal）
     """
     variant = variant_tag(lam, tau, bptt, steps, lr_cond, lr_time, lr_rest)
-    out = OUT_DIR / f"stage2_lstm{stage1_tag()}{variant}_judge.csv"
-    table = gs2.judge(path_of=lambda seed, run_: csv_path(seed, run_, variant), out_path=out, label="lstm")
-    table = pd.concat([table, pd.DataFrame(reference_rows(variant))], ignore_index=True)
+    out = OUT_DIR / f"stage2_{cell}{stage1_tag()}{variant}_judge.csv"
+    table = gs2.judge(path_of=lambda seed, run_: csv_path(seed, run_, variant, cell), out_path=out, label=cell)
+    table = pd.concat([table, pd.DataFrame(reference_rows(variant, cell))], ignore_index=True)
     table.to_csv(out, index=False)
     return table
 
 
-def smoke() -> None:
+def smoke(cell: str = CELL) -> None:
     """2 更新・群あたり 4 本で学習と軸 1 の採点が通ることだけを確かめる（何も保存しない）"""
     tgt = st.load_stula_targets()
-    model = lm.load_model(stage1_ckpt(LGO_SEED))
+    model = load_pretrained(LGO_SEED, cell)
     teacher = teacher_mask_of(tgt, 0)
     before = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    history = train_stage2(model, tgt, teacher, LGO_SEED, steps=2, d_sub=2, n=4, val_every=1)
+    history = train_stage2(model, tgt, teacher, LGO_SEED, steps=2, d_sub=2, n=4, val_every=1, cell=cell)
     moved = [k for k, v in model.state_dict().items() if not torch.equal(v, before[k])]
     rows, rates = evaluate(model, tgt, {"fold0": teacher}, {"run": "smoke"}, n_per_group=4, full=False)
     assert len(history) == 2 and all(math.isfinite(h["L_agg"]) for h in history)
     assert {"in-teacher", "held-out", "all"} <= {r["eval_kind"] for r in rows}
     assert rates.shape == (sm.D_GROUPS, sm.NUM_ACT, sm.NUM_SLOTS)
-    print(f"smoke: OK（{len(rows)} 行、更新されたパラメータ {len(moved)}/{len(before)}）")
+    print(f"smoke: OK（{cell}、{len(rows)} 行、更新されたパラメータ {len(moved)}/{len(before)}）")
 
 
 def main() -> None:
     """CLI"""
     ap = argparse.ArgumentParser(description="LSTM_Aggregate の Stage 2（生成の連鎖を通して L_agg を逆伝播する）")
+    ap.add_argument("--cell", choices=tuple(CELLS), default=CELL, help="再帰の層。gru_minimal は GRU_Minimal")
     ap.add_argument("--seed", type=int, default=LGO_SEED)
     ap.add_argument("--fold", type=int, default=None, help="教師から外す LGO の fold（0〜6）。省略で 28 群すべて")
     ap.add_argument("--zero-shot", action="store_true", help="Pre-trained のまま採点する（E0）")
@@ -734,14 +768,14 @@ def main() -> None:
     if args.fold is not None and not 0 <= args.fold < lgo.N_FOLDS:
         ap.error(f"--fold は 0〜{lgo.N_FOLDS - 1}: {args.fold}")
     if args.smoke:
-        smoke()
+        smoke(args.cell)
     elif args.judge:
         with pd.option_context("display.width", 200, "display.float_format", "{:.4g}".format):
             print(judge(args.lam, args.tau, args.bptt, args.steps, args.lr_cond, args.lr_time,
-                        args.lr_rest).to_string(index=False))
+                        args.lr_rest, args.cell).to_string(index=False))
     else:
         run(args.seed, args.fold, args.zero_shot, args.lam, args.tau, args.bptt, args.steps, args.d_sub, args.n,
-            args.lr_cond, args.lr_time, args.lr_rest, args.eval_step)
+            args.lr_cond, args.lr_time, args.lr_rest, args.eval_step, args.cell)
 
 
 if __name__ == "__main__":

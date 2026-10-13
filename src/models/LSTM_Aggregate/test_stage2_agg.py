@@ -7,7 +7,9 @@ LSTM_Aggregate の Stage 2（stage2_agg.py）の単体テスト
     c. 履歴を通る勾配: 既定（bptt = 0）では活動の埋め込み（BOS 以外の 12 行）に勾配が届き、
        bptt = 1（毎スロットで履歴を切る）では届かない。L_agg の勾配は cond・time・rest の 3 群すべてに届く
     d. 層別学習率の群: すべてのパラメータがちょうど 1 つの群に入る。時刻符号 none では time 群を作らない
-    e. 保存先: Stage 1 の ckpt の名前、変種の印、E0 の CSV が変種によらないこと
+    e. 保存先: Stage 1 の ckpt の名前、変種の印、E0 の CSV が変種によらないこと。GRU は頭が stage2_gru_minimal
+    f. 評価の JSD: 損失側の sl.jsd_loss と一致し、同じ分布で 0 になる
+    b〜d は LSTM と GRU（--cell gru_minimal）の両方で確かめる
 
     .venv/bin/python src/models/LSTM_Aggregate/test_stage2_agg.py
 """
@@ -39,10 +41,10 @@ sl: Any = s2.sl
 SMALL = 16              # テスト用の幅
 
 
-def _model(seed: int = 0, time_enc: str = "learned") -> Any:
+def _model(seed: int = 0, time_enc: str = "learned", cell: str = "lstm") -> Any:
     """小さな幅のモデル（CPU）"""
     torch.manual_seed(seed)
-    return lm.LSTMScheduler(hidden=SMALL, num_layers=1, time_enc=time_enc).eval()
+    return s2.CELL_CLASSES[cell](hidden=SMALL, num_layers=1, time_enc=time_enc).eval()
 
 
 def _cond(batch: int, seed: int = 0) -> torch.Tensor:
@@ -67,9 +69,9 @@ def test_gumbel() -> None:
     print("a. straight-through Gumbel: OK")
 
 
-def test_sample_matches_teacher_forcing() -> None:
+def test_sample_matches_teacher_forcing(cell: str) -> None:
     """b. sample_soft の logits = teacher forcing の logits"""
-    model = _model()
+    model = _model(cell=cell)
     cond = _cond(32)
     with torch.no_grad():
         y, acts, logits = s2.sample_soft(model, cond, torch.Generator().manual_seed(2))
@@ -78,12 +80,12 @@ def test_sample_matches_teacher_forcing() -> None:
     assert torch.equal(y.argmax(dim=1), acts)
     err = (logits - tf).abs().max().item()
     assert err < 1e-5, f"teacher forcing と食い違う: {err:.2e}"
-    print(f"b. 微分できる生成 = teacher forcing: OK（最大差 {err:.1e}）")
+    print(f"b. 微分できる生成 = teacher forcing（{cell}）: OK（最大差 {err:.1e}）")
 
 
-def _act_grad(bptt: int) -> torch.Tensor:
+def _act_grad(bptt: int, cell: str) -> torch.Tensor:
     """群平均の行動者率の線形な損失を逆伝播し、活動の埋め込みの勾配を返す"""
-    model = _model()
+    model = _model(cell=cell)
     cond = _cond(16)
     y, _, _ = s2.sample_soft(model, cond, torch.Generator().manual_seed(3), bptt=bptt)
     w = torch.randn(sm.NUM_ACT, sm.NUM_SLOTS, generator=torch.Generator().manual_seed(4))
@@ -92,14 +94,14 @@ def _act_grad(bptt: int) -> torch.Tensor:
     return model.act_embed.weight.grad
 
 
-def test_history_gradient() -> None:
+def test_history_gradient(cell: str) -> None:
     """c. 既定では履歴を通り、bptt = 1 では切れる。L_agg の勾配は 3 群すべてに届く"""
-    full, cut = _act_grad(0), _act_grad(1)
+    full, cut = _act_grad(0, cell), _act_grad(1, cell)
     assert full[:sm.NUM_ACT].abs().sum() > 0, "既定で活動の埋め込みに勾配が届かない"
     assert cut[:sm.NUM_ACT].abs().sum() == 0, "bptt = 1 なのに活動の埋め込みに勾配が届く"
     assert full[lm.BOS].abs().sum() > 0 and cut[lm.BOS].abs().sum() > 0, "BOS の行に勾配が届かない"
 
-    model = _model()
+    model = _model(cell=cell)
     n = 8
     grid = torch.as_tensor(sm.cond_grid(), dtype=torch.long)
     cond = grid[:2].repeat_interleave(n, dim=0)
@@ -113,23 +115,23 @@ def test_history_gradient() -> None:
     norms = s2.ft.grad_norms(optimizer, "agg")
     assert set(norms) == {"agg_gnorm_cond", "agg_gnorm_time", "agg_gnorm_rest"}
     assert all(v > 0 for v in norms.values()), f"勾配が届かない群がある: {norms}"
-    print("c. 履歴を通る勾配: OK")
+    print(f"c. 履歴を通る勾配（{cell}）: OK")
 
 
-def test_param_groups() -> None:
+def test_param_groups(cell: str) -> None:
     """d. すべてのパラメータがちょうど 1 つの群に入る"""
     for time_enc, names in (("learned", ["cond", "time", "rest"]), ("none", ["cond", "rest"])):
-        model = _model(time_enc=time_enc)
+        model = _model(time_enc=time_enc, cell=cell)
         groups = s2.split_param_groups(model)
         assert list(groups) == names, f"{time_enc}: 群が {list(groups)}"
         ids = [id(p) for ps in groups.values() for p in ps]
         assert len(ids) == len(set(ids)) == len(list(model.parameters())), f"{time_enc}: 重複か漏れがある"
-    model = _model()
+    model = _model(cell=cell)
     groups = s2.split_param_groups(model)
     assert {id(p) for p in groups["time"]} == {id(p) for p in model.time_input.parameters()}
     assert {id(p) for p in groups["cond"]} == {id(p) for m in (model.cond_embeds, model.cond_proj)
                                                for p in m.parameters()}
-    print("d. 層別学習率の群: OK")
+    print(f"d. 層別学習率の群（{cell}）: OK")
 
 
 def test_paths() -> None:
@@ -143,6 +145,12 @@ def test_paths() -> None:
     assert s2.csv_path(42, "zeroshot", "_lam0.01") == s2.csv_path(42, "zeroshot", "_lam0.1")
     assert s2.csv_path(43, "fold3", "_lam0.01").name == "stage2_lstm_time_learned_h64_wd0.01_lam0.01_s43_fold3.csv"
     assert s2.run_dir(42, "all", "_lam0.01").name == "stage2_lstm_time_learned_h64_wd0.01_lam0.01_all"
+    # GRU: Stage 1 は GRU_Minimal の ckpt、保存先の頭は stage2_gru_minimal（GRU_Aggregate の stage2_gru_ と分ける）
+    assert s2.stage1_ckpt(42, "gru_minimal").name == "gru_minimal_time_learned_h64_wd0.01.pt"
+    assert s2.stage1_ckpt(44, "gru_minimal").name == "gru_minimal_time_learned_h64_wd0.01_s44.pt"
+    assert (s2.csv_path(43, "fold3", "_lam0.01", "gru_minimal").name
+            == "stage2_gru_minimal_time_learned_h64_wd0.01_lam0.01_s43_fold3.csv")
+    assert s2.csv_path(42, "zeroshot", "_lam0.01", "gru_minimal") != s2.csv_path(42, "zeroshot", "_lam0.01")
     print("e. 保存先: OK")
 
 
@@ -163,9 +171,10 @@ def test_slot_jsd() -> None:
 
 if __name__ == "__main__":
     test_gumbel()
-    test_sample_matches_teacher_forcing()
-    test_history_gradient()
-    test_param_groups()
+    for cell_ in s2.CELLS:
+        test_sample_matches_teacher_forcing(cell_)
+        test_history_gradient(cell_)
+        test_param_groups(cell_)
     test_paths()
     test_slot_jsd()
     print("all OK")
