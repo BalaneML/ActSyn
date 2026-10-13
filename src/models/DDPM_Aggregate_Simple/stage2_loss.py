@@ -22,8 +22,8 @@ Stage 2 の集計損失
     omega  = chi2_weights(a_star, eps=float("inf"))  # A なら全要素1
     ...
     y = straight_through(diffusion.sample_differentiable(model, cond, K), tau)
-    a_A, a_B = group_rates_split(y, n)
-    L_agg = agg_loss_from_rates(a_A, a_B, a_star[d_sub], omega[d_sub])
+    a_hat_1, a_hat_2 = group_rates_split(y, n)
+    L_agg = agg_loss_from_rates(a_hat_1, a_hat_2, a_star[d_sub], omega[d_sub])
 """
 import math
 
@@ -85,14 +85,17 @@ def chi2_weights(a_star: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def group_rates_split(y: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """(D_sub*n, 12, 96) の one-hot を群ごとに半分ずつ割り, それぞれの群平均して ā_A, ā_B (D_sub,12,96) を2つ返す
+    """(D_sub*n, 12, 96) の one-hot を群ごとに半分ずつ割り, それぞれの群平均して Â_1, Â_2 (D_sub,12,96) を2つ返す
     
     split-batch不偏推定のための分割
     重複しない2つの半分から独立の郡平均を2つ作り, 内積をとることで多様性への罰 (1/n)tr Var を消す
 
+        I_1 = {1, ..., n/2},  I_2 = {n/2+1, ..., n}   （群の中での位置。どの群でも同じ）
+        Â_1[d,c,s] = (2/n) Σ_{i∈I_1} y[d,i,c,s],   Â_2[d,c,s] = (2/n) Σ_{i∈I_2} y[d,i,c,s]
+
     Note:
-        ★A/B の分け方が群をまたがないこと（群ごとに半分ずつ）が要点。群をまたいで
-        分けると ā_A と ā_B が別の群の平均になり、内積が bias² を推定しなくなる。
+        ★I_1 / I_2 の分け方が群をまたがないこと（群ごとに半分ずつ）が要点。群をまたいで
+        分けると Â_1 と Â_2 が別の群の平均になり、内積が bias² を推定しなくなる。
         前半・後半という決め打ちでよいのは、群内の n 本が同じ cond から独立なノイズで
         生成された i.i.d. だからで、必要なのは2つの半分が独立であることだけである。
         ★並びが群優先であることは検査できない。y の中身から群の境界は読めないので、
@@ -106,8 +109,8 @@ def group_rates_split(y: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tens
         n: 郡あたりの生成本数, 偶数であることが必須
 
     Returns:
-        (ā_A, ā_B), dtype=float32, (D_sub, 12, 96)
-        ā_A[d] = 群dの前半 n/2 本の平均, ā_B[d] = 群dの後半 n/2 本の平均
+        (Â_1, Â_2), dtype=float32, (D_sub, 12, 96)
+        Â_1[d] = 群dの前半 n/2 本の平均, Â_2[d] = 群dの後半 n/2 本の平均
         y の勾配グラフを保つので、そのまま損失へ繋いで逆伝播できる
     """
     if n % 2 != 0:
@@ -120,21 +123,22 @@ def group_rates_split(y: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tens
     return grouped[:, :half].mean(dim=1), grouped[:, half:].mean(dim=1)
 
 
-def agg_loss_from_rates(a_A: torch.Tensor, a_B: torch.Tensor,
+def agg_loss_from_rates(a_hat_1: torch.Tensor, a_hat_2: torch.Tensor,
                         a_star: torch.Tensor, omega: torch.Tensor) -> torch.Tensor:
     """split-batch 不偏推定による集計損失 L_agg を1つのスカラーで返す
 
-    L = mean_{d,c,s} ω[d,c,s] · (ā_A[d,c,s] − A*[d,c,s]) · (ā_B[d,c,s] − A*[d,c,s])
+    L = mean_{d,c,s} ω[d,c,s] · (Â_1[d,c,s] − A*[d,c,s]) · (Â_2[d,c,s] − A*[d,c,s])
     二乗ではなく, 重複しない2つの半分から作った誤差の積をとる
     群 d・活動 c・時刻 s の3軸すべてで平均する
 
     Note:
-        ★ā_A ⊥ ā_B なので E[L] = Σ ω (E[ā] − A*)² となり, 多様性への罰 (1/n)tr Var が
-        厳密に消える。素朴な二乗誤差はこの項を含むので, 集計を合わせるほど群内の個票が互いに似ていく圧力がかかる。
-        ★値が負になりうる。ā_A と ā_B の誤差の符号が逆のセルでは積が負になる。
+        ★Â_1 ⊥ Â_2 なので E[L] = Σ ω (E[ā] − A*)² となり, 素の二乗誤差の分散の項 (1/n)Σ ω p(1−p) が
+        厳密に消える。ただし個票は one-hot なのでこの項は p だけで決まり, 多様性への罰ではない
+        （agg_mse_from_rates の Note）。LSTM / GRU の Stage 2 は 2026-10-13 から素の MSE が既定。
+        ★値が負になりうる。Â_1 と Â_2 の誤差の符号が逆のセルでは積が負になる。
         損失値として不自然に見えるが, 期待値が bias² で下限0なのは変わらない
         (推定量の分散が見えているだけ)。学習ログの l_agg < 0 は異常ではない。
-        ★4引数の群の並びが一致していることが前提。a_A, a_B は cond を作った順,
+        ★4引数の群の並びが一致していることが前提。a_hat_1, a_hat_2 は cond を作った順,
         a_star, omega は d_pick_t で切り出した順であり, 呼び出し側が揃える。
         ずれても例外は出ず, 別の群の教師に合わせにいく。
         ★ε=inf では ω が全要素1なのでセル単位の素の MSE と厳密に一致し, rate_rmse と
@@ -143,23 +147,66 @@ def agg_loss_from_rates(a_A: torch.Tensor, a_B: torch.Tensor,
         (ステップ間で L_agg を比較できるようにするための意図した挙動)。
 
     Args:
-        a_A: 群dの前半 n/2 本の平均 ā_A, dtype=float32, (D_sub, 12, 96), 勾配グラフを保つ
-        a_B: 群dの後半 n/2 本の平均 ā_B, dtype=float32, (D_sub, 12, 96), 勾配グラフを保つ
+        a_hat_1: 群dの前半 n/2 本の平均 Â_1, dtype=float32, (D_sub, 12, 96), 勾配グラフを保つ
+        a_hat_2: 群dの後半 n/2 本の平均 Â_2, dtype=float32, (D_sub, 12, 96), 勾配グラフを保つ
         a_star: 教師 A* のうち当該ステップの D_sub 群, (D_sub, 12, 96), 値域[0, 1]
         omega: 損失の重み ω のうち当該ステップの D_sub 群, (D_sub, 12, 96)
 
     Returns:
         集計損失 L_agg, 0次元テンソル (スカラー), dtype=float32
-        a_A, a_B 経由の勾配グラフを保つので, そのまま backward() できる
+        a_hat_1, a_hat_2 経由の勾配グラフを保つので, そのまま backward() できる
     """
-    return ((a_A - a_star) * (a_B - a_star) * omega).mean()
+    return ((a_hat_1 - a_star) * (a_hat_2 - a_star) * omega).mean()
+
+
+def group_rates(y: torch.Tensor, n: int) -> torch.Tensor:
+    """(D_sub*n, 12, 96) の one-hot を群ごとに n 本すべて平均して Â (D_sub, 12, 96) を返す
+
+        Â[d,c,s] = (1/n) Σ_{i=1}^{n} y[d,i,c,s]
+
+    Note:
+        ★並びは group_rates_split と同じ群優先が前提。検査できない点も同じ
+
+    Args:
+        y: 微分可能なone-hot, dtype=float32, (D_sub*n, 12, 96)
+        n: 群あたりの生成本数（奇数でもよい）
+
+    Returns:
+        Â, dtype=float32, (D_sub, 12, 96)。y の勾配グラフを保つ
+    """
+    d_sub = y.size(0) // n
+    if d_sub * n != y.size(0):
+        raise ValueError(f"本数 {y.size(0)} が n={n} で割り切れない")
+    return y.view(d_sub, n, y.size(1), y.size(2)).mean(dim=1)
+
+
+def agg_mse_from_rates(a_hat: torch.Tensor, a_star: torch.Tensor, omega: torch.Tensor) -> torch.Tensor:
+    """群平均 Â と教師 A* の素の重み付き二乗誤差を集計損失 L_agg として返す
+
+    L = mean_{d,c,s} ω[d,c,s] · (Â[d,c,s] − A*[d,c,s])²
+
+    Note:
+        ★期待値は Σ ω (E[Â] − A*)² + Σ ω p(1−p)/n（p = E[Â]）。個票が one-hot なので第2項は
+        p だけで決まり、個票どうしの多様性への罰にはならない。最小点は p を 0/1 の側へ
+        最大 1/(2(n−1)) ずらすだけ（n=256 で 0.2pt。教師の標本誤差の RMSE 約 0.5pt より小さい）
+        ★値は負にならない。ε=inf（ω=1）では評価の rate_mse と同じ量
+
+    Args:
+        a_hat: 群平均 Â, dtype=float32, (D_sub, 12, 96), 勾配グラフを保つ
+        a_star: 教師 A* のうち当該ステップの D_sub 群, (D_sub, 12, 96), 値域[0, 1]
+        omega: 損失の重み ω のうち当該ステップの D_sub 群, (D_sub, 12, 96)
+
+    Returns:
+        集計損失 L_agg, 0次元テンソル (スカラー), dtype=float32
+    """
+    return ((a_hat - a_star) ** 2 * omega).mean()
 
 
 def agg_loss(y: torch.Tensor, a_star: torch.Tensor,
                 omega: torch.Tensor,n: int) -> torch.Tensor:
     """生成 one-hot -> 分割 -> 集計損失 L_agg
 
-    group_rates_split   -> 生成スケジュール y を ā_A, ā_B に分ける
+    group_rates_split   -> 生成スケジュール y を Â_1, Â_2 に分ける
     agg_loss_from_rates -> 損失にする
 
     Args:
@@ -172,8 +219,8 @@ def agg_loss(y: torch.Tensor, a_star: torch.Tensor,
         集計損失 L_agg, 0次元テンソル (スカラー), dtype=float32
         y 経由の勾配グラフを保つので, そのまま backward() できる
     """
-    a_A, a_B = group_rates_split(y, n)
-    return agg_loss_from_rates(a_A, a_B, a_star, omega)
+    a_hat_1, a_hat_2 = group_rates_split(y, n)
+    return agg_loss_from_rates(a_hat_1, a_hat_2, a_star, omega)
 
 
 def jsd_loss(y: torch.Tensor, a_star: torch.Tensor, n: int,
@@ -191,29 +238,29 @@ def jsd_loss(y: torch.Tensor, a_star: torch.Tensor, n: int,
 # ============================================================
 # g = ∂L/∂Ã の解析形と診断
 # ============================================================
-def loss_grad(a_A: torch.Tensor, a_B: torch.Tensor, a_star: torch.Tensor,
+def loss_grad(a_hat_1: torch.Tensor, a_hat_2: torch.Tensor, a_star: torch.Tensor,
                 omega: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """郡平均への勾配 g_A = ∂L/∂ā_A, g_B = ∂L/∂ā_B を解析的に返す (autograd を使わない)
+    """郡平均への勾配 g_1 = ∂L/∂Â_1, g_2 = ∂L/∂Â_2 を解析的に返す (autograd を使わない)
 
-    g_A = ω·(ā_B − A*) / (|D_sub|·12·96)
-    g_B = ω·(ā_A − A*) / (|D_sub|·12·96)
+    g_1 = ω·(Â_2 − A*) / (|D_sub|·12·96)
+    g_2 = ω·(Â_1 − A*) / (|D_sub|·12·96)
 
     Args:
-        a_A: 群dの前半 n/2 本の平均 ā_A, dtype=float32, (D_sub, 12, 96)
-        a_B: 群dの後半 n/2 本の平均 ā_B, dtype=float32, (D_sub, 12, 96)
+        a_hat_1: 群dの前半 n/2 本の平均 Â_1, dtype=float32, (D_sub, 12, 96)
+        a_hat_2: 群dの後半 n/2 本の平均 Â_2, dtype=float32, (D_sub, 12, 96)
         a_star: 教師 A* のうち当該ステップの D_sub 群, (D_sub, 12, 96), 値域[0, 1]
         omega: 損失の重み ω のうち当該ステップの D_sub 群, (D_sub, 12, 96)
 
     Returns:
-        (g_A, g_B), dtype=float32, ともに (D_sub, 12, 96)
-        g_A[d, c, s] = 群d, 活動c, 時刻区分s の ā_A を動かすべき向きと大きさ
+        (g_1, g_2), dtype=float32, ともに (D_sub, 12, 96)
+        g_1[d, c, s] = 群d, 活動c, 時刻区分s の Â_1 を動かすべき向きと大きさ
     """
-    scale = a_A.size(0) * a_A.size(1) * a_A.size(2)    # |D_sub| × 12 × 96（3軸とも平均）
-    return omega * (a_B - a_star) / scale, omega * (a_A - a_star) / scale
+    scale = a_hat_1.size(0) * a_hat_1.size(1) * a_hat_1.size(2)    # |D_sub| × 12 × 96（3軸とも平均）
+    return omega * (a_hat_2 - a_star) / scale, omega * (a_hat_1 - a_star) / scale
 
 
-def per_sample_grad(g_A: torch.Tensor, g_B: torch.Tensor, n: int) -> torch.Tensor:
-    """群平均への勾配 g_A, g_B を個票ごとの上流勾配 ∂L/∂y_i へ展開する
+def per_sample_grad(g_1: torch.Tensor, g_2: torch.Tensor, n: int) -> torch.Tensor:
+    """群平均への勾配 g_1, g_2 を個票ごとの上流勾配 ∂L/∂y_i へ展開する
 
     2パス勾配蓄積 (§2.9, §11.2) で y_c.backward(gradient=...) に渡す値そのもの
     群 d・半分 h に属する個票 i について
@@ -224,23 +271,23 @@ def per_sample_grad(g_A: torch.Tensor, g_B: torch.Tensor, n: int) -> torch.Tenso
     group_rates_split の逆操作であり, 並びの規約を共有する
 
     Note:
-        ★割る数は n ではなく n/2。ā_A は n/2 本の平均なので ∂ā_A/∂y_i = 1/(n/2) である。
+        ★割る数は n ではなく n/2。Â_1 は n/2 本の平均なので ∂Â_1/∂y_i = 1/(n/2) である。
         §2.9 の説明は split-batch を使わない素朴版 (g/n) なので取り違えないこと。
-        ★並びは group_rates_split と同じ「群優先・群の中は前半がA・後半がB」。
+        ★並びは group_rates_split と同じ「群優先・群の中は前半が I_1・後半が I_2」。
         cat の順序がこの規約に対応しているため, 片方だけ変えると壊れる。
         ★並びは検査できない。y の並びがずれていても例外は出ず, 別の群の勾配を
         別の群の個票へ流したまま学習が進む。
-        ★検算: 群dのA半分の勾配を全て足すと half·g_A[d]/half = g_A[d] となり,
+        ★検算: 群dの I_1 側の勾配を全て足すと half·g_1[d]/half = g_1[d] となり,
         群平均側の勾配に一致する。
 
     Args:
-        g_A: 群平均 ā_A への勾配 ∂L/∂ā_A, dtype=float32, (D_sub, 12, 96)
-        g_B: 群平均 ā_B への勾配 ∂L/∂ā_B, dtype=float32, (D_sub, 12, 96)
+        g_1: 群平均 Â_1 への勾配 ∂L/∂Â_1, dtype=float32, (D_sub, 12, 96)
+        g_2: 群平均 Â_2 への勾配 ∂L/∂Â_2, dtype=float32, (D_sub, 12, 96)
         n: 群あたりの生成本数, 偶数であることが必須
 
     Raises:
         ValueError: n が奇数のとき
-        RuntimeError: g_B の形が g_A と一致しないとき (expand が送出する)
+        RuntimeError: g_2 の形が g_1 と一致しないとき (expand が送出する)
 
     Returns:
         個票ごとの上流勾配 ∂L/∂y_i, dtype=float32, (D_sub*n, 12, 96)
@@ -248,10 +295,10 @@ def per_sample_grad(g_A: torch.Tensor, g_B: torch.Tensor, n: int) -> torch.Tenso
     """
     if n % 2 != 0:
         raise ValueError(f"split-batch には n が偶数である必要がある: {n}")
-    d_sub, n_act, n_slot = g_A.shape
+    d_sub, n_act, n_slot = g_1.shape
     half = n // 2
-    per = torch.cat([g_A.unsqueeze(1).expand(d_sub, half, n_act, n_slot),
-                    g_B.unsqueeze(1).expand(d_sub, half, n_act, n_slot)], dim=1)
+    per = torch.cat([g_1.unsqueeze(1).expand(d_sub, half, n_act, n_slot),
+                    g_2.unsqueeze(1).expand(d_sub, half, n_act, n_slot)], dim=1)
     return (per / half).reshape(d_sub * n, n_act, n_slot)
 
 
@@ -263,15 +310,15 @@ def g_diagnostics(g: torch.Tensor, a_star: torch.Tensor, n: int,
     全ステップ記録すれば, 教師のどの部分が実際に効いているかを勾配という直接の量で測れる
 
     Note:
-        ★本番では g_A だけを渡す。g_A = ω(ā_B − A*)/S なので, 読んでいるのは
-        「B半分の誤差が A半分へ流す勾配」である。
+        ★本番では g_1 だけを渡す。g_1 = ω(Â_2 − A*)/S なので, 読んでいるのは
+        「I_2 側の誤差が I_1 側へ流す勾配」である。
         ★g_abs_mean と g_abs_max は 1/(|D_sub|·12·96) を含むため, D_sub や ε を
         変えると比較できない。同一設定内の時間変化を見る量である。
         残る3つ (g_frac_negligible, g_share_unidentifiable, g_sign_pos_frac) と
         g_share_<活動> は g の定数倍で変わらないので設定をまたいで比較できる。
-        ★σ の分母は n だが, g_A を駆動する ā_B は n/2 本の平均であり揺らぎは √2 倍。
+        ★σ の分母は n だが, g_1 を駆動する Â_2 は n/2 本の平均であり揺らぎは √2 倍。
         識別可能性の閾値を「全 n 本で報告する群平均」基準で定めた結果であり,
-        g_A に対する判定としては緩い側に立つ。
+        g_1 に対する判定としては緩い側に立つ。
         ★jsd では呼ばない。loss_grad が二次形式の勾配なので, 別の損失の勾配を
         報告することになる (呼び出し側で分岐している)。
 

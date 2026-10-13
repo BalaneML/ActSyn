@@ -229,8 +229,28 @@ class GRUMinimalScheduler(nn.Module):
         Returns:
             (このスロットの logits (B, NUM_ACT), 次の状態 h)
         """
-        x = self.act_embed(a_prev) + c_emb                                      # (B, H)
-        x = self.add_time(x, torch.tensor(slot, device=a_prev.device))
+        return self.step_embedded(self.act_embed(a_prev), c_emb, state, slot)
+
+    def step_embedded(self, e_prev: torch.Tensor, c_emb: torch.Tensor,
+                      state: GRUState | None, slot: int) -> tuple[torch.Tensor, GRUState]:
+        """直前の活動の埋め込みを受け取って 1 スロット分だけ進める（step の本体。LSTMScheduler.step_embedded と同じ）
+
+        Note:
+            ★Stage 2（LSTM_Aggregate/stage2_agg.py --cell gru_minimal）は、直前の活動を one-hot y と埋め込み行列の積
+              y @ act_embed.weight で渡す。y が厳密な one-hot なら act_embed(a_prev) と同じ値になり、
+              y に勾配があれば履歴を通して逆伝播できる
+
+        Args:
+            e_prev: 直前の活動の埋め込み, (B, HIDDEN)。step からは act_embed(a_prev)
+            c_emb: embed_cond の出力, (B, HIDDEN)
+            state: GRU の状態 h, (NUM_LAYERS, B, HIDDEN)。s = 0 では None（0 から始める）
+            slot: 生成するスロットの番号 s, 値域 [0, 96)。time_enc が none なら使わない
+
+        Returns:
+            (このスロットの logits (B, NUM_ACT), 次の状態 h)
+        """
+        x = e_prev + c_emb                                                      # (B, H)
+        x = self.add_time(x, torch.tensor(slot, device=e_prev.device))
         h, next_state = self.gru(x[:, None, :], state)                          # h: (B, 1, H)
         return self.out_proj(h[:, 0]), next_state
 

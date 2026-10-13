@@ -7,7 +7,7 @@ Stage 2 の学習ループ
 
 1更新でやること:
     1. 教師群から |D_sub| 群を一様抽出し, 群あたり n 本を打ち切り逆伝播つきで生成
-    2. straight-through で one-hot 化し, 群ごとに A/B へ二分して集計
+    2. straight-through で one-hot 化し, 群ごとに I_1 / I_2 へ二分して集計
     3. L_agg = split-batch 不偏推定の重み付き二乗誤差
     4. L_atus = ATUS 実個票のリハーサル項（Stage 1 と同じ ε-MSE）
     5. L_agg.backward() と (λ·L_atus).backward() を別々に呼んで AdamW を1歩
@@ -298,7 +298,7 @@ def check_shapes(K: int, d_sub: int, n: int) -> None:
     if n < 2 or n % 2 != 0:
         raise SystemExit(
             f"ERROR: n は2以上の偶数でなければならない（n={n}）。\n"
-            f"       split-batch 不偏推定が群内を A/B の半分ずつへ割るため（§7.5）")
+            f"       split-batch 不偏推定が群内を I_1 / I_2 の半分ずつへ割るため（§7.5）")
 
 
 def check_memory_budget(K: int, d_sub: int, n: int, chunk: int | None = None,
@@ -346,7 +346,7 @@ def aggregate_step(diffusion: Any,
                     chunk: int,
                     loss_kind: str = "sq",
                     tau: float = 1.0) -> tuple[float, torch.Tensor, torch.Tensor, dict[str, float]]:
-    """集計側の1更新分の勾配を θ.grad へ蓄積し、(L_agg の値, ā_A, ā_B, 診断) を返す。
+    """集計側の1更新分の勾配を θ.grad へ蓄積し、(L_agg の値, Â_1, Â_2, 診断) を返す。
 
     ★返り値の損失はスカラー値であって計算グラフを持たない。backward はこの関数の中で
       済ませてある。呼び出し側は先に optimizer.zero_grad() を済ませておくこと。
@@ -450,12 +450,12 @@ def _aggregate_step_one_pass(diffusion: Any,
     y = sm.straight_through(x0, tau)
     if loss_kind == "jsd":
         l_agg = sl.jsd_loss(y, a_star, n)
-        a_A, a_B = sl.group_rates_split(y.detach(), n)
+        a_hat_1, a_hat_2 = sl.group_rates_split(y.detach(), n)
     else:
-        a_A, a_B = sl.group_rates_split(y, n)
-        l_agg = sl.agg_loss_from_rates(a_A, a_B, a_star, omega)
+        a_hat_1, a_hat_2 = sl.group_rates_split(y, n)
+        l_agg = sl.agg_loss_from_rates(a_hat_1, a_hat_2, a_star, omega)
     l_agg.backward()
-    return float(l_agg.detach()), a_A.detach(), a_B.detach(), diag
+    return float(l_agg.detach()), a_hat_1.detach(), a_hat_2.detach(), diag
 
 
 def _aggregate_step_two_pass(diffusion: Any,
@@ -477,10 +477,10 @@ def _aggregate_step_two_pass(diffusion: Any,
         x0 = diffusion._sample_tail(model, x_K, K, cond, zs=zs)
         diag = _x0_diagnostics(x0)
         y = sm.straight_through(x0, tau)
-        a_A, a_B = sl.group_rates_split(y, n)
-        l_agg = float(sl.agg_loss_from_rates(a_A, a_B, a_star, omega))
-        g_A, g_B = sl.loss_grad(a_A, a_B, a_star, omega)
-        g_per = sl.per_sample_grad(g_A, g_B, n)          # (B,12,96)
+        a_hat_1, a_hat_2 = sl.group_rates_split(y, n)
+        l_agg = float(sl.agg_loss_from_rates(a_hat_1, a_hat_2, a_star, omega))
+        g_1, g_2 = sl.loss_grad(a_hat_1, a_hat_2, a_star, omega)
+        g_per = sl.per_sample_grad(g_1, g_2, n)          # (B,12,96)
 
     # ---- 2パス目: チャンクごとに末尾 K だけ再計算し、g を上流勾配として注入 ----
     for start in range(0, total, chunk):
@@ -491,7 +491,7 @@ def _aggregate_step_two_pass(diffusion: Any,
         # ★backward(gradient=...) は「この値を上流から来た勾配とみなせ」という指示。
         #   底にある概念は VJP（ベクトル・ヤコビアン積）で、計算しているのは vᵀJ
         y_c.backward(gradient=g_per[start:end])
-    return l_agg, a_A, a_B, diag
+    return l_agg, a_hat_1, a_hat_2, diag
 
 
 def val_epsilon_mse(diffusion: Any, model: torch.nn.Module, val_loader: Any,
@@ -801,7 +801,7 @@ def run(steps: int = DEFAULT_STEPS,
         # ---- 集計側（eval モードで微分する。§12 未決 G）----
         # ★zero_grad を先に置く。aggregate_step は内部で backward まで済ませるため
         optimizer.zero_grad(set_to_none=True)
-        l_agg, a_A, a_B, x0_diag = aggregate_step(diffusion, model, cond, K, n, a_star,
+        l_agg, a_hat_1, a_hat_2, x0_diag = aggregate_step(diffusion, model, cond, K, n, a_star,
                                                     omega, chunk, loss_kind)
         # ★集計側だけの θ 勾配をここで測る。リハーサル側を足した後では
         #   「集計の信号が straight-through と clamp を抜けて来ているか」が分からない
@@ -842,7 +842,7 @@ def run(steps: int = DEFAULT_STEPS,
 
         # ---- 記録 ----
         with torch.no_grad():
-            a_full = 0.5 * (a_A + a_B)          # 全 n 本の群平均（A半分とB半分の平均）
+            a_full = 0.5 * (a_hat_1 + a_hat_2)          # 全 n 本の群平均（I_1 側と I_2 側の平均）
             log: dict[str, Any] = {
                     "step": step, "L_agg": l_agg,
                     "L_atus": l_atus_num, "lam": lam, "sec": time.time() - t0,
@@ -852,8 +852,8 @@ def run(steps: int = DEFAULT_STEPS,
             # ★g の診断は二次形式のときだけ。loss_grad は split-batch の二乗誤差の
             #   勾配なので、jsd で回しているときに混ぜると別の損失の勾配を報告することになる
             if loss_kind != "jsd":
-                g_A, _ = sl.loss_grad(a_A, a_B, a_star, omega)
-                log.update(sl.g_diagnostics(g_A, a_star, n, act_names=sm.ACT_NAMES))
+                g_1, _ = sl.loss_grad(a_hat_1, a_hat_2, a_star, omega)
+                log.update(sl.g_diagnostics(g_1, a_star, n, act_names=sm.ACT_NAMES))
 
         # ---- val の ε-MSE（リハーサル項の過学習監視）----
         # ★学習の乱数を汚さない実装になっている（val_epsilon_mse の Note）。

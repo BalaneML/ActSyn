@@ -33,7 +33,7 @@ flowchart LR
     TGT --> EV
 ```
 
-## 2. 現在の到達点（2026-10-09）
+## 2. 現在の到達点（2026-10-10）
 
 土台は、学習型の時刻符号を持つ 1 層の LSTM（`LSTM_Aggregate`、H = 64、約 4.2 万パラメータ）である。Stage 2 は、GRU・LSTM のどの方法でも教師との誤差が DDPM より大きく縮んだ。一方で、1 日の系列が ATUS 実から離れる問題が残っている。
 
@@ -62,29 +62,31 @@ flowchart LR
 | DRaFT-K | `DDPM_Aggregate_Simple` | 拡散の逆過程の末尾 K ステップだけ勾配を通し、集計損失とリハーサルで重みを更新する |
 | 日本へのずれ δ | `GRU_Aggregate`（H128） | 重みは固定する。logits に「時刻 × 活動」のずれ δ を足し、生成した行動者率が A* に合うよう δ を反復で直す。δ は属性の足し算（共通＋性＋年齢＋就業）で持つ |
 | 傾けたリハーサル | `GRU_Aggregate`（H128） | 生成した個票に、集計が A* へ近づく重み（指数傾け）を付け、その重み付き交差エントロピーで重みを更新する |
-| 連鎖の逆伝播 | `LSTM_Aggregate`（H64） | 引いた活動を次の入力にしたまま、96 スロットの生成の連鎖を通して集計損失を逆伝播する（straight-through Gumbel-softmax） |
+| 連鎖の逆伝播 | `LSTM_Aggregate`・`GRU_Minimal`（H64） | 引いた活動を次の入力にしたまま、96 スロットの生成の連鎖を通して集計損失を逆伝播する（straight-through Gumbel-softmax）。LSTM と、セルだけを替えた GRU に同じ設定で当てた |
 
 | 方法 | 28 群の `rate_mse_split` | `bigram_jsd` | 1 日の切替回数（ATUS 実 12.81） | 判定 |
 | --- | --- | --- | --- | --- |
 | DRaFT-K | 2.59e-3（Pre-trained から −13.3%） | 0.0049 → 0.0023 | — | J1〜J6 の比較の基準 |
 | 日本へのずれ δ | 3.05e-3 → 5.8e-4 | 0.0016 → 0.0092 | 12.91 → 12.61 | J3 不合格 |
 | 傾けたリハーサル | 3.05e-3 → 5.6e-4 | 0.0016 → 0.0133 | 12.91 → 11.31 | J3・J4（起床時刻）不合格 |
-| 連鎖の逆伝播 | 3.42e-3 → 2.25e-4 | 0.0021 → 0.0043 | 13.04 → 12.39 | 判定前 |
+| 連鎖の逆伝播（LSTM） | 3.30e-3 → 2.25e-4 | 0.0022 → 0.0044 | 12.73 → 12.39 | J3 不合格 |
+| 連鎖の逆伝播（GRU） | 3.37e-3 → 2.53e-4 | 0.0018 → 0.0046 | 12.85 → 12.18 | J3・J4（起床時刻）不合格 |
 
-- 値は Pre-trained → Fine-tuned。GRU は E1 の 5 種の中央値、LSTM は種 42 の 1 本（学習率 1e-3・1000 step・λ = 0.01）。DDPM は λ = 0.003・step 200 の値で、`bigram_jsd` だけは LGO 7 fold の中央値。
-- 教師との誤差（28 群の `rate_mse_split`）は、DDPM Fine-tuned の 0.22 倍（GRU の 2 方法）と 0.09 倍（LSTM）まで縮んだ。教師から外した群でも、GRU の 2 方法は 7 fold すべてで Pre-trained と DDPM Fine-tuned を下回った（J1・J2 合格）。
-- 一方で、自己回帰の 3 方法はどれも `bigram_jsd` を増やした（GRU 5.8 倍・8.3 倍、LSTM 2.0 倍）。J3 の基準は Pre-trained の 1.2 倍以内なので、増え方の小さい LSTM（種 42）も基準を超えている。DDPM は `bigram_jsd` が半減したが、教師との誤差は 13% しか縮まなかった。
-- LSTM の種 43〜46 の E1 と LGO 7 fold は 2026-10-09 時点で実行中。判定 J1〜J6 はその後に出す。
+- 値は Pre-trained → Fine-tuned。δ・傾けたリハーサル・連鎖の逆伝播は E1 の 5 種の中央値（連鎖の逆伝播は学習率 1e-3・1000 step・λ = 0.01）。DDPM は λ = 0.003・step 200 の値で、`bigram_jsd` だけは LGO 7 fold の中央値。
+- 教師との誤差（28 群の `rate_mse_split`）は、DDPM Fine-tuned の 0.22 倍（δ・傾けたリハーサル）、0.09 倍（連鎖の逆伝播の LSTM）、0.10 倍（同 GRU）まで縮んだ。教師から外した群でも、自己回帰の 4 つはどれも 7 fold すべてで Pre-trained と DDPM Fine-tuned を下回った（J1・J2 合格）。
+- 一方で、自己回帰の 4 つはどれも `bigram_jsd` を増やした（δ 5.8 倍・傾けたリハーサル 8.4 倍、連鎖の逆伝播は LSTM 1.9 倍・GRU 2.6 倍）。J3 の基準は Pre-trained の 1.2 倍以内なので、増え方の小さい連鎖の逆伝播も基準を超えている。DDPM は `bigram_jsd` が半減したが、教師との誤差は 13% しか縮まなかった。
+- 連鎖の逆伝播では、教師への適合は LSTM と GRU で区別できない（28 群の種 5 本の範囲が重なり、外した群では GRU のほうが小さい fold が 7 中 5）。δ・傾けたリハーサルとの差はセルからは来ていない。方法と土台（最低限の構成）のどちらから来るかは、まだ分けていない。
 
 ### 2.3 判断待ちの論点
 
 | # | 論点 | 選択肢・状態 |
 | --- | --- | --- |
 | 1 | Stage 1 の構成を選ぶ基準 | 生成の質で選ぶ（1 層・H64、wd を 0.01〜0.1 へ下げる）か、val で選ぶ（2 層・H128・wd 1）か。`model.py` の既定は wd 1.0 のまま |
-| 2 | Stage 2 の系列の崩れ（J3） | GRU の 2 方法は不合格のまま保留している。LSTM の判定が出たら 3 方法を並べて決める |
-| 3 | Stage 2 の λ | 学習率 1e-3 での判定の後、λ を 0.01 から上下どちらへ振るかを決める |
+| 2 | Stage 2 の系列の崩れ（J3） | 自己回帰の 4 つとも不合格。崩れが最も小さいのは LSTM の連鎖の逆伝播（不合格は 3 指標）。採否は判断待ち |
+| 3 | Stage 2 の λ | λ を 0.01 から上下どちらへ振るかを決める（LSTM・GRU の両方で） |
 | 4 | 生成で積み重なる水準のずれ | 出力のバイアスを学習後に補正する部品を足すか |
 | 5 | 細切れの原因 | 生成の温度を下げ、wd 1 の構成の細切れが減るかを確かめる（学習し直しは不要） |
+| 6 | Stage 2 の方法と土台の切り分け | δ を最低限の LSTM・GRU に当てて、連鎖の逆伝播と比べる（提案） |
 
 計画だけで未着手の実験が 2 つある。計画はどちらも [pretrain_variation_plan.md](src/models/GRU_Aggregate/docs/pretrain_variation_plan.md) にある。
 
@@ -262,6 +264,7 @@ uv run python src/models/LSTM_Aggregate/stage2_agg.py --judge --lam 0.01 \
 - 1 回の更新で 7 群 × 256 本を生成し、集計損失 `l_agg` とリハーサル `l_reh`（ATUS の交差エントロピー）の勾配を足して AdamW を 1 歩進める。早期終了は使わず、判定には最終 step を使う。
 - コードの既定（学習率 cond・time 1e-4、その他 1e-5、300 step）は、2026-10-08 に結果を見る前に固定した値である。種 42 では `rate_mse_split` が 1.43e-3 で止まった。止めていたのは学習率 × step で決まる重みの移動量の上限だったので、2026-10-09 から学習率 1e-3・1000 step で回している。
 - 既定と違う学習率・step 数は保存名に入る（例：`_lam0.01_lr0.001_steps1000`）ので、既定の結果を上書きしない。
+- `--cell gru_minimal` を付けると、同じ手順を `GRU_Minimal` に当てる（判定・図も同じフラグ）。保存名の頭は `stage2_gru_minimal` になり、`GRU_Aggregate` の `stage2_gru_` とは分かれる。
 - 1 回の更新は約 0.27 秒（MPS）。ckpt は `outputs/checkpoints/stage2_lstm_…/stage2_step{S}.pt` に 25 step ごと、採点は `data/processed/aggregates/stage2_lstm_….csv` に出る。
 
 ### 6.3 評価と図
@@ -374,6 +377,7 @@ flowchart LR
 | --- | --- |
 | LSTM・GRU 最低限の実験のまとめ（Stage 1 の 5 実験と Stage 2） | `src/models/LSTM_Aggregate/docs/experiment_summary.md` ※ |
 | 上の個別の報告（セル・時刻符号・幅・weight decay・24 構成） | `src/models/LSTM_Aggregate/docs/Stage1_*.md` ※ |
+| 上の個別の報告（Stage 2 の連鎖の逆伝播：LSTM・GRU） | `src/models/LSTM_Aggregate/docs/Stage2_agg_lr_results.md`・`Stage2_gru_minimal_results.md` ※ |
 | GRU の計画と Stage 1 | [plan.md](src/models/GRU_Aggregate/docs/plan.md)・[Stage1_gru_results.md](src/models/GRU_Aggregate/docs/Stage1_gru_results.md) |
 | GRU の Stage 2 | [stage2_plan.md](src/models/GRU_Aggregate/docs/stage2_plan.md)・[Stage2_results.md](src/models/GRU_Aggregate/docs/Stage2_results.md)・[Stage2_finetune_results.md](src/models/GRU_Aggregate/docs/Stage2_finetune_results.md) |
 | GRU の H128 への切り替え | `src/models/GRU_Aggregate/docs/h128_results.md` ※ |
