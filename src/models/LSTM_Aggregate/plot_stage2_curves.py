@@ -7,6 +7,10 @@ LSTM_Aggregate の Stage 2（stage2_agg.py）の時刻別行動者率を描く�
     stage2_{セル}_curves_groups{変種}.png   GRU と同じ 4 群 × 4 活動（gsp.GROUP_EXAMPLES × gsp.GROUP_ACTS）。
                                             Fine-tuned は 28 群すべてを教師にした E1（この 4 群も教師に入っている）
     stage2_cells_curves{変種}.png           --compare: LSTM と GRU の Fine-tuned を重ねた全国の 12 活動
+    stage2_{セル}_learning_curves{変種}.png  --history: E1 の学習曲線（L_agg・L_reh・勾配の cos）
+    stage2_cells_learning_curves{変種}.png   --history --compare: LSTM と GRU の学習曲線を重ねたもの
+    stage2_{セル}_mae_curve{変種}_s2wd{値}.png --mae-curve: 評価のプールで測った A* との誤差の学習曲線を、
+                                            Stage 2 の weight decay の値ごとに重ねたもの
     {セル} は lstm / gru_minimal、{変種} は stage2_agg.variant_tag（例: _lam0.01）
 
 ★率は stage2_agg.run が評価のプール（2000 本/群、種 12345）から保存した npz を読む。生成し直さない。
@@ -24,6 +28,9 @@ flowchart LR
     ZS --> F2["plot_groups"]
     FT --> F2
     TGT --> F2
+    HIST["load_history(seed, variant, steps, cell)<br/>run_dir(seed, 'all', variant, cell)/history.csv"] --> F3["plot_history"]
+    PV["pretrained_val(seed, cell)<br/>Stage 1 の config['best_val']"] --> F3
+    SC["load_step_curve(seed, variant, steps, cell)<br/>s2.step_curve_path(seed, 'all', variant, cell)"] --> F4["plot_mae_curve"]
 ```
 
 使い方:
@@ -31,6 +38,8 @@ flowchart LR
     .venv/bin/python src/models/LSTM_Aggregate/plot_stage2_curves.py --lam 0.01 --seeds 42 43 44 45 46
     .venv/bin/python src/models/LSTM_Aggregate/plot_stage2_curves.py --cell gru_minimal --lam 0.01
     .venv/bin/python src/models/LSTM_Aggregate/plot_stage2_curves.py --compare --lam 0.01 --seeds 42 43 44 45 46
+    .venv/bin/python src/models/LSTM_Aggregate/plot_stage2_curves.py --history --compare --lam 0.01 --seeds 42 43 44 45 46
+    .venv/bin/python src/models/LSTM_Aggregate/plot_stage2_curves.py --mae-curve 0 0.01 --lam 0.01 --seeds 42 43 44 45 46
 """
 import argparse
 import importlib.util
@@ -40,6 +49,8 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+import pandas as pd
+import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FIG_DIR = Path(__file__).resolve().parent / "figures"
@@ -72,6 +83,7 @@ agr: Any = gsp.agr
 CELL_COLORS: dict[str, str] = {"lstm": cmp.ARM_COLOR["lstm"], "gru_minimal": "#e34948"}
 CELL_LABELS: dict[str, str] = {"lstm": "LSTM", "gru_minimal": "GRU"}
 DASH = (0, (3, 2))
+HISTORY_WINDOW = 50   # 学習曲線の移動平均の幅（step）
 
 
 def load_rates(seed: int, run: str, variant: str, cell: str = s2.CELL) -> FloatArr:
@@ -197,6 +209,160 @@ def plot_groups(tgt: dict, seed: int, variant: str, label_ft: str, out: Path, ce
     print(f"[stage2 curves] 図: {out}")
 
 
+def load_history(seed: int, variant: str, steps: int, cell: str = s2.CELL) -> pd.DataFrame:
+    """stage2_agg.train_stage2 が E1 で保存した 1 更新ごとの記録を読む
+
+    Args:
+        seed: 種
+        variant: stage2_agg.variant_tag の印
+        steps: 学習した step 数（記録の行数と照らす）
+        cell: 再帰の層 lstm / gru_minimal
+
+    Returns:
+        history.csv（列 step・L_agg・L_reh・L_reh_val・tug_cos ほか）
+
+    Raises:
+        FileNotFoundError: history.csv が無いとき
+        RuntimeError: 行数が steps と違うとき（途中で止まった実行を読むおそれ）
+    """
+    path = s2.run_dir(seed, "all", variant, cell) / "history.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} が無い。先に stage2_agg.py を回す（{cell}、種 {seed}）")
+    history = pd.read_csv(path)
+    if len(history) != steps:
+        raise RuntimeError(f"{path} の行数 {len(history)} が step 数 {steps} と違う")
+    return history
+
+
+def pretrained_val(seed: int, cell: str = s2.CELL) -> float:
+    """Stage 1 の学習記録にある ATUS の val の最小値（Stage 2 の L_reh_val と同じ関数で測った値）"""
+    ckpt = torch.load(s2.stage1_ckpt(seed, cell), map_location="cpu", weights_only=False)
+    return float(ckpt["config"]["best_val"])
+
+
+def plot_history(seeds: tuple[int, ...], variant: str, steps: int, cells: tuple[str, ...], out: Path) -> None:
+    """Stage 2 の学習曲線。L_agg・L_reh（train と val）・勾配の cos の 3 面
+
+    Note:
+        1. L_agg・L_reh・tug_cos は 1 更新ごとの値が揺れるので、HISTORY_WINDOW step の移動平均を描く
+           （L_agg は移動平均の前の値も薄く描く）。L_reh_val は VAL_EVERY step ごとの値をそのまま描く
+        2. ★L_agg は更新の前に、その step で引いた D_SUB 群だけで測った値。評価のプールの rate_mse_split とは別物
+        3. 種が 2 本以上なら、種ごとの曲線の中央値を線、最小〜最大を帯で描く
+        4. L_reh の破線は Pre-trained の val（種の中央値）
+
+    Args:
+        seeds: 描く種
+        variant: stage2_agg.variant_tag の印
+        steps: 学習した step 数
+        cells: 描くセル
+        out: 図の保存先
+    """
+    import matplotlib.pyplot as plt
+    fm = cmp.rd._figure_module()
+    fm.setup_fonts()
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.6))
+    for cell in cells:
+        color, name = CELL_COLORS[cell], CELL_LABELS[cell]
+        hists = [load_history(s, variant, steps, cell) for s in seeds]
+        step = hists[0]["step"].to_numpy()
+        smooth = {k: np.asarray([h[k].rolling(HISTORY_WINDOW, min_periods=1).mean() for h in hists])
+                  for k in ("L_agg", "L_reh", "tug_cos")}                                  # (種の数, steps)
+        val_rows = hists[0]["L_reh_val"].notna().to_numpy()
+        val = np.asarray([h["L_reh_val"].to_numpy()[val_rows] for h in hists])           # (種の数, steps / VAL_EVERY + 1)
+
+        def band(ax: Any, x: npt.NDArray[Any], y: FloatArr, label: str, lw: float = 1.8, alpha: float = 1.0) -> None:
+            if len(seeds) > 1:
+                ax.fill_between(x, y.min(axis=0), y.max(axis=0), color=color, alpha=0.18 * alpha, lw=0)
+            ax.plot(x, np.median(y, axis=0), color=color, lw=lw, alpha=alpha, label=label)
+
+        if len(seeds) == 1:
+            axes[0].plot(step, hists[0]["L_agg"], color=color, lw=0.6, alpha=0.2)
+        band(axes[0], step, smooth["L_agg"], name)
+        band(axes[1], step, smooth["L_reh"], f"{name} train", lw=1.0, alpha=0.6)
+        band(axes[1], step[val_rows], val, f"{name} val")
+        axes[1].axhline(float(np.median([pretrained_val(s, cell) for s in seeds])), color=color, lw=1.0, ls=DASH,
+                        label=f"{name} Pre-trained の val")
+        band(axes[2], step, smooth["tug_cos"], name)
+    axes[0].set_yscale("log")
+    axes[2].axhline(0.0, color="#888888", lw=0.8)
+    for ax, title in zip(axes, ("L_agg", "L_reh（ATUS の交差エントロピー）", "L_agg と L_reh の勾配の cos")):
+        ax.set_title(title, fontsize=12)
+        ax.set_xlabel("step", fontsize=10)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8.5, frameon=False)
+    fig.suptitle("Stage 2 の学習曲線", fontsize=14)
+    fig.tight_layout()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"[stage2 curves] 図: {out}")
+
+
+def load_step_curve(seed: int, variant: str, steps: int, cell: str = s2.CELL) -> pd.DataFrame:
+    """stage2_agg.step_curve が書いた E1 の学習曲線を、step × 指標の横持ちにして読む
+
+    Raises:
+        FileNotFoundError: CSV が無いとき
+        RuntimeError: CSV が最後の ckpt より古いとき（別の学習の曲線を読むおそれ）
+    """
+    path = s2.step_curve_path(seed, "all", variant, cell)
+    if not path.exists():
+        raise FileNotFoundError(f"{path} が無い。先に stage2_agg.py --step-curve を回す（{cell}、種 {seed}）")
+    last = s2.ck.ckpt_path(s2.run_dir(seed, "all", variant, cell), steps)
+    if last.exists() and path.stat().st_mtime < last.stat().st_mtime:
+        raise RuntimeError(f"{path.name} が {last.name} より古い。--step-curve で測り直す")
+    table = pd.read_csv(path)
+    table = table[(table["mask"] == "12act") & table["eval_kind"].isin(["in-teacher", "all"])]
+    return table.pivot_table(index="step", columns="metric", values="value")
+
+
+def plot_mae_curve(seeds: tuple[int, ...], arms: list[tuple[str, str]], steps: int, out: Path,
+                   cell: str = s2.CELL) -> None:
+    """評価のプールで測った A* との誤差の学習曲線（E1）。28 群の rate_mae・rate_mse_split と全国の曲線の MSE
+
+    Note:
+        1. 種が 2 本以上なら、線が種の中央値、帯が最小〜最大
+        2. 設定（arm）は線の種類で分ける。1 本目が実線、2 本目が破線
+
+    Args:
+        seeds: 描く種
+        arms: (凡例の名前, variant_tag の印) の list
+        steps: 学習した step 数
+        out: 図の保存先
+        cell: 再帰の層 lstm / gru_minimal
+    """
+    import matplotlib.pyplot as plt
+    fm = cmp.rd._figure_module()
+    fm.setup_fonts()
+    color = CELL_COLORS[cell]
+    panels = (("rate_mae", "A* との MAE（pt、28 群）", 100.0, False),
+              ("rate_mse_split", "rate_mse_split（28 群）", 1.0, True),
+              ("national_curve_mse", "全国の曲線の MSE", 1.0, True))
+    fig, axes = plt.subplots(1, len(panels), figsize=(16, 4.6))
+    for i, (label, variant) in enumerate(arms):
+        curves = [load_step_curve(s, variant, steps, cell) for s in seeds]
+        step = curves[0].index.to_numpy()
+        ls = "-" if i == 0 else DASH
+        for ax, (metric, _, scale, _) in zip(axes, panels):
+            y = np.asarray([c[metric].to_numpy() for c in curves]) * scale          # (種の数, step の数)
+            if len(seeds) > 1:
+                ax.fill_between(step, y.min(axis=0), y.max(axis=0), color=color, alpha=0.15, lw=0)
+            ax.plot(step, np.median(y, axis=0), color=color, lw=1.8, ls=ls, label=label)
+    for ax, (_, title, _, log) in zip(axes, panels):
+        if log:
+            ax.set_yscale("log")
+        ax.set_title(title, fontsize=12)
+        ax.set_xlabel("step", fontsize=10)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=9, frameon=False)
+    fig.suptitle("Stage 2 の A* との誤差の学習曲線", fontsize=14)
+    fig.tight_layout()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"[stage2 curves] 図: {out}")
+
+
 def main() -> None:
     """CLI"""
     import matplotlib
@@ -211,11 +377,32 @@ def main() -> None:
     ap.add_argument("--lr-cond", type=float, default=s2.LR_COND)
     ap.add_argument("--lr-time", type=float, default=s2.LR_TIME)
     ap.add_argument("--lr-rest", type=float, default=s2.LR_REST)
+    ap.add_argument("--weight-decay", type=float, default=s2.WEIGHT_DECAY, help="Stage 2 の weight decay")
+    ap.add_argument("--agg-loss", choices=s2.AGG_LOSSES, default=s2.AGG_LOSS, help="集計損失 mse / split")
     ap.add_argument("--seeds", type=int, nargs="+", default=[s2.LGO_SEED],
                     help="全国の図で平均する種。群ごとの図は最初の種")
+    ap.add_argument("--history", action="store_true",
+                    help="学習曲線（E1 の history.csv）だけを描く。--compare と併せると LSTM と GRU を重ねる")
+    ap.add_argument("--mae-curve", type=float, nargs="+", default=None, metavar="WD",
+                    help="A* との誤差の学習曲線（--step-curve の CSV）を、Stage 2 の weight decay の値ごとに重ねて描く")
     args = ap.parse_args()
     seeds = tuple(args.seeds)
-    variant = s2.variant_tag(args.lam, args.tau, args.bptt, args.steps, args.lr_cond, args.lr_time, args.lr_rest)
+    variant = s2.variant_tag(args.lam, args.tau, args.bptt, args.steps, args.lr_cond, args.lr_time, args.lr_rest,
+                             args.weight_decay, args.agg_loss)
+    if args.mae_curve is not None:
+        def tag_of(wd: float) -> str:
+            return s2.variant_tag(args.lam, args.tau, args.bptt, args.steps, args.lr_cond, args.lr_time,
+                                  args.lr_rest, wd, args.agg_loss)
+        arms = [(f"{CELL_LABELS[args.cell]} weight decay {wd:g}", tag_of(wd)) for wd in args.mae_curve]
+        wd_txt = "-".join(f"{wd:g}" for wd in args.mae_curve)
+        plot_mae_curve(seeds, arms, args.steps,
+                       FIG_DIR / f"stage2_{args.cell}_mae_curve{tag_of(s2.WEIGHT_DECAY)}_s2wd{wd_txt}.png", args.cell)
+        return
+    if args.history:
+        cells = tuple(s2.CELLS) if args.compare else (args.cell,)
+        prefix = "cells" if args.compare else args.cell
+        plot_history(seeds, variant, args.steps, cells, FIG_DIR / f"stage2_{prefix}_learning_curves{variant}.png")
+        return
     seed_txt = f"種 {seeds[0]}" if len(seeds) == 1 else f"種 {len(seeds)} 本の平均、帯は最小〜最大"
     # 学習率と step 数は既定と違うときだけ凡例に書く（variant_tag と同じ規則）
     lrs = (args.lr_cond, args.lr_time, args.lr_rest)
@@ -224,6 +411,8 @@ def main() -> None:
         setting += f"、学習率 {args.lr_cond:g}" if len(set(lrs)) == 1 else "、学習率 " + "/".join(f"{x:g}" for x in lrs)
     if args.steps != s2.STEPS:
         setting += f"、{args.steps} step"
+    if args.weight_decay != s2.WEIGHT_DECAY:
+        setting += f"、weight decay {args.weight_decay:g}"
     tgt = s2.st.load_stula_targets()
     if args.compare:
         # 2 つのセルは同じ設定なので、凡例には設定を書かない（設定は報告書の表に書く）
