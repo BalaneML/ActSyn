@@ -379,6 +379,8 @@ def main() -> None:
     ap.add_argument("--lr-rest", type=float, default=s2.LR_REST)
     ap.add_argument("--weight-decay", type=float, default=s2.WEIGHT_DECAY, help="Stage 2 の weight decay")
     ap.add_argument("--agg-loss", choices=s2.AGG_LOSSES, default=s2.AGG_LOSS, help="集計損失 mse / split")
+    ap.add_argument("--device", choices=s2.DEVICES, default=s2.DEVICE,
+                    help="結果を学習した計算場所（保存名の印 _cpu / _cuda を選ぶだけ。描画は CPU）")
     ap.add_argument("--seeds", type=int, nargs="+", default=[s2.LGO_SEED],
                     help="全国の図で平均する種。群ごとの図は最初の種")
     ap.add_argument("--history", action="store_true",
@@ -388,11 +390,11 @@ def main() -> None:
     args = ap.parse_args()
     seeds = tuple(args.seeds)
     variant = s2.variant_tag(args.lam, args.tau, args.bptt, args.steps, args.lr_cond, args.lr_time, args.lr_rest,
-                             args.weight_decay, args.agg_loss)
+                             args.weight_decay, args.agg_loss, args.device)
     if args.mae_curve is not None:
         def tag_of(wd: float) -> str:
             return s2.variant_tag(args.lam, args.tau, args.bptt, args.steps, args.lr_cond, args.lr_time,
-                                  args.lr_rest, wd, args.agg_loss)
+                                  args.lr_rest, wd, args.agg_loss, args.device)
         arms = [(f"{CELL_LABELS[args.cell]} weight decay {wd:g}", tag_of(wd)) for wd in args.mae_curve]
         wd_txt = "-".join(f"{wd:g}" for wd in args.mae_curve)
         plot_mae_curve(seeds, arms, args.steps,

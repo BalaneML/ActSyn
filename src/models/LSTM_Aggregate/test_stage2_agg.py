@@ -8,7 +8,8 @@ LSTM_Aggregate の Stage 2（stage2_agg.py）の単体テスト
        bptt = 1（毎スロットで履歴を切る）では届かない。L_agg の勾配は cond・time・rest の 3 群すべてに届く
     d. 層別学習率の群: すべてのパラメータがちょうど 1 つの群に入る。時刻符号 none では time 群を作らない。
        weight decay > 0 では 2 次元以上だけに減衰が掛かり、bias は {群}_bias（減衰 0）に入る
-    e. 保存先: Stage 1 の ckpt の名前、変種の印、E0 の CSV が変種によらないこと。GRU は頭が stage2_gru_minimal
+    e. 保存先: Stage 1 の ckpt の名前、変種の印、E0 の CSV が変種によらないこと。GRU は頭が stage2_gru_minimal。
+       計算場所の印は mps だけ空で、cpu・cuda は変種の最後に付く
     f. 評価の JSD: 損失側の sl.jsd_loss と一致し、同じ分布で 0 になる
     b〜d は LSTM と GRU（--cell gru_minimal）の両方で確かめる
 
@@ -170,6 +171,17 @@ def test_paths() -> None:
     assert (s2.csv_path(43, "fold3", "_lam0.01", "gru_minimal").name
             == "stage2_gru_minimal_time_learned_h64_wd0.01_lam0.01_s43_fold3.csv")
     assert s2.csv_path(42, "zeroshot", "_lam0.01", "gru_minimal") != s2.csv_path(42, "zeroshot", "_lam0.01")
+    assert s2.device_tag("mps") == "" and s2.device_tag("cpu") == "_cpu" and s2.device_tag("cuda") == "_cuda"
+    assert s2.variant_tag(0.01, device="mps") == "_lam0.01_mse"
+    assert (s2.variant_tag(0.01, steps=1000, lr_cond=1e-3, lr_time=1e-3, lr_rest=1e-3, agg_loss="split", device="cpu")
+            == "_lam0.01_lr0.001_steps1000_cpu")
+    assert (s2.run_dir(43, "fold2", s2.variant_tag(0.01, device="cpu")).name
+            == "stage2_lstm_time_learned_h64_wd0.01_lam0.01_mse_cpu_s43_fold2")
+    try:
+        s2.device_tag("tpu")
+        raise AssertionError("未知の計算場所で例外が出ない")
+    except ValueError:
+        pass
     print("e. 保存先: OK")
 
 

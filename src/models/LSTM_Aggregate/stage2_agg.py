@@ -64,6 +64,7 @@ flowchart TD
     .venv/bin/python src/models/LSTM_Aggregate/stage2_agg.py --seed 42 --lam 0.01 --fold 3
     .venv/bin/python src/models/LSTM_Aggregate/stage2_agg.py --judge --lam 0.01
     .venv/bin/python src/models/LSTM_Aggregate/stage2_agg.py --cell gru_minimal --seed 42 --zero-shot
+    .venv/bin/python src/models/LSTM_Aggregate/stage2_agg.py --seed 42 --lam 0.01 --device cpu --threads 1
 
     フラグ:
         --cell K         再帰の層 lstm / gru_minimal（既定 lstm）。保存先の頭が stage2_{K} になる
@@ -74,6 +75,10 @@ flowchart TD
         --agg-loss K     集計損失 mse（既定）/ split。mse は保存先に _mse、split は印なし（旧来の名前のまま）
         --weight-decay W Stage 2 の AdamW の weight decay（既定 0）。2 次元以上のパラメータだけに掛ける。
                          0 以外は保存先に _s2wd{W}
+        --device D       学習と採点の計算場所 cpu / mps / cuda（既定はこの計算機で使える GPU）。
+                         mps 以外は E1・E2 の保存先の最後に _{D}（E0 は計算場所によらず共有）
+        --threads T      CPU の計算のスレッド数。0 なら torch の既定。小さいモデルなので、CPU で何本も
+                         並列に回すときは 1 本 1 スレッドにする
         --eval-step S    学習せず、保存済みの step S の ckpt を採点する
         --step-curve     学習せず、保存済みの ckpt を 25 step ごとに採点し、A* との誤差の学習曲線を
                          data/processed/aggregates/stage2_..._step_curve.csv に書く
@@ -84,7 +89,7 @@ flowchart TD
     data/processed/aggregates/stage2_{セル}{Stage1}{変種}{種}_{実行}.csv           採点（GRU と同じ縦持ち）
     outputs/generated/stage2_{セル}{Stage1}{変種}{種}_{実行}_rates.npz             評価のプールの時刻別行動者率 (28, 12, 96)
         {セル} = lstm / gru_minimal、{Stage1} = _time_learned_h64_wd0.01、
-        {変種} = _lam{λ}[_mse][_tau{τ}][_bptt{K}][_lr{値}][_steps{N}][_s2wd{W}]（E0 は空）、
+        {変種} = _lam{λ}[_mse][_tau{τ}][_bptt{K}][_lr{値}][_steps{N}][_s2wd{W}][_cpu|_cuda]（E0 は空）、
         {種} は 42 なら空・それ以外は _s{seed}、{実行} = zeroshot / all / fold{K}
 """
 import argparse
@@ -183,6 +188,8 @@ SEEDS: tuple[int, ...] = gs2.SEEDS
 LGO_SEED: int = gs2.LGO_SEED
 
 DEVICE: str = lm.DEVICE
+# 学習・採点に使える計算場所。保存名の印は device_tag が作る（MPS だけ印なし）
+DEVICES: tuple[str, ...] = ("cpu", "mps", "cuda")
 CKPT_ROOT = REPO_ROOT / "outputs" / "checkpoints"
 OUT_DIR = REPO_ROOT / "data" / "processed" / "aggregates"
 RATES_DIR = REPO_ROOT / "outputs" / "generated"
@@ -348,15 +355,39 @@ def stage1_ckpt(seed: int, cell: str = CELL) -> Path:
                                  num_layers=STAGE1_NUM_LAYERS, weight_decay=STAGE1_WEIGHT_DECAY)
 
 
-def load_pretrained(seed: int, cell: str = CELL) -> Any:
-    """Pre-trained のモデルを eval モードで戻す"""
-    return CELLS[cell].load_model(stage1_ckpt(seed, cell))
+def load_pretrained(seed: int, cell: str = CELL, device: str = DEVICE) -> Any:
+    """Pre-trained のモデルを device に載せ、eval モードで戻す"""
+    return CELLS[cell].load_model(stage1_ckpt(seed, cell), device=device)
+
+
+def device_tag(device: str) -> str:
+    """計算場所の保存名の印。mps は空、cpu は _cpu、cuda は _cuda
+
+    Note:
+        1. ★2026-10-13 までの Stage 2 の結果はすべて MPS で回したので、MPS だけ印を付けない（名前を変えないため）
+        2. 計算場所が違うと浮動小数の丸めが違い、同じ種でも 1,000 step の学習の経過がずれる。
+           印を付けて、別の計算場所の実行が既存の ckpt・CSV を上書きしないようにする
+        3. E0（Pre-trained の採点）には付けない。評価のプールは CPU の乱数で引くので、計算場所による差は
+           56,000 本中 4 本・時刻別行動者率で最大 0.05pt（種 42 で実測）にとどまり、E0 は共有する
+
+    Args:
+        device: cpu / mps / cuda
+
+    Returns:
+        印の文字列
+
+    Raises:
+        ValueError: device が DEVICES に無いとき
+    """
+    if device not in DEVICES:
+        raise ValueError(f"device は {DEVICES} のどれか: {device}")
+    return "" if device == "mps" else f"_{device}"
 
 
 def variant_tag(lam: float, tau: float = TAU, bptt: int = BPTT, steps: int = STEPS, lr_cond: float = LR_COND,
                 lr_time: float = LR_TIME, lr_rest: float = LR_REST, weight_decay: float = WEIGHT_DECAY,
-                agg_loss: str = AGG_LOSS) -> str:
-    """Stage 2 の設定の印（例: _lam0.01_mse、_lam0.01_tau0.5_bptt8、_lam0.01_mse_lr0.001_steps1000_s2wd0.01）
+                agg_loss: str = AGG_LOSS, device: str = DEVICE) -> str:
+    """Stage 2 の設定の印（例: _lam0.01_mse、_lam0.01_tau0.5_bptt8、_lam0.01_mse_lr0.001_steps1000_s2wd0.01_cpu）
 
     Note:
         1. τ・bptt・学習率・step 数・weight decay は既定と違うときだけ書く（既定の結果の名前を変えないため）
@@ -376,6 +407,7 @@ def variant_tag(lam: float, tau: float = TAU, bptt: int = BPTT, steps: int = STE
         weight_decay: Stage 2 の weight decay, default=WEIGHT_DECAY。印は _s2wd{値}
             （Stage 1 の印 _wd0.01 と区別するため s2 を付ける）
         agg_loss: 集計損失 mse / split, default=AGG_LOSS="mse"
+        device: 学習した計算場所, default=DEVICE。印は device_tag（mps は印なし）で、いちばん後ろに付ける
 
     Returns:
         印の文字列
@@ -396,7 +428,7 @@ def variant_tag(lam: float, tau: float = TAU, bptt: int = BPTT, steps: int = STE
         tag += f"_steps{steps}"
     if weight_decay != WEIGHT_DECAY:
         tag += f"_s2wd{weight_decay:g}"
-    return tag
+    return tag + device_tag(device)
 
 
 def run_name(zero_shot: bool, fold: int | None) -> str:
@@ -507,6 +539,7 @@ def train_stage2(model: Any, tgt: dict, teacher_mask: BoolArr, seed: int, lam: f
                               "d_sub": d_sub, "n": n, "tau": tau, "bptt": bptt, "eps": EPS,
                               "lr_cond": lr_cond, "lr_time": lr_time, "lr_rest": lr_rest,
                               "weight_decay": weight_decay, "grad_clip": GRAD_CLIP,
+                              "device": str(dev), "threads": torch.get_num_threads(),
                               "holdout": np.flatnonzero(~teacher_mask).tolist()}
     print(f"[stage2] cell={cell} agg_loss={agg_loss} steps={steps} d_sub={d_sub} n={n} lam={lam:g} tau={tau:g} bptt={bptt} "
           f"teacher_groups={len(teacher_groups)}/28 lr cond={lr_cond:g} time={lr_time:g} rest={lr_rest:g} "
@@ -667,7 +700,7 @@ def write_scores(rows: list[dict[str, Any]], rates: FloatArr, seed: int, run: st
 def run(seed: int, fold: int | None, zero_shot: bool, lam: float = LAM, tau: float = TAU, bptt: int = BPTT,
         steps: int = STEPS, d_sub: int = D_SUB, n: int = N, lr_cond: float = LR_COND, lr_time: float = LR_TIME,
         lr_rest: float = LR_REST, eval_step: int | None = None, cell: str = CELL,
-        weight_decay: float = WEIGHT_DECAY, agg_loss: str = AGG_LOSS) -> None:
+        weight_decay: float = WEIGHT_DECAY, agg_loss: str = AGG_LOSS, device: str = DEVICE) -> None:
     """E0 / E1 / E2 を 1 本回して採点の CSV を書く
 
     Args:
@@ -687,14 +720,15 @@ def run(seed: int, fold: int | None, zero_shot: bool, lam: float = LAM, tau: flo
         cell: 再帰の層 lstm / gru_minimal
         weight_decay: Stage 2 の weight decay
         agg_loss: 集計損失 mse / split
+        device: 学習と採点の計算場所 cpu / mps / cuda。E1・E2 の保存名に device_tag が付く（E0 は共有）
     """
     tgt = st.load_stula_targets()
     name = run_name(zero_shot, fold)
     variant = "" if zero_shot else variant_tag(lam, tau, bptt, steps, lr_cond, lr_time, lr_rest, weight_decay,
-                                               agg_loss)
+                                               agg_loss, device)
     folds = gs2.fold_masks(tgt)
     if zero_shot:
-        model = load_pretrained(seed, cell)
+        model = load_pretrained(seed, cell, device)
         masks: dict[str, BoolArr] = {"all": np.ones(sm.D_GROUPS, dtype=bool), **folds}
         step = 0
     else:
@@ -702,17 +736,17 @@ def run(seed: int, fold: int | None, zero_shot: bool, lam: float = LAM, tau: flo
         masks = {name: teacher}
         out_dir = run_dir(seed, name, variant, cell)
         if eval_step is None:
-            model = load_pretrained(seed, cell)
+            model = load_pretrained(seed, cell, device)
             train_stage2(model, tgt, teacher, seed, lam, steps, d_sub, n, tau, bptt, lr_cond, lr_time, lr_rest,
                          weight_decay, out_dir=out_dir, cell=cell, agg_loss=agg_loss)
             step = steps
         else:
-            model = load_stage2(ck.ckpt_path(out_dir, eval_step), cell=cell)
+            model = load_stage2(ck.ckpt_path(out_dir, eval_step), device=device, cell=cell)
             step = eval_step
     model.eval()
     base: dict[str, Any] = {"model": f"{cell}{stage1_tag()}", "seed": seed, "run": name, "lam": lam if not zero_shot
                             else float("nan"), "tau": tau, "bptt": bptt, "step": step,
-                            "n_per_group": EVAL_N, "pool_seed": EVAL_SEED}
+                            "n_per_group": EVAL_N, "pool_seed": EVAL_SEED, "device": device}
     rows, rates = evaluate(model, tgt, masks, base)
     suffix = "" if eval_step is None or eval_step == steps else f"_step{eval_step}"
     write_scores(rows, rates, seed, name + suffix, variant, cell)
@@ -724,7 +758,7 @@ def step_curve_path(seed: int, run_: str, variant: str, cell: str = CELL) -> Pat
 
 
 def step_curve(seed: int, run_: str, variant: str, steps: int, cell: str = CELL,
-               every: int = SAVE_EVERY) -> pd.DataFrame:
+               every: int = SAVE_EVERY, device: str = DEVICE) -> pd.DataFrame:
     """保存済みの ckpt を every step ごとに評価のプールで採点し、A* との誤差の学習曲線を作る
 
     Note:
@@ -741,6 +775,7 @@ def step_curve(seed: int, run_: str, variant: str, steps: int, cell: str = CELL,
         steps: 学習した step 数（最後の ckpt）
         cell: 再帰の層 lstm / gru_minimal
         every: 採点する間隔（SAVE_EVERY の倍数）, default=SAVE_EVERY=25
+        device: 採点する計算場所。学習した計算場所は variant の印で決まり、こちらとは別でよい, default=DEVICE
 
     Returns:
         縦持ちの表（列 step・eval_kind・mask・metric・value）。step_curve_path に書く
@@ -754,12 +789,12 @@ def step_curve(seed: int, run_: str, variant: str, steps: int, cell: str = CELL,
     rows: list[dict[str, Any]] = []
     for step in range(0, steps + 1, every):
         if step == 0:
-            model = load_pretrained(seed, cell)
+            model = load_pretrained(seed, cell, device)
         else:
             path = ck.ckpt_path(out_dir, step)
             if not path.exists():
                 raise FileNotFoundError(f"{path} が無い")
-            model = load_stage2(path, cell=cell)
+            model = load_stage2(path, device=device, cell=cell)
         model.eval()
         pool = lm.group_pool(model, EVAL_N, seed=EVAL_SEED)
         for r in gs2.score_pool(pool, tgt, {run_: teacher}, {"step": step}, False):
@@ -825,14 +860,15 @@ def reference_rows(variant: str, cell: str = CELL) -> list[dict[str, Any]]:
 
 def judge(lam: float = LAM, tau: float = TAU, bptt: int = BPTT, steps: int = STEPS, lr_cond: float = LR_COND,
           lr_time: float = LR_TIME, lr_rest: float = LR_REST, cell: str = CELL,
-          weight_decay: float = WEIGHT_DECAY, agg_loss: str = AGG_LOSS) -> pd.DataFrame:
+          weight_decay: float = WEIGHT_DECAY, agg_loss: str = AGG_LOSS, device: str = DEVICE) -> pd.DataFrame:
     """E0〜E2 の CSV から J1〜J6 を判定する（GRU の stage2.judge と同じ規則・同じ比較先の DDPM の値）
 
     Note:
         1. 判定の後に MAE・JSD の参考行（reference_rows）を足して、同じ CSV に書き直す
         2. 判定するモデルの値の列の名前は cell（lstm / gru_minimal）
+        3. device は E1・E2 を学習した計算場所（保存名の印）。E0 は計算場所によらず共有の CSV を読む
     """
-    variant = variant_tag(lam, tau, bptt, steps, lr_cond, lr_time, lr_rest, weight_decay, agg_loss)
+    variant = variant_tag(lam, tau, bptt, steps, lr_cond, lr_time, lr_rest, weight_decay, agg_loss, device)
     out = OUT_DIR / f"stage2_{cell}{stage1_tag()}{variant}_judge.csv"
     table = gs2.judge(path_of=lambda seed, run_: csv_path(seed, run_, variant, cell), out_path=out, label=cell)
     table = pd.concat([table, pd.DataFrame(reference_rows(variant, cell))], ignore_index=True)
@@ -840,10 +876,10 @@ def judge(lam: float = LAM, tau: float = TAU, bptt: int = BPTT, steps: int = STE
     return table
 
 
-def smoke(cell: str = CELL) -> None:
+def smoke(cell: str = CELL, device: str = DEVICE) -> None:
     """2 更新・群あたり 4 本で学習と軸 1 の採点が通ることだけを確かめる（何も保存しない）"""
     tgt = st.load_stula_targets()
-    model = load_pretrained(LGO_SEED, cell)
+    model = load_pretrained(LGO_SEED, cell, device)
     teacher = teacher_mask_of(tgt, 0)
     before = {k: v.detach().clone() for k, v in model.state_dict().items()}
     history = train_stage2(model, tgt, teacher, LGO_SEED, steps=2, d_sub=2, n=4, val_every=1, cell=cell)
@@ -852,7 +888,7 @@ def smoke(cell: str = CELL) -> None:
     assert len(history) == 2 and all(math.isfinite(h["L_agg"]) for h in history)
     assert {"in-teacher", "held-out", "all"} <= {r["eval_kind"] for r in rows}
     assert rates.shape == (sm.D_GROUPS, sm.NUM_ACT, sm.NUM_SLOTS)
-    print(f"smoke: OK（{cell}、{len(rows)} 行、更新されたパラメータ {len(moved)}/{len(before)}）")
+    print(f"smoke: OK（{cell}、{device}、{len(rows)} 行、更新されたパラメータ {len(moved)}/{len(before)}）")
 
 
 def main() -> None:
@@ -875,6 +911,10 @@ def main() -> None:
                     help="集計損失。mse = 素の MSE（既定、保存先に _mse）、split = split-batch の積（印なし）")
     ap.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY,
                     help="Stage 2 の AdamW の weight decay（2 次元以上のパラメータだけ）。0 以外は保存先に _s2wd{値}")
+    ap.add_argument("--device", choices=DEVICES, default=DEVICE,
+                    help=f"学習と採点の計算場所（既定 {DEVICE}）。mps 以外は E1・E2 の保存先に _{{device}}")
+    ap.add_argument("--threads", type=int, default=0,
+                    help="CPU の計算に使うスレッド数（torch.set_num_threads）。0 なら torch の既定のまま")
     ap.add_argument("--eval-step", type=int, default=None, help="学習せず、保存済みの step の ckpt を採点する")
     ap.add_argument("--judge", action="store_true", help="E0〜E2 の CSV から J1〜J6 を出す")
     ap.add_argument("--step-curve", action="store_true",
@@ -885,19 +925,29 @@ def main() -> None:
         ap.error("--zero-shot は --fold・--eval-step と併用できない")
     if args.fold is not None and not 0 <= args.fold < lgo.N_FOLDS:
         ap.error(f"--fold は 0〜{lgo.N_FOLDS - 1}: {args.fold}")
+    if args.device == "mps" and not torch.backends.mps.is_available():
+        ap.error("--device mps: この計算機では MPS が使えない")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        ap.error("--device cuda: この計算機では CUDA が使えない")
+    if args.threads < 0:
+        ap.error(f"--threads は 0 以上: {args.threads}")
+    if args.threads > 0:
+        torch.set_num_threads(args.threads)
     if args.smoke:
-        smoke(args.cell)
+        smoke(args.cell, args.device)
     elif args.step_curve:
         variant = variant_tag(args.lam, args.tau, args.bptt, args.steps, args.lr_cond, args.lr_time, args.lr_rest,
-                              args.weight_decay, args.agg_loss)
-        step_curve(args.seed, run_name(False, args.fold), variant, args.steps, args.cell)
+                              args.weight_decay, args.agg_loss, args.device)
+        step_curve(args.seed, run_name(False, args.fold), variant, args.steps, args.cell, device=args.device)
     elif args.judge:
         with pd.option_context("display.width", 200, "display.float_format", "{:.4g}".format):
             print(judge(args.lam, args.tau, args.bptt, args.steps, args.lr_cond, args.lr_time,
-                        args.lr_rest, args.cell, args.weight_decay, args.agg_loss).to_string(index=False))
+                        args.lr_rest, args.cell, args.weight_decay, args.agg_loss,
+                        args.device).to_string(index=False))
     else:
         run(args.seed, args.fold, args.zero_shot, args.lam, args.tau, args.bptt, args.steps, args.d_sub, args.n,
-            args.lr_cond, args.lr_time, args.lr_rest, args.eval_step, args.cell, args.weight_decay, args.agg_loss)
+            args.lr_cond, args.lr_time, args.lr_rest, args.eval_step, args.cell, args.weight_decay, args.agg_loss,
+            args.device)
 
 
 if __name__ == "__main__":
