@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -q SQUID-S
-#PBS -l elapstim_req=03:00:00
+#PBS -l elapstim_req=03:30:00
 #PBS -l cpunum_job=38
 #PBS -l gpunum_job=1
 #PBS -N dt_2stage_ddpm
@@ -10,9 +10,10 @@
 # 共通の 2 段階学習を DDPM_Minimal（幅 16・CFG なし）で回す: Stage 1 → E0（Pre-trained の採点）→ E1（Stage 2）。
 # 幅 8 の出力（ddpm_minimal_ch8_*）は別名なので、このスクリプトは読まない・上書きしない。
 #
-# elapstim_req=03:00:00 の根拠（2026-10-29、幅 8 の実測。幅 16 は jobs/two_stage_ddpm_measure.sh で測り直して更新する）:
-#   Stage 1 は 1 epoch 0.32 秒（最大 1,000 epoch で約 5 分）、Stage 2 は 1 更新 5.1 秒（1,000 更新で 1.43 時間）、
-#   評価のプール 56,000 本は 2.7 分（E0・E1 で 2 回）。起動を含めて約 1.8 時間 × 安全率 1.5 ≒ 3 時間（ユーザー承認済み）
+# elapstim_req=03:30:00 の根拠（2026-10-29、幅 16 を jobs/two_stage_ddpm_measure.sh で実測、A100、ジョブ 1632014）:
+#   Stage 1 は 1 epoch 0.32 秒（最大 1,000 epoch で約 5 分）、Stage 2 は 1 更新 6.9 秒。幅 8 の本番では
+#   リハーサルと val を含む 1 step が測定値の 1.09 倍だったので 7.6 秒とみて、1,000 step で 2.1 時間。
+#   評価のプール 56,000 本は 3.8 分（E0・E1 で 2 回）。起動を含めて約 2.4 時間 × 安全率 1.5 ≒ 3.5 時間（ユーザー承認済み）
 #
 # 投入: SEED=42 jobs/submit.sh -v SEED jobs/two_stage_ddpm.sh
 #
