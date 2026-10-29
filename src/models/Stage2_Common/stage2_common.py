@@ -59,7 +59,8 @@ flowchart TD
     .venv/bin/python src/models/Stage2_Common/stage2_common.py --model lstm --seed 42 --device cpu --threads 1 --resume
 
     フラグ:
-        --model M        モデル（MODEL_ADAPTERS のキー: lstm / gru_minimal / vae_minimal / ddpm_minimal）
+        --model M        モデル（MODEL_ADAPTERS のキー: lstm / gru_minimal / vae_minimal / ddpm_minimal /
+                         gan_minimal_final / gan_minimal_valbest）
         --seed S         種（Pre-trained の ckpt と Stage 2 の乱数）
         --zero-shot      学習せず Pre-trained を採点する（E0）
         --lam V          リハーサルの重み λ（既定 0.01、暫定）
@@ -142,6 +143,9 @@ MODEL_ADAPTERS: dict[str, Path] = {
     "gru_minimal": LSTM_DIR / "stage2_adapter.py",
     "vae_minimal": REPO_ROOT / "src" / "models" / "VAE_Minimal" / "stage2_adapter.py",
     "ddpm_minimal": REPO_ROOT / "src" / "models" / "DDPM_Minimal" / "stage2_adapter.py",
+    # GAN は Stage 1 の 2 つの ckpt（最終 epoch・val 最良）を別の名前で登録する
+    "gan_minimal_final": REPO_ROOT / "src" / "models" / "GAN_Minimal" / "stage2_adapter.py",
+    "gan_minimal_valbest": REPO_ROOT / "src" / "models" / "GAN_Minimal" / "stage2_adapter.py",
 }
 
 # 採点（GRU・LSTM の Stage 2 と同じ）
