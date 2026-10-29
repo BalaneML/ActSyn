@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -q SQUID-S
-#PBS -l elapstim_req=04:00:00
+#PBS -l elapstim_req=03:00:00
 #PBS -l cpunum_job=38
 #PBS -l gpunum_job=1
 #PBS -N dt_2stage_ddpm
@@ -9,9 +9,11 @@
 #
 # 共通の 2 段階学習を DDPM_Minimal（幅 8・CFG なし）で回す: Stage 1 → E0（Pre-trained の採点）→ E1（Stage 2）。
 #
-# ★要求経過時間（上の elapstim_req）は仮の値。jobs/two_stage_ddpm_measure.sh の実測から見積もり、
-#   ユーザーの承認を得てから投入時に上書きする:
-#       SEED=42 jobs/submit.sh -v SEED -l elapstim_req=HH:MM:SS jobs/two_stage_ddpm.sh
+# elapstim_req=03:00:00 の根拠（2026-10-29、jobs/two_stage_ddpm_measure.sh の実測、A100）:
+#   Stage 1 は 1 epoch 0.32 秒（最大 1,000 epoch で約 5 分）、Stage 2 は 1 更新 5.1 秒（1,000 更新で 1.43 時間）、
+#   評価のプール 56,000 本は 2.7 分（E0・E1 で 2 回）。起動を含めて約 1.8 時間 × 安全率 1.5 ≒ 3 時間（ユーザー承認済み）
+#
+# 投入: SEED=42 jobs/submit.sh -v SEED jobs/two_stage_ddpm.sh
 #
 # ★出力が既にある段は飛ばす。E1 は --resume で保存済みの最新の ckpt から続けるので、時間切れで止まっても
 #   同じコマンドで再投入すれば続きから回る（25 step ごとに保存）。
