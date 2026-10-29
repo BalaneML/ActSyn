@@ -11,6 +11,8 @@ DDPM_Minimal（model.py・stage2_adapter.py）の単体テスト（CPU で回る
     f. 保存名（学習率・run_tag）と、途中の ckpt の保存（--save-every）が学習の結果を変えないこと
     g. reverse_chain（group_pool と trajectory_pools.py が使う逆過程）が、手で回した逆過程と一致する
     h. trajectory_pools.py の final_x_stats・activity_shares が、手で数えた値と一致する
+    i. 幅の変更（set_base_ch）: 使えない幅の拒否・保存名・パラメータ数・幅の違う ckpt の扱い。
+       trajectory_pools.py は ckpt の幅に合わせて読む
 
     .venv/bin/python src/models/DDPM_Minimal/test_model.py
 """
@@ -208,6 +210,36 @@ def test_final_x_stats_and_shares() -> None:
     print("h. final_x_stats・activity_shares: OK")
 
 
+def test_width_option() -> None:
+    """i. 幅の変更: 使えない幅の拒否・保存名・パラメータ数・幅の違う ckpt の扱い（1 epoch・群あたり 2 本）"""
+    for bad in (8, 12, 20):                                # 12 未満、または 8 の倍数でない
+        try:
+            dm.set_base_ch(bad)
+            raise AssertionError(f"幅 {bad} を拒否していない")
+        except ValueError:
+            pass
+    assert dm.base.BASE_CH == dm.BASE_CH == 16
+    try:
+        dm.set_base_ch(32)
+        assert dm.stage1_tag() == "_ch32_wd0.01" and dm.ckpt_path(42).name == "ddpm_minimal_ch32_wd0.01.pt"
+        assert dm.count_params(_model()) == 528_628
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "w32.pt"
+            dm.train(epochs=1, seed=0, save_path=path, device="cpu")
+            dm.set_base_ch(16)
+            try:
+                dm.load_model(path, device="cpu")
+                raise AssertionError("幅の違う ckpt を読めてしまった")
+            except ValueError:
+                pass
+            row = tp.measure_ckpt(path, tp.load_real(), dm.base.Diffusion("cpu"), 2, tp.POOL_SEED, "cpu")
+            assert dm.base.BASE_CH == 32 and row["base_ch"] == 32 and np.isfinite(row["tv_atus"])
+    finally:
+        dm.set_base_ch(dm.BASE_CH)
+    assert dm.stage1_tag() == "_ch16_wd0.01" and s2c.sm.BASE_CH == 64
+    print("i. 幅の変更・使えない幅の拒否・ckpt の幅に合わせた読み戻し: OK")
+
+
 if __name__ == "__main__":
     test_size_and_isolation()
     test_matches_base_unet()
@@ -217,4 +249,5 @@ if __name__ == "__main__":
     test_names_and_save_every()
     test_reverse_chain_matches_inline()
     test_final_x_stats_and_shares()
+    test_width_option()
     print("all OK")

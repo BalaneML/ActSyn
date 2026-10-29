@@ -17,7 +17,8 @@ DDPM_Aggregate_Simple からの変更点（それ以外の denoiser・拡散の�
   12 × 96 = 1,152 個の値を 8 × 96 = 768 個に絞るので、ε の二乗誤差がどう学習しても 1/3 を下回れず、生成が崩れた
   （Stage2_Common/docs/Stage2_common_results.md §5）。GroupNorm(8, ·) のため 8 の倍数で、16 が最小
 ★幅・dropout は DDPM_Aggregate_Simple/model.py のモジュールの定数で決まる（--kernel と同じ仕組み）。
-  別名で読み込んだ写し（base）の定数だけを書き換えるので、ほかの実験が使う同じファイルには影響しない
+  別名で読み込んだ写し（base）の定数だけを書き換えるので、ほかの実験が使う同じファイルには影響しない。
+  幅は set_base_ch（CLI は --base-ch）で変える。モデルを作る前・ckpt を読む前に呼ぶ
 
 ★乱数の置き場所:
     - Stage 1 の t と ε、Stage 2 のリハーサルの t と ε は CPU の大域の乱数で引く（計算場所によらず同じ値。
@@ -44,6 +45,7 @@ flowchart LR
 
 ```mermaid
 flowchart TD
+    SB["set_base_ch(base_ch)<br/>base.BASE_CH を書き換える（--base-ch。既定 16）"] --> TR
     TR["train(epochs, seed, save_path, device, lr, save_every)<br/>eps_mse（t・ε は CPU の大域の乱数）<br/>val_loss（t・ε を固定）で早期終了"] --> CK["save_ckpt(model, ckpt_path(seed, lr, run_tag), seed, extra)"]
     TR -. "save_every > 0（診断用）" .-> EP["save_ckpt(model, epoch_ckpt_path(save_path, ep), seed, extra)"]
     CK --> GP["group_pool(model, diffusion, n_per_group, seed)<br/>reverse_chain(model, diffusion, cond_idx, gen) → argmax<br/>pool (28, n_per_group, 96)"]
@@ -57,10 +59,14 @@ flowchart TD
     # 診断用（Stage2_common_results.md §7）：50 epoch ごとに途中の ckpt も残す。本番の ckpt と別名にする
     .venv/bin/python src/models/DDPM_Minimal/model.py --seed 42 --device cuda --save-every 50 --run-tag _traj
     .venv/bin/python src/models/DDPM_Minimal/model.py --seed 42 --device cuda --save-every 50 --lr 2e-4
+    # 幅を変える（Stage1_ddpm_minimal_traj_results.md §5 の案 W）。保存名は _ch{幅}_wd0.01 になる
+    .venv/bin/python src/models/DDPM_Minimal/model.py --base-ch 32 --seed 42 --device cuda --save-every 100
+    .venv/bin/python src/models/DDPM_Minimal/model.py --base-ch 32 --measure --device cuda
 
 出力:
     outputs/checkpoints/ddpm_minimal{構成}{run_tag}{接尾辞}.pt   val 最良の ckpt（config に学習曲線 history）
-        {構成} = stage1_tag() = _ch16_wd0.01。学習率が既定（1e-3）以外なら _lr{学習率} が付く（例 _ch16_wd0.01_lr0.0002）
+        {構成} = stage1_tag() = _ch{幅}_wd0.01（幅の既定は 16）。学習率が既定（1e-3）以外なら _lr{学習率} が付く
+        （例 _ch16_wd0.01_lr0.0002）
         {run_tag} は --run-tag（既定は空）、{接尾辞} は種 42 なら空、それ以外は _s{seed}
     outputs/checkpoints/ddpm_minimal{構成}{run_tag}{接尾辞}_ep{epoch:04d}.pt   --save-every N のときの途中の ckpt
 """
@@ -177,10 +183,35 @@ class DDPMMinimal(base.UNet1D):
         return h1, h2, h3
 
 
-def stage1_tag(base_ch: int = BASE_CH, weight_decay: float = WEIGHT_DECAY, lr: float = LR) -> str:
-    """Pre-trained の構成の印（例: _ch16_wd0.01。学習率が既定の LR 以外なら _ch16_wd0.01_lr0.0002）"""
+def set_base_ch(base_ch: int) -> None:
+    """denoiser の幅を変える（写し base の定数 base.BASE_CH を書き換える）
+
+    Note:
+        DDPMMinimal・stage1_tag・ckpt_path・save_ckpt・load_model は、呼んだ時点の base.BASE_CH を使う。
+        ほかの実験が使う DDPM_Aggregate_Simple のモジュールは変わらない
+
+    Args:
+        base_ch: 幅。NUM_ACT（12）以上で、GroupNorm(8, ·) のため 8 の倍数
+
+    Raises:
+        ValueError: 幅が NUM_ACT より小さいか、8 の倍数でないとき
+    """
+    if base_ch < NUM_ACT or base_ch % 8 != 0:
+        raise ValueError(f"幅 {base_ch} は使えない。{NUM_ACT} 以上の 8 の倍数にする（GroupNorm(8, ·)）")
+    base.BASE_CH = base_ch
+
+
+def stage1_tag(base_ch: int | None = None, weight_decay: float = WEIGHT_DECAY, lr: float = LR) -> str:
+    """Pre-trained の構成の印（例: _ch16_wd0.01。学習率が既定の LR 以外なら _ch16_wd0.01_lr0.0002）
+
+    Args:
+        base_ch: 幅, default=None（いまの base.BASE_CH。set_base_ch で変わる）
+        weight_decay: weight decay, default=WEIGHT_DECAY=0.01
+        lr: 学習率, default=LR=1e-3
+    """
+    ch = base.BASE_CH if base_ch is None else base_ch
     lr_tag = "" if lr == LR else f"_lr{lr:g}"
-    return f"_ch{base_ch}_wd{weight_decay:g}{lr_tag}"
+    return f"_ch{ch}_wd{weight_decay:g}{lr_tag}"
 
 
 def count_params(model: nn.Module) -> int:
@@ -351,7 +382,7 @@ def load_model(path: Path, device: str = DEVICE) -> DDPMMinimal:
     """save_ckpt で保存した ckpt から eval モードのモデルを戻す
 
     Raises:
-        ValueError: ckpt の幅が BASE_CH と違うとき
+        ValueError: ckpt の幅が base.BASE_CH と違うとき（幅の違う ckpt は、先に set_base_ch で幅を合わせる）
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if ckpt["config"]["base_ch"] != base.BASE_CH:
@@ -362,10 +393,11 @@ def load_model(path: Path, device: str = DEVICE) -> DDPMMinimal:
 
 
 def ckpt_path(seed: int, lr: float = LR, run_tag: str = "") -> Path:
-    """最良の ckpt のパス
+    """最良の ckpt のパス（幅は呼んだ時点の base.BASE_CH）
 
     例: 種 42 は ddpm_minimal_ch16_wd0.01.pt、種 43 は ddpm_minimal_ch16_wd0.01_s43.pt、
-        学習率 2e-4 は ddpm_minimal_ch16_wd0.01_lr0.0002.pt、run_tag="_traj" は ddpm_minimal_ch16_wd0.01_traj.pt
+        学習率 2e-4 は ddpm_minimal_ch16_wd0.01_lr0.0002.pt、run_tag="_traj" は ddpm_minimal_ch16_wd0.01_traj.pt、
+        set_base_ch(32) の後の種 42 は ddpm_minimal_ch32_wd0.01.pt
 
     Args:
         seed: 学習の乱数の種
@@ -512,14 +544,16 @@ def measure(device: str = DEVICE) -> None:
     group_pool(model, diffusion, POOL_BATCH // D_GROUPS, seed=0)
     sync()
     pool_sec = (time.perf_counter() - t0) * (2000 * D_GROUPS) / (POOL_BATCH // D_GROUPS * D_GROUPS)
-    print(f"[measure] device={device}  Stage 1: 1 epoch {epoch_sec:.2f} 秒（1,000 epoch で {epoch_sec * 1000 / 3600:.2f} 時間）")
+    print(f"[measure] device={device}  base_ch={base.BASE_CH}  params={count_params(model):,}  "
+          f"Stage 1: 1 epoch {epoch_sec:.2f} 秒（1,000 epoch で {epoch_sec * 1000 / 3600:.2f} 時間）")
     print(f"[measure] Stage 2: 1 更新 {update_sec:.1f} 秒（1,000 更新で {update_sec * 1000 / 3600:.2f} 時間。リハーサルと val は含まない）")
     print(f"[measure] 評価のプール 56,000 本: {pool_sec / 60:.1f} 分（E0・E1 で 2 回）")
 
 
 def main() -> None:
     """CLI"""
-    ap = argparse.ArgumentParser(description="DDPM_Minimal: 幅 16・CFG なしの DDPM の Stage 1")
+    ap = argparse.ArgumentParser(description="DDPM_Minimal: CFG なしの DDPM の Stage 1（幅の既定は 16）")
+    ap.add_argument("--base-ch", type=int, default=BASE_CH, help="denoiser の幅。保存名の _ch{幅} になる")
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--epochs", type=int, default=EPOCHS)
     ap.add_argument("--device", choices=("cpu", "mps", "cuda"), default=DEVICE)
@@ -531,6 +565,7 @@ def main() -> None:
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--measure", action="store_true", help="所要時間だけを測る（何も保存しない）")
     args = ap.parse_args()
+    set_base_ch(args.base_ch)
     if args.threads > 0:
         torch.set_num_threads(args.threads)
     if args.smoke:
@@ -540,8 +575,8 @@ def main() -> None:
         measure(args.device)
         return
     path = ckpt_path(args.seed, lr=args.lr, run_tag=args.run_tag)
-    print(f"[config] seed={args.seed} epochs={args.epochs} device={args.device} lr={args.lr:g} "
-          f"save_every={args.save_every} ckpt={path.name}")
+    print(f"[config] base_ch={base.BASE_CH} seed={args.seed} epochs={args.epochs} device={args.device} "
+          f"lr={args.lr:g} save_every={args.save_every} ckpt={path.name}")
     train(epochs=args.epochs, seed=args.seed, save_path=path, device=args.device, lr=args.lr,
           save_every=args.save_every)
 

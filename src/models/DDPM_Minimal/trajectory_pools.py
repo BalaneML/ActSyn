@@ -30,6 +30,7 @@ flowchart LR
 
 使い方:
     .venv/bin/python src/models/DDPM_Minimal/trajectory_pools.py --stem ddpm_minimal_ch16_wd0.01_traj --device cuda
+    .venv/bin/python src/models/DDPM_Minimal/trajectory_pools.py --stem ddpm_minimal_ch32_wd0.01 --device cuda   # 幅は ckpt から読む
     .venv/bin/python src/models/DDPM_Minimal/trajectory_pools.py --smoke   # 手元の CPU で形だけ確かめる（何も残さない）
 
 出力:
@@ -199,6 +200,9 @@ def measure_ckpt(path: Path, real: RealData, diffusion: Any, n_per_group: int, s
                  device: str) -> dict[str, Any]:
     """1 つの ckpt から小さなプールを作って測る
 
+    Note:
+        ckpt の config の幅に合わせて dm.set_base_ch を呼ぶ（呼んだ後は dm の関数がこの幅を使う）
+
     Args:
         path: ckpt（途中の ckpt は config に epoch・val、val 最良の ckpt は best_epoch・best_val を持つ）
         real: ATUS 平日の実データ
@@ -208,14 +212,16 @@ def measure_ckpt(path: Path, real: RealData, diffusion: Any, n_per_group: int, s
         device: 計算場所
 
     Returns:
-        1 行分の記録（ckpt・epoch・is_best・lr・val・pool_seed・n_per_group・pool_metrics・final_x_stats・sec）
+        1 行分の記録（ckpt・base_ch・epoch・is_best・lr・val・pool_seed・n_per_group・pool_metrics・final_x_stats・sec）
     """
     config = torch.load(path, map_location="cpu", weights_only=False)["config"]
     is_best = "best_epoch" in config
+    dm.set_base_ch(int(config["base_ch"]))
     model = dm.load_model(path, device=device)
     t0 = time.perf_counter()
     pool, fx = pool_and_final_x(model, diffusion, n_per_group, seed)
-    row: dict[str, Any] = {"ckpt": path.name, "epoch": int(config["best_epoch"] if is_best else config["epoch"]),
+    row: dict[str, Any] = {"ckpt": path.name, "base_ch": int(config["base_ch"]),
+                           "epoch": int(config["best_epoch"] if is_best else config["epoch"]),
                            "is_best": is_best, "lr": float(config.get("lr", dm.LR)),
                            "val": float(config["best_val"] if is_best else config["val"]),
                            "pool_seed": seed, "n_per_group": n_per_group}
