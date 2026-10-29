@@ -8,6 +8,9 @@ DDPM_Minimal（model.py・stage2_adapter.py）の単体テスト（CPU で回る
     d. Stage 2 の生成: 前向きは硬い one-hot で、同じ雑音で勾配なしに回した逆過程の argmax と一致する（評価の生成と同じ標本）。
        勾配はモデルに届く
     e. 共通の Stage 2 で回せて、途中の ckpt からの再開が止めずに回した結果とビット単位で一致する
+    f. 保存名（学習率・run_tag）と、途中の ckpt の保存（--save-every）が学習の結果を変えないこと
+    g. reverse_chain（group_pool と trajectory_pools.py が使う逆過程）が、手で回した逆過程と一致する
+    h. trajectory_pools.py の final_x_stats・activity_shares が、手で数えた値と一致する
 
     .venv/bin/python src/models/DDPM_Minimal/test_model.py
 """
@@ -38,6 +41,7 @@ def _load(name: str, path: Path) -> Any:
 s2c: Any = _load("stage2_common", HERE.parent / "Stage2_Common" / "stage2_common.py")
 dm: Any = _load("ddpm_minimal_model", HERE / "model.py")
 da: Any = _load("stage2_adapter_ddpm_minimal", HERE / "stage2_adapter.py")
+tp: Any = _load("ddpm_minimal_trajectory_pools", HERE / "trajectory_pools.py")   # dm は上で載せたものを使い回す
 sm: Any = dm.sm
 
 
@@ -145,10 +149,72 @@ def test_common_loop_resume() -> None:
     print("e. 共通の Stage 2 で回せる・再開がビット単位で一致: OK")
 
 
+def test_names_and_save_every() -> None:
+    """f. 保存名と、途中の ckpt の保存が学習の結果を変えないこと（2 epoch を 2 回）"""
+    assert dm.stage1_tag() == "_ch16_wd0.01" and dm.stage1_tag(lr=2e-4) == "_ch16_wd0.01_lr0.0002"
+    assert dm.ckpt_path(42).name == "ddpm_minimal_ch16_wd0.01.pt"
+    assert dm.ckpt_path(42, run_tag="_traj").name == "ddpm_minimal_ch16_wd0.01_traj.pt"
+    assert dm.ckpt_path(43, lr=2e-4).name == "ddpm_minimal_ch16_wd0.01_lr0.0002_s43.pt"
+    with tempfile.TemporaryDirectory() as tmp:
+        saved, plain = Path(tmp) / "a.pt", Path(tmp) / "b.pt"
+        model_a, _ = dm.train(epochs=2, seed=0, save_path=saved, device="cpu", save_every=1)
+        model_b, _ = dm.train(epochs=2, seed=0, save_path=plain, device="cpu")
+        sa, sb = model_a.state_dict(), model_b.state_dict()
+        assert all(torch.equal(sa[k], sb[k]) for k in sa), "途中の ckpt の保存で学習の結果が変わった"
+        assert [p.name for p in tp.ckpt_list("a", Path(tmp))] == ["a_ep0001.pt", "a_ep0002.pt", "a.pt"]
+        config = torch.load(Path(tmp) / "a_ep0002.pt", map_location="cpu", weights_only=False)["config"]
+        assert config["epoch"] == 2 and config["lr"] == dm.LR and np.isfinite(config["val"])
+        assert tp.ckpt_list("b", Path(tmp)) == [plain]
+    try:
+        dm.train(epochs=1, save_path=None, device="cpu", save_every=1)
+        raise AssertionError("保存先なしの save_every を拒否していない")
+    except ValueError:
+        pass
+    print("f. 保存名・途中の ckpt の保存が学習を変えない: OK")
+
+
+def test_reverse_chain_matches_inline() -> None:
+    """g. reverse_chain が、同じ generator で手で回した逆過程と一致する"""
+    model = _model()
+    diffusion = dm.base.Diffusion("cpu")
+    cond = torch.as_tensor(sm.cond_grid(), dtype=torch.long)[:2]
+    x = dm.reverse_chain(model, diffusion, cond, torch.Generator().manual_seed(4))
+    gen = torch.Generator().manual_seed(4)
+    shape = (2, sm.NUM_ACT, sm.NUM_SLOTS)
+    with torch.no_grad():
+        ref = torch.randn(shape, generator=gen)
+        for ti in reversed(range(dm.T_STEPS)):
+            z = None if ti == 0 else torch.randn(shape, generator=gen)
+            ref = diffusion._reverse_step(model, ref, ti, cond, dm.GUIDANCE, z)
+    assert torch.equal(x, ref)
+    print("g. reverse_chain が手で回した逆過程と一致: OK")
+
+
+def test_final_x_stats_and_shares() -> None:
+    """h. 最後の x の形の指標と、重み付きの活動の割合"""
+    x = torch.zeros(1, sm.NUM_ACT, 4)
+    x[0, 2, 0] = 1.0                                       # スロット 0: one-hot に近い
+    x[0, 3, 1] = x[0, 5, 1] = 0.8                          # スロット 1: 同点（2 番目も 0.8）
+    x[0, 1, 2], x[0, 4, 2] = 0.95, 0.2                     # スロット 2: 最大は 0.9 超だが 2 つが 0.1 超
+    x[0, 0, 3], x[0, 7, 3] = 0.6, 0.3                      # スロット 3: 最大が 0.9 以下
+    stats = tp.final_x_stats(x)
+    assert stats["clean_onehot"] == 0.25 and stats["tie_rate"] == 0.25
+    assert abs(stats["second_mean"] - (0.0 + 0.8 + 0.2 + 0.3) / 4) < 1e-6      # float32 の平均
+    sched = np.array([[0] * 96, [2] * 48 + [0] * 48], dtype=np.int64)
+    shares = tp.activity_shares(sched, np.array([1.0, 3.0]))
+    expected = np.zeros(sm.NUM_ACT)
+    expected[0], expected[2] = 0.25 * 1.0 + 0.75 * 0.5, 0.75 * 0.5
+    assert np.allclose(shares, expected)
+    print("h. final_x_stats・activity_shares: OK")
+
+
 if __name__ == "__main__":
     test_size_and_isolation()
     test_matches_base_unet()
     test_val_deterministic()
     test_relaxed_matches_sampler()
     test_common_loop_resume()
+    test_names_and_save_every()
+    test_reverse_chain_matches_inline()
+    test_final_x_stats_and_shares()
     print("all OK")

@@ -44,8 +44,9 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    TR["train(epochs, seed, save_path, device)<br/>eps_mse（t・ε は CPU の大域の乱数）<br/>val_loss（t・ε を固定）で早期終了"] --> CK["save_ckpt(model, ckpt_path(seed), seed, extra)"]
-    CK --> GP["group_pool(model, diffusion, n_per_group, seed)<br/>逆過程 1,000 ステップ → argmax<br/>pool (28, n_per_group, 96)"]
+    TR["train(epochs, seed, save_path, device, lr, save_every)<br/>eps_mse（t・ε は CPU の大域の乱数）<br/>val_loss（t・ε を固定）で早期終了"] --> CK["save_ckpt(model, ckpt_path(seed, lr, run_tag), seed, extra)"]
+    TR -. "save_every > 0（診断用）" .-> EP["save_ckpt(model, epoch_ckpt_path(save_path, ep), seed, extra)"]
+    CK --> GP["group_pool(model, diffusion, n_per_group, seed)<br/>reverse_chain(model, diffusion, cond_idx, gen) → argmax<br/>pool (28, n_per_group, 96)"]
     CK --> SR["sample_relaxed_chain(model, diffusion, cond_idx, generator, tau, k)<br/>t = 999..k は勾配なし、t = k−1..0 は勾配あり<br/>base.straight_through(x0, tau) → y (B, 12, 96)"]
 ```
 
@@ -53,10 +54,15 @@ flowchart TD
     .venv/bin/python src/models/DDPM_Minimal/model.py --smoke
     .venv/bin/python src/models/DDPM_Minimal/model.py --measure --device cuda   # SQUID で所要時間を測る
     .venv/bin/python src/models/DDPM_Minimal/model.py --seed 42 --device cuda
+    # 診断用（Stage2_common_results.md §7）：50 epoch ごとに途中の ckpt も残す。本番の ckpt と別名にする
+    .venv/bin/python src/models/DDPM_Minimal/model.py --seed 42 --device cuda --save-every 50 --run-tag _traj
+    .venv/bin/python src/models/DDPM_Minimal/model.py --seed 42 --device cuda --save-every 50 --lr 2e-4
 
 出力:
-    outputs/checkpoints/ddpm_minimal{構成}{接尾辞}.pt   val 最良の ckpt（config に学習曲線 history）
-        {構成} = stage1_tag() = _ch16_wd0.01、{接尾辞} は種 42 なら空、それ以外は _s{seed}
+    outputs/checkpoints/ddpm_minimal{構成}{run_tag}{接尾辞}.pt   val 最良の ckpt（config に学習曲線 history）
+        {構成} = stage1_tag() = _ch16_wd0.01。学習率が既定（1e-3）以外なら _lr{学習率} が付く（例 _ch16_wd0.01_lr0.0002）
+        {run_tag} は --run-tag（既定は空）、{接尾辞} は種 42 なら空、それ以外は _s{seed}
+    outputs/checkpoints/ddpm_minimal{構成}{run_tag}{接尾辞}_ep{epoch:04d}.pt   --save-every N のときの途中の ckpt
 """
 import argparse
 import copy
@@ -171,9 +177,10 @@ class DDPMMinimal(base.UNet1D):
         return h1, h2, h3
 
 
-def stage1_tag(base_ch: int = BASE_CH, weight_decay: float = WEIGHT_DECAY) -> str:
-    """Pre-trained の構成の印（例: _ch16_wd0.01）"""
-    return f"_ch{base_ch}_wd{weight_decay:g}"
+def stage1_tag(base_ch: int = BASE_CH, weight_decay: float = WEIGHT_DECAY, lr: float = LR) -> str:
+    """Pre-trained の構成の印（例: _ch16_wd0.01。学習率が既定の LR 以外なら _ch16_wd0.01_lr0.0002）"""
+    lr_tag = "" if lr == LR else f"_lr{lr:g}"
+    return f"_ch{base_ch}_wd{weight_decay:g}{lr_tag}"
 
 
 def count_params(model: nn.Module) -> int:
@@ -236,28 +243,38 @@ def val_loss(model: DDPMMinimal, diffusion: Any, loader: DataLoader) -> float:
 # 4. 学習と読み込み
 # ============================================================
 def train(epochs: int = EPOCHS, seed: int = SEED, save_path: Path | None = MODEL_SAVE_PATH,
-          device: str = DEVICE) -> tuple[DDPMMinimal, dict[str, list[float]]]:
+          device: str = DEVICE, lr: float = LR,
+          save_every: int = 0) -> tuple[DDPMMinimal, dict[str, list[float]]]:
     """学習し、val の ε の二乗誤差が最良の重みのモデルを返す（手順は lm.train と同じ）
+
+    Note:
+        save_every > 0 のときの途中の ckpt の保存は、乱数を使わないので学習の結果を変えない
 
     Args:
         epochs: 学習 epoch の上限, default=EPOCHS=1000
         seed: 学習の乱数の種, default=SEED=42
         save_path: 最良の ckpt の保存先。None なら何も保存しない
         device: 学習するデバイス, default=DEVICE
+        lr: AdamW の学習率, default=LR=1e-3
+        save_every: 正なら N epoch ごとにその時点の重みを epoch_ckpt_path(save_path, ep) へ保存する（診断用）, default=0
 
     Returns:
         (最良の重みを戻したモデル, 学習曲線 {"epoch", "train", "val", "sec"})
 
     Raises:
-        ValueError: epochs < 1 のとき
+        ValueError: epochs < 1、save_every < 0、または save_every > 0 なのに save_path が None のとき
     """
     if epochs < 1:
         raise ValueError(f"epochs は 1 以上: {epochs}")
+    if save_every < 0:
+        raise ValueError(f"save_every は 0 以上: {save_every}")
+    if save_every > 0 and save_path is None:
+        raise ValueError("save_every > 0 には save_path が要る（途中の ckpt の保存先を作るため）")
     torch.manual_seed(seed)
     train_part, val_part = gm.load_split()
     model = DDPMMinimal().to(device)
     diffusion = base.Diffusion(device)
-    optimizer = torch.optim.AdamW(lm.param_groups(model, WEIGHT_DECAY), lr=LR)
+    optimizer = torch.optim.AdamW(lm.param_groups(model, WEIGHT_DECAY), lr=lr)
     train_loader = gm.make_loader(train_part, shuffle=True)
     val_loader = gm.make_loader(val_part, shuffle=False)
     print(f"device={device}  train={len(train_part.sched)}  val={len(val_part.sched)}  base_ch={base.BASE_CH}  "
@@ -285,6 +302,9 @@ def train(epochs: int = EPOCHS, seed: int = SEED, save_path: Path | None = MODEL
             history[key].append(float(val))
         if ep == 1 or ep % 10 == 0:
             print(f"epoch {ep:4d} | train {total / count:.5f} | val {va:.5f} | {sec:.2f}s", flush=True)
+        if save_every > 0 and ep % save_every == 0:
+            assert save_path is not None
+            save_ckpt(model, epoch_ckpt_path(save_path, ep), seed, extra={"epoch": ep, "val": va, "lr": lr})
         if va < best_val - EARLY_STOP_MIN_DELTA:
             best_val, best_epoch, no_improve = va, ep, 0
             best_state = copy.deepcopy(model.state_dict())
@@ -300,9 +320,14 @@ def train(epochs: int = EPOCHS, seed: int = SEED, save_path: Path | None = MODEL
     print(f"restored best: epoch {best_epoch} (val {best_val:.5f})", flush=True)
     if save_path is not None:
         save_ckpt(model, save_path, seed, extra={"best_epoch": best_epoch, "best_val": best_val,
-                                                  "stopped_epoch": ep, "history": history})
+                                                  "stopped_epoch": ep, "lr": lr, "history": history})
         print(f"saved model to {save_path}")
     return model, history
+
+
+def epoch_ckpt_path(save_path: Path, epoch: int) -> Path:
+    """途中の epoch の ckpt の保存先 {save_path の stem}_ep{epoch:04d}.pt（DDPM_Aggregate_Simple と同じ形）"""
+    return save_path.with_name(f"{save_path.stem}_ep{epoch:04d}{save_path.suffix}")
 
 
 def save_ckpt(model: DDPMMinimal, path: Path, seed: int, extra: dict[str, Any] | None = None) -> None:
@@ -336,9 +361,19 @@ def load_model(path: Path, device: str = DEVICE) -> DDPMMinimal:
     return model.eval()
 
 
-def ckpt_path(seed: int) -> Path:
-    """最良の ckpt のパス（例: 種 42 は ddpm_minimal_ch16_wd0.01.pt、種 43 は ddpm_minimal_ch16_wd0.01_s43.pt）"""
-    return MODEL_SAVE_PATH.with_name(f"{MODEL_SAVE_PATH.stem}{stage1_tag()}{lm.run_suffix(seed)}{MODEL_SAVE_PATH.suffix}")
+def ckpt_path(seed: int, lr: float = LR, run_tag: str = "") -> Path:
+    """最良の ckpt のパス
+
+    例: 種 42 は ddpm_minimal_ch16_wd0.01.pt、種 43 は ddpm_minimal_ch16_wd0.01_s43.pt、
+        学習率 2e-4 は ddpm_minimal_ch16_wd0.01_lr0.0002.pt、run_tag="_traj" は ddpm_minimal_ch16_wd0.01_traj.pt
+
+    Args:
+        seed: 学習の乱数の種
+        lr: 学習率, default=LR=1e-3（既定以外は stage1_tag に _lr{lr} が付く）
+        run_tag: 本番の ckpt と分けるための印（例 "_traj"）, default=""
+    """
+    name = f"{MODEL_SAVE_PATH.stem}{stage1_tag(lr=lr)}{run_tag}{lm.run_suffix(seed)}{MODEL_SAVE_PATH.suffix}"
+    return MODEL_SAVE_PATH.with_name(name)
 
 
 # ============================================================
@@ -386,6 +421,31 @@ def sample_relaxed_chain(model: DDPMMinimal, diffusion: Any, cond_idx: torch.Ten
 
 
 @torch.no_grad()
+def reverse_chain(model: DDPMMinimal, diffusion: Any, cond_idx: torch.Tensor, gen: torch.Generator) -> torch.Tensor:
+    """逆過程 1,000 ステップを勾配なしで回し、最後の x を返す（group_pool と診断の trajectory_pools.py で共有）
+
+    Note:
+        最後の x は ti = 0 の事後平均で、clamp された x0 の予測（値は [0, 1]）。argmax を取る前の連続値
+
+    Args:
+        model: DDPMMinimal
+        diffusion: base.Diffusion
+        cond_idx: 条件インデックス, dtype=int64, (B, 3)。モデルと同じデバイス
+        gen: 計算場所の torch.Generator（x_T と各ステップの雑音 z をこの順に引く）
+
+    Returns:
+        x: 最後の x, dtype=float32, (B, 12, 96)
+    """
+    dev = cond_idx.device
+    shape = (cond_idx.size(0), NUM_ACT, NUM_SLOTS)
+    x = torch.randn(shape, generator=gen, device=dev)
+    for ti in reversed(range(T_STEPS)):
+        z = None if ti == 0 else torch.randn(shape, generator=gen, device=dev)
+        x = diffusion._reverse_step(model, x, ti, cond_idx, GUIDANCE, z)
+    return x
+
+
+@torch.no_grad()
 def group_pool(model: DDPMMinimal, diffusion: Any, n_per_group: int, seed: int,
                batch: int = POOL_BATCH) -> npt.NDArray[np.int64]:
     """群別サンプルプールを作る, -> (28, n_per_group, 96)。逆過程 1,000 ステップ → argmax（CFG なし）
@@ -410,12 +470,7 @@ def group_pool(model: DDPMMinimal, diffusion: Any, n_per_group: int, seed: int,
     outs = []
     for i in range(0, flat.size(0), batch):
         cond = flat[i:i + batch].to(dev)
-        shape = (cond.size(0), NUM_ACT, NUM_SLOTS)
-        x = torch.randn(shape, generator=gen, device=dev)
-        for ti in reversed(range(T_STEPS)):
-            z = None if ti == 0 else torch.randn(shape, generator=gen, device=dev)
-            x = diffusion._reverse_step(model, x, ti, cond, GUIDANCE, z)
-        outs.append(x.argmax(dim=1).cpu())
+        outs.append(reverse_chain(model, diffusion, cond, gen).argmax(dim=1).cpu())
     return torch.cat(outs).numpy().astype(np.int64).reshape(D_GROUPS, n_per_group, NUM_SLOTS)
 
 
@@ -469,6 +524,10 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=EPOCHS)
     ap.add_argument("--device", choices=("cpu", "mps", "cuda"), default=DEVICE)
     ap.add_argument("--threads", type=int, default=0, help="CPU の計算のスレッド数。0 なら torch の既定")
+    ap.add_argument("--lr", type=float, default=LR, help="AdamW の学習率。既定以外は保存名に _lr{学習率} が付く")
+    ap.add_argument("--save-every", type=int, default=0,
+                    help="N epoch ごとに途中の ckpt を {保存名の stem}_ep{epoch:04d}.pt へ保存する（診断用。0 なら保存しない）")
+    ap.add_argument("--run-tag", default="", help="保存名に足す印（例 _traj）。本番の ckpt を上書きしないために使う")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--measure", action="store_true", help="所要時間だけを測る（何も保存しない）")
     args = ap.parse_args()
@@ -480,9 +539,11 @@ def main() -> None:
     if args.measure:
         measure(args.device)
         return
-    path = ckpt_path(args.seed)
-    print(f"[config] seed={args.seed} epochs={args.epochs} device={args.device} ckpt={path.name}")
-    train(epochs=args.epochs, seed=args.seed, save_path=path, device=args.device)
+    path = ckpt_path(args.seed, lr=args.lr, run_tag=args.run_tag)
+    print(f"[config] seed={args.seed} epochs={args.epochs} device={args.device} lr={args.lr:g} "
+          f"save_every={args.save_every} ckpt={path.name}")
+    train(epochs=args.epochs, seed=args.seed, save_path=path, device=args.device, lr=args.lr,
+          save_every=args.save_every)
 
 
 if __name__ == "__main__":
