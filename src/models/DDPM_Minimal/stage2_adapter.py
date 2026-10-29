@@ -77,7 +77,7 @@ class DDPMAdapter(s2c.Stage2Adapter):
         self.diffusion = dm.base.Diffusion(device)
 
     def stage1_tag(self) -> str:
-        """Pre-trained の構成の印（_ch8_wd0.01）"""
+        """Pre-trained の構成の印（_ch16_wd0.01）"""
         return dm.stage1_tag()
 
     def sample_relaxed(self, cond_idx: torch.Tensor, generator: torch.Generator, tau: float) -> torch.Tensor:

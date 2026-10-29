@@ -6,7 +6,7 @@
 #PBS -N dt_2stage_ddpm_measure
 #PBS -r n
 #
-# 共通の 2 段階学習の DDPM_Minimal（幅 8・CFG なし）の所要時間を測る（DBG キュー、最大 10 分）。
+# 共通の 2 段階学習の DDPM_Minimal（幅 16・CFG なし）の所要時間を測る（DBG キュー、最大 10 分）。
 # 本番（jobs/two_stage_ddpm.sh）の要求経過時間は、ここで出た値から見積もる。
 #
 # 測るもの（src/models/DDPM_Minimal/model.py の measure）:

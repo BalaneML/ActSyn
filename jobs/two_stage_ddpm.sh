@@ -7,9 +7,10 @@
 #PBS -r n
 #PBS -m e
 #
-# 共通の 2 段階学習を DDPM_Minimal（幅 8・CFG なし）で回す: Stage 1 → E0（Pre-trained の採点）→ E1（Stage 2）。
+# 共通の 2 段階学習を DDPM_Minimal（幅 16・CFG なし）で回す: Stage 1 → E0（Pre-trained の採点）→ E1（Stage 2）。
+# 幅 8 の出力（ddpm_minimal_ch8_*）は別名なので、このスクリプトは読まない・上書きしない。
 #
-# elapstim_req=03:00:00 の根拠（2026-10-29、jobs/two_stage_ddpm_measure.sh の実測、A100）:
+# elapstim_req=03:00:00 の根拠（2026-10-29、幅 8 の実測。幅 16 は jobs/two_stage_ddpm_measure.sh で測り直して更新する）:
 #   Stage 1 は 1 epoch 0.32 秒（最大 1,000 epoch で約 5 分）、Stage 2 は 1 更新 5.1 秒（1,000 更新で 1.43 時間）、
 #   評価のプール 56,000 本は 2.7 分（E0・E1 で 2 回）。起動を含めて約 1.8 時間 × 安全率 1.5 ≒ 3 時間（ユーザー承認済み）
 #
@@ -19,10 +20,10 @@
 #   同じコマンドで再投入すれば続きから回る（25 step ごとに保存）。
 #
 # 出力（${REPO} 配下）:
-#   outputs/checkpoints/ddpm_minimal_ch8_wd0.01{_s種}.pt                                   Stage 1
-#   data/processed/aggregates/stage2_common_ddpm_minimal_ch8_wd0.01_seed{種}_zeroshot.csv   E0
-#   outputs/checkpoints/stage2_common_ddpm_minimal_ch8_wd0.01_lam0.01_cuda_seed{種}_all/    E1 の ckpt・history.csv
-#   data/processed/aggregates/stage2_common_ddpm_minimal_ch8_wd0.01_lam0.01_cuda_seed{種}_all.csv  E1
+#   outputs/checkpoints/ddpm_minimal_ch16_wd0.01{_s種}.pt                                   Stage 1
+#   data/processed/aggregates/stage2_common_ddpm_minimal_ch16_wd0.01_seed{種}_zeroshot.csv   E0
+#   outputs/checkpoints/stage2_common_ddpm_minimal_ch16_wd0.01_lam0.01_cuda_seed{種}_all/    E1 の ckpt・history.csv
+#   data/processed/aggregates/stage2_common_ddpm_minimal_ch16_wd0.01_lam0.01_cuda_seed{種}_all.csv  E1
 
 cd "${PBS_O_WORKDIR}"
 source jobs/_common.sh
@@ -30,9 +31,10 @@ source jobs/_common.sh
 SEED="${SEED:-42}"
 SUFFIX=""
 [ "${SEED}" != "42" ] && SUFFIX="_s${SEED}"
-STAGE1="${REPO}/outputs/checkpoints/ddpm_minimal_ch8_wd0.01${SUFFIX}.pt"
-E0_CSV="${REPO}/data/processed/aggregates/stage2_common_ddpm_minimal_ch8_wd0.01_seed${SEED}_zeroshot.csv"
-E1_CSV="${REPO}/data/processed/aggregates/stage2_common_ddpm_minimal_ch8_wd0.01_lam0.01_cuda_seed${SEED}_all.csv"
+TAG="ddpm_minimal_ch16_wd0.01"     # model.py の "ddpm_minimal" + stage1_tag()。BASE_CH を変えたらここも変える
+STAGE1="${REPO}/outputs/checkpoints/${TAG}${SUFFIX}.pt"
+E0_CSV="${REPO}/data/processed/aggregates/stage2_common_${TAG}_seed${SEED}_zeroshot.csv"
+E1_CSV="${REPO}/data/processed/aggregates/stage2_common_${TAG}_lam0.01_cuda_seed${SEED}_all.csv"
 LOG="${WORK}/logs/two_stage_ddpm_s${SEED}_${PBS_JOBID:-manual}.log"
 echo "seed=${SEED}  log=${LOG}"
 nvidia-smi --query-gpu=name,memory.total --format=csv

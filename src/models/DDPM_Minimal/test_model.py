@@ -1,8 +1,8 @@
 """
 DDPM_Minimal（model.py・stage2_adapter.py）の単体テスト（CPU で回る大きさ）
 
-    a. 大きさと写しの分離: 幅 8・dropout 0 のパラメータ数 68,860。書き換えたのは別名の写し（dm.base）の定数だけで、
-       ほかの実験が使う DDPM_Aggregate_Simple のモジュールは幅 64・dropout 0.1 のまま
+    a. 大きさと写しの分離: 幅 16・dropout 0 のパラメータ数 177,572。書き換えたのは別名の写し（dm.base）の定数だけで、
+       ほかの実験が使う DDPM_Aggregate_Simple のモジュールは幅 64・dropout 0.1 のまま。幅 8（12 チャネル未満）は作れない
     b. 時刻埋め込みを 0 にすると、同じ重みの既存の UNet1D（時刻符号なし）と同じ出力になる（_encode の書き換えの検算）
     c. 損失: val は決定的で、t と ε のために大域の乱数を進めない
     d. Stage 2 の生成: 前向きは硬い one-hot で、同じ雑音で勾配なしに回した逆過程の argmax と一致する（評価の生成と同じ標本）。
@@ -48,12 +48,20 @@ def _model(seed: int = 0) -> Any:
 
 
 def test_size_and_isolation() -> None:
-    """a. パラメータ数と、定数を書き換えたのが写しだけであること"""
-    assert dm.count_params(_model()) == 68_860
-    assert dm.base.BASE_CH == 8 and dm.base.DROPOUT == 0.0
+    """a. パラメータ数と、定数を書き換えたのが写しだけであること。入力より狭い幅は拒否する"""
+    assert dm.count_params(_model()) == 177_572
+    assert dm.base.BASE_CH == 16 and dm.base.DROPOUT == 0.0
     shared = s2c.sm                                         # ほかの実験と同じ名前で読み込まれた DDPM_Aggregate_Simple
     assert shared is not dm.base and shared.BASE_CH == 64 and shared.DROPOUT == 0.1
-    print("a. 大きさ 68,860・写しの分離: OK")
+    dm.base.BASE_CH = 8
+    try:
+        dm.DDPMMinimal()
+        raise AssertionError("幅 8 を拒否していない")
+    except ValueError:
+        pass
+    finally:
+        dm.base.BASE_CH = dm.BASE_CH
+    print("a. 大きさ 177,572・写しの分離・幅 8 の拒否: OK")
 
 
 def test_matches_base_unet() -> None:

@@ -5,7 +5,7 @@ DDPM_Minimal: 既存の DDPM（DDPM_Aggregate_Simple の UNet1D）を小さく�
 共通の 2 段階学習の比較対象の 1 つ（2026-10-29 ユーザー決定）
 
 DDPM_Aggregate_Simple からの変更点（それ以外の denoiser・拡散のスケジュール・逆過程の式は同じ）:
-    1. 幅 BASE_CH = 64 → 8（生成側のパラメータを LSTM と同程度にする。68,092 + 時刻埋め込み 768）
+    1. 幅 BASE_CH = 64 → 16（入口と出口の畳み込みが入力の 12 チャネルを絞らない最小の幅。176,036 + 時刻埋め込み 1,536）
     2. CFG なし（条件を落とす学習をせず、生成は guidance 1.0）。dropout 0.1 → 0
     3. 学習型の時刻埋め込み slot_embed = Embedding(96, BASE_CH) を、入口の畳み込みの出力に足す
        （既存の UNet1D の既定にはスロットの時刻を表す経路が無い）
@@ -13,6 +13,9 @@ DDPM_Aggregate_Simple からの変更点（それ以外の denoiser・拡散の�
        （AdamW lr 1e-3・weight decay 0.01（2 次元以上）・clip 1.0・batch 256・最大 1,000 epoch・
        val が 30 epoch 改善しなければ停止・val 最良を採用）
 
+★幅は 12（= NUM_ACT）以上が要る。最初に使った幅 8（2026-10-29）は、入口 Conv1d(12 → 8) と出口 Conv1d(8 → 12) で
+  12 × 96 = 1,152 個の値を 8 × 96 = 768 個に絞るので、ε の二乗誤差がどう学習しても 1/3 を下回れず、生成が崩れた
+  （Stage2_Common/docs/Stage2_common_results.md §5）。GroupNorm(8, ·) のため 8 の倍数で、16 が最小
 ★幅・dropout は DDPM_Aggregate_Simple/model.py のモジュールの定数で決まる（--kernel と同じ仕組み）。
   別名で読み込んだ写し（base）の定数だけを書き換えるので、ほかの実験が使う同じファイルには影響しない
 
@@ -53,7 +56,7 @@ flowchart TD
 
 出力:
     outputs/checkpoints/ddpm_minimal{構成}{接尾辞}.pt   val 最良の ckpt（config に学習曲線 history）
-        {構成} = stage1_tag() = _ch8_wd0.01、{接尾辞} は種 42 なら空、それ以外は _s{seed}
+        {構成} = stage1_tag() = _ch16_wd0.01、{接尾辞} は種 42 なら空、それ以外は _s{seed}
 """
 import argparse
 import copy
@@ -97,7 +100,7 @@ sm: Any = lm.sm
 # ============================================================
 # 1. 設定
 # ============================================================
-BASE_CH = 8                          # 2026-10-29 決定（GroupNorm(8, ·) のため 8 の倍数）
+BASE_CH = 16                         # 2026-10-29 決定（8 から変更。NUM_ACT 以上で、GroupNorm(8, ·) のため 8 の倍数）
 DROPOUT = 0.0                        # dropout を使わない（全モデル共通の決定）
 # ★DDPM_Aggregate_Simple を別名で読み込んだ写し。この写しの定数だけを書き換える
 base: Any = _load("ddpm_minimal_base_model", SIMPLE_DIR / "model.py")
@@ -128,7 +131,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # 2. モデル
 # ============================================================
 class DDPMMinimal(base.UNet1D):
-    """幅 8・CFG なし・dropout なしの UNet1D に、学習型の時刻埋め込みを足した ε 予測ネットワーク
+    """幅 16・CFG なし・dropout なしの UNet1D に、学習型の時刻埋め込みを足した ε 予測ネットワーク
 
     Note:
         1. 部品は base.UNet1D（時刻符号なしの既定の構造 ArchSpec()）と同じ。幅と dropout は base の定数で決まる
@@ -138,7 +141,14 @@ class DDPMMinimal(base.UNet1D):
     """
 
     def __init__(self) -> None:
-        """部品を作る（親の UNet1D の後に slot_embed を作る）"""
+        """部品を作る（親の UNet1D の後に slot_embed を作る）
+
+        Raises:
+            ValueError: 幅 base.BASE_CH が入力のチャネル数 NUM_ACT より小さいとき（ε の二乗誤差に下限ができる）
+        """
+        if base.BASE_CH < NUM_ACT:
+            raise ValueError(f"BASE_CH={base.BASE_CH} が入力の {NUM_ACT} チャネルより小さい。入口と出口の畳み込みで"
+                             f"値が絞られ、ε の二乗誤差に 1 − BASE_CH/{NUM_ACT} の下限ができる")
         super().__init__(arch=base.ArchSpec())
         self.slot_embed = nn.Embedding(NUM_SLOTS, base.BASE_CH)
 
@@ -162,7 +172,7 @@ class DDPMMinimal(base.UNet1D):
 
 
 def stage1_tag(base_ch: int = BASE_CH, weight_decay: float = WEIGHT_DECAY) -> str:
-    """Pre-trained の構成の印（例: _ch8_wd0.01）"""
+    """Pre-trained の構成の印（例: _ch16_wd0.01）"""
     return f"_ch{base_ch}_wd{weight_decay:g}"
 
 
@@ -327,7 +337,7 @@ def load_model(path: Path, device: str = DEVICE) -> DDPMMinimal:
 
 
 def ckpt_path(seed: int) -> Path:
-    """最良の ckpt のパス（例: 種 42 は ddpm_minimal_ch8_wd0.01.pt、種 43 は ddpm_minimal_ch8_wd0.01_s43.pt）"""
+    """最良の ckpt のパス（例: 種 42 は ddpm_minimal_ch16_wd0.01.pt、種 43 は ddpm_minimal_ch16_wd0.01_s43.pt）"""
     return MODEL_SAVE_PATH.with_name(f"{MODEL_SAVE_PATH.stem}{stage1_tag()}{lm.run_suffix(seed)}{MODEL_SAVE_PATH.suffix}")
 
 
@@ -454,7 +464,7 @@ def measure(device: str = DEVICE) -> None:
 
 def main() -> None:
     """CLI"""
-    ap = argparse.ArgumentParser(description="DDPM_Minimal: 幅 8・CFG なしの DDPM の Stage 1")
+    ap = argparse.ArgumentParser(description="DDPM_Minimal: 幅 16・CFG なしの DDPM の Stage 1")
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--epochs", type=int, default=EPOCHS)
     ap.add_argument("--device", choices=("cpu", "mps", "cuda"), default=DEVICE)
