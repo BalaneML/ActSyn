@@ -8,6 +8,7 @@
         "src/common/preprocess/stula",
         "src/eval",
         "src/models/CVAE_Aggregate",
-        "src/models/DDPM_Aggregate_Simple"
+        "src/models/DDPM_Aggregate_Simple",
+        "src/models/SA_Aggregate"
     ]
 }
