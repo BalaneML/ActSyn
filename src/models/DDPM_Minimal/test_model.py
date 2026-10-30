@@ -1,7 +1,7 @@
 """
 DDPM_Minimal（model.py・stage2_adapter.py）の単体テスト（CPU で回る大きさ）
 
-    a. 大きさと写しの分離: 幅 16・dropout 0 のパラメータ数 177,572。書き換えたのは別名の写し（dm.base）の定数だけで、
+    a. 大きさと写しの分離: 幅 32・dropout 0 のパラメータ数 528,628。書き換えたのは別名の写し（dm.base）の定数だけで、
        ほかの実験が使う DDPM_Aggregate_Simple のモジュールは幅 64・dropout 0.1 のまま。幅 8（12 チャネル未満）は作れない
     b. 時刻埋め込みを 0 にすると、同じ重みの既存の UNet1D（時刻符号なし）と同じ出力になる（_encode の書き換えの検算）
     c. 損失: val は決定的で、t と ε のために大域の乱数を進めない
@@ -55,8 +55,8 @@ def _model(seed: int = 0) -> Any:
 
 def test_size_and_isolation() -> None:
     """a. パラメータ数と、定数を書き換えたのが写しだけであること。入力より狭い幅は拒否する"""
-    assert dm.count_params(_model()) == 177_572
-    assert dm.base.BASE_CH == 16 and dm.base.DROPOUT == 0.0
+    assert dm.count_params(_model()) == 528_628
+    assert dm.base.BASE_CH == 32 and dm.base.DROPOUT == 0.0
     shared = s2c.sm                                         # ほかの実験と同じ名前で読み込まれた DDPM_Aggregate_Simple
     assert shared is not dm.base and shared.BASE_CH == 64 and shared.DROPOUT == 0.1
     dm.base.BASE_CH = 8
@@ -67,7 +67,7 @@ def test_size_and_isolation() -> None:
         pass
     finally:
         dm.base.BASE_CH = dm.BASE_CH
-    print("a. 大きさ 177,572・写しの分離・幅 8 の拒否: OK")
+    print("a. 大きさ 528,628・写しの分離・幅 8 の拒否: OK")
 
 
 def test_matches_base_unet() -> None:
@@ -153,10 +153,10 @@ def test_common_loop_resume() -> None:
 
 def test_names_and_save_every() -> None:
     """f. 保存名と、途中の ckpt の保存が学習の結果を変えないこと（2 epoch を 2 回）"""
-    assert dm.stage1_tag() == "_ch16_wd0.01" and dm.stage1_tag(lr=2e-4) == "_ch16_wd0.01_lr0.0002"
-    assert dm.ckpt_path(42).name == "ddpm_minimal_ch16_wd0.01.pt"
-    assert dm.ckpt_path(42, run_tag="_traj").name == "ddpm_minimal_ch16_wd0.01_traj.pt"
-    assert dm.ckpt_path(43, lr=2e-4).name == "ddpm_minimal_ch16_wd0.01_lr0.0002_s43.pt"
+    assert dm.stage1_tag() == "_ch32_wd0.01" and dm.stage1_tag(lr=2e-4) == "_ch32_wd0.01_lr0.0002"
+    assert dm.ckpt_path(42).name == "ddpm_minimal_ch32_wd0.01.pt"
+    assert dm.ckpt_path(42, run_tag="_traj").name == "ddpm_minimal_ch32_wd0.01_traj.pt"
+    assert dm.ckpt_path(43, lr=2e-4).name == "ddpm_minimal_ch32_wd0.01_lr0.0002_s43.pt"
     with tempfile.TemporaryDirectory() as tmp:
         saved, plain = Path(tmp) / "a.pt", Path(tmp) / "b.pt"
         model_a, _ = dm.train(epochs=2, seed=0, save_path=saved, device="cpu", save_every=1)
@@ -218,25 +218,25 @@ def test_width_option() -> None:
             raise AssertionError(f"幅 {bad} を拒否していない")
         except ValueError:
             pass
-    assert dm.base.BASE_CH == dm.BASE_CH == 16
+    assert dm.base.BASE_CH == dm.BASE_CH == 32
     try:
-        dm.set_base_ch(32)
-        assert dm.stage1_tag() == "_ch32_wd0.01" and dm.ckpt_path(42).name == "ddpm_minimal_ch32_wd0.01.pt"
-        assert dm.count_params(_model()) == 528_628
+        dm.set_base_ch(16)
+        assert dm.stage1_tag() == "_ch16_wd0.01" and dm.ckpt_path(42).name == "ddpm_minimal_ch16_wd0.01.pt"
+        assert dm.count_params(_model()) == 177_572
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "w32.pt"
+            path = Path(tmp) / "w16.pt"
             dm.train(epochs=1, seed=0, save_path=path, device="cpu")
-            dm.set_base_ch(16)
+            dm.set_base_ch(32)
             try:
                 dm.load_model(path, device="cpu")
                 raise AssertionError("幅の違う ckpt を読めてしまった")
             except ValueError:
                 pass
             row = tp.measure_ckpt(path, tp.load_real(), dm.base.Diffusion("cpu"), 2, tp.POOL_SEED, "cpu")
-            assert dm.base.BASE_CH == 32 and row["base_ch"] == 32 and np.isfinite(row["tv_atus"])
+            assert dm.base.BASE_CH == 16 and row["base_ch"] == 16 and np.isfinite(row["tv_atus"])
     finally:
         dm.set_base_ch(dm.BASE_CH)
-    assert dm.stage1_tag() == "_ch16_wd0.01" and s2c.sm.BASE_CH == 64
+    assert dm.stage1_tag() == "_ch32_wd0.01" and s2c.sm.BASE_CH == 64
     print("i. 幅の変更・使えない幅の拒否・ckpt の幅に合わせた読み戻し: OK")
 
 

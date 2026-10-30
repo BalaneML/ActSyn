@@ -5,7 +5,7 @@ DDPM_Minimal: 既存の DDPM（DDPM_Aggregate_Simple の UNet1D）を小さく�
 共通の 2 段階学習の比較対象の 1 つ（2026-10-29 ユーザー決定）
 
 DDPM_Aggregate_Simple からの変更点（それ以外の denoiser・拡散のスケジュール・逆過程の式は同じ）:
-    1. 幅 BASE_CH = 64 → 16（入口と出口の畳み込みが入力の 12 チャネルを絞らない最小の幅。176,036 + 時刻埋め込み 1,536）
+    1. 幅 BASE_CH = 64 → 32（2026-10-30 決定。525,556 + 時刻埋め込み 3,072 = 528,628）
     2. CFG なし（条件を落とす学習をせず、生成は guidance 1.0）。dropout 0.1 → 0
     3. 学習型の時刻埋め込み slot_embed = Embedding(96, BASE_CH) を、入口の畳み込みの出力に足す
        （既存の UNet1D の既定にはスロットの時刻を表す経路が無い）
@@ -16,6 +16,9 @@ DDPM_Aggregate_Simple からの変更点（それ以外の denoiser・拡散の�
 ★幅は 12（= NUM_ACT）以上が要る。最初に使った幅 8（2026-10-29）は、入口 Conv1d(12 → 8) と出口 Conv1d(8 → 12) で
   12 × 96 = 1,152 個の値を 8 × 96 = 768 個に絞るので、ε の二乗誤差がどう学習しても 1/3 を下回れず、生成が崩れた
   （Stage2_Common/docs/Stage2_common_results.md §5）。GroupNorm(8, ·) のため 8 の倍数で、16 が最小
+★次に使った幅 16（2026-10-29）は下限が無いが、Pre-trained の活動の割合が ATUS から大きく外れた（総変動距離 0.42。
+  Stage2_Common/docs/Stage1_ddpm_minimal_traj_results.md）。幅 32・64 を種 42〜44 で比べ、結果を見る前に決めた
+  選び方（総変動距離の範囲が重なれば狭い幅）で 32 にした（Stage1_ddpm_minimal_seeds_results.md）
 ★幅・dropout は DDPM_Aggregate_Simple/model.py のモジュールの定数で決まる（--kernel と同じ仕組み）。
   別名で読み込んだ写し（base）の定数だけを書き換えるので、ほかの実験が使う同じファイルには影響しない。
   幅は set_base_ch（CLI は --base-ch）で変える。モデルを作る前・ckpt を読む前に呼ぶ
@@ -45,7 +48,7 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    SB["set_base_ch(base_ch)<br/>base.BASE_CH を書き換える（--base-ch。既定 16）"] --> TR
+    SB["set_base_ch(base_ch)<br/>base.BASE_CH を書き換える（--base-ch。既定 32）"] --> TR
     TR["train(epochs, seed, save_path, device, lr, save_every)<br/>eps_mse（t・ε は CPU の大域の乱数）<br/>val_loss（t・ε を固定）で早期終了"] --> CK["save_ckpt(model, ckpt_path(seed, lr, run_tag), seed, extra)"]
     TR -. "save_every > 0（診断用）" .-> EP["save_ckpt(model, epoch_ckpt_path(save_path, ep), seed, extra)"]
     CK --> GP["group_pool(model, diffusion, n_per_group, seed)<br/>reverse_chain(model, diffusion, cond_idx, gen) → argmax<br/>pool (28, n_per_group, 96)"]
@@ -59,14 +62,14 @@ flowchart TD
     # 診断用（Stage2_common_results.md §7）：50 epoch ごとに途中の ckpt も残す。本番の ckpt と別名にする
     .venv/bin/python src/models/DDPM_Minimal/model.py --seed 42 --device cuda --save-every 50 --run-tag _traj
     .venv/bin/python src/models/DDPM_Minimal/model.py --seed 42 --device cuda --save-every 50 --lr 2e-4
-    # 幅を変える（Stage1_ddpm_minimal_traj_results.md §5 の案 W）。保存名は _ch{幅}_wd0.01 になる
-    .venv/bin/python src/models/DDPM_Minimal/model.py --base-ch 32 --seed 42 --device cuda --save-every 100
-    .venv/bin/python src/models/DDPM_Minimal/model.py --base-ch 32 --measure --device cuda
+    # 幅を変える（既定は 32）。保存名は _ch{幅}_wd0.01 になる
+    .venv/bin/python src/models/DDPM_Minimal/model.py --base-ch 64 --seed 42 --device cuda --save-every 100
+    .venv/bin/python src/models/DDPM_Minimal/model.py --base-ch 64 --measure --device cuda
 
 出力:
     outputs/checkpoints/ddpm_minimal{構成}{run_tag}{接尾辞}.pt   val 最良の ckpt（config に学習曲線 history）
-        {構成} = stage1_tag() = _ch{幅}_wd0.01（幅の既定は 16）。学習率が既定（1e-3）以外なら _lr{学習率} が付く
-        （例 _ch16_wd0.01_lr0.0002）
+        {構成} = stage1_tag() = _ch{幅}_wd0.01（幅の既定は 32）。学習率が既定（1e-3）以外なら _lr{学習率} が付く
+        （例 _ch32_wd0.01_lr0.0002）
         {run_tag} は --run-tag（既定は空）、{接尾辞} は種 42 なら空、それ以外は _s{seed}
     outputs/checkpoints/ddpm_minimal{構成}{run_tag}{接尾辞}_ep{epoch:04d}.pt   --save-every N のときの途中の ckpt
 """
@@ -112,7 +115,7 @@ sm: Any = lm.sm
 # ============================================================
 # 1. 設定
 # ============================================================
-BASE_CH = 16                         # 2026-10-29 決定（8 から変更。NUM_ACT 以上で、GroupNorm(8, ·) のため 8 の倍数）
+BASE_CH = 32                         # 2026-10-30 決定（16 から変更。NUM_ACT 以上で、GroupNorm(8, ·) のため 8 の倍数）
 DROPOUT = 0.0                        # dropout を使わない（全モデル共通の決定）
 # ★DDPM_Aggregate_Simple を別名で読み込んだ写し。この写しの定数だけを書き換える
 base: Any = _load("ddpm_minimal_base_model", SIMPLE_DIR / "model.py")
@@ -143,7 +146,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # 2. モデル
 # ============================================================
 class DDPMMinimal(base.UNet1D):
-    """幅 16・CFG なし・dropout なしの UNet1D に、学習型の時刻埋め込みを足した ε 予測ネットワーク
+    """幅 base.BASE_CH（既定 32）・CFG なし・dropout なしの UNet1D に、学習型の時刻埋め込みを足した ε 予測ネットワーク
 
     Note:
         1. 部品は base.UNet1D（時刻符号なしの既定の構造 ArchSpec()）と同じ。幅と dropout は base の定数で決まる
@@ -202,7 +205,7 @@ def set_base_ch(base_ch: int) -> None:
 
 
 def stage1_tag(base_ch: int | None = None, weight_decay: float = WEIGHT_DECAY, lr: float = LR) -> str:
-    """Pre-trained の構成の印（例: _ch16_wd0.01。学習率が既定の LR 以外なら _ch16_wd0.01_lr0.0002）
+    """Pre-trained の構成の印（例: _ch32_wd0.01。学習率が既定の LR 以外なら _ch32_wd0.01_lr0.0002）
 
     Args:
         base_ch: 幅, default=None（いまの base.BASE_CH。set_base_ch で変わる）
@@ -395,9 +398,9 @@ def load_model(path: Path, device: str = DEVICE) -> DDPMMinimal:
 def ckpt_path(seed: int, lr: float = LR, run_tag: str = "") -> Path:
     """最良の ckpt のパス（幅は呼んだ時点の base.BASE_CH）
 
-    例: 種 42 は ddpm_minimal_ch16_wd0.01.pt、種 43 は ddpm_minimal_ch16_wd0.01_s43.pt、
-        学習率 2e-4 は ddpm_minimal_ch16_wd0.01_lr0.0002.pt、run_tag="_traj" は ddpm_minimal_ch16_wd0.01_traj.pt、
-        set_base_ch(32) の後の種 42 は ddpm_minimal_ch32_wd0.01.pt
+    例: 種 42 は ddpm_minimal_ch32_wd0.01.pt、種 43 は ddpm_minimal_ch32_wd0.01_s43.pt、
+        学習率 2e-4 は ddpm_minimal_ch32_wd0.01_lr0.0002.pt、run_tag="_traj" は ddpm_minimal_ch32_wd0.01_traj.pt、
+        set_base_ch(64) の後の種 42 は ddpm_minimal_ch64_wd0.01.pt
 
     Args:
         seed: 学習の乱数の種
@@ -552,7 +555,7 @@ def measure(device: str = DEVICE) -> None:
 
 def main() -> None:
     """CLI"""
-    ap = argparse.ArgumentParser(description="DDPM_Minimal: CFG なしの DDPM の Stage 1（幅の既定は 16）")
+    ap = argparse.ArgumentParser(description="DDPM_Minimal: CFG なしの DDPM の Stage 1（幅の既定は 32）")
     ap.add_argument("--base-ch", type=int, default=BASE_CH, help="denoiser の幅。保存名の _ch{幅} になる")
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--epochs", type=int, default=EPOCHS)
