@@ -57,6 +57,7 @@ flowchart TD
     .venv/bin/python src/models/Stage2_Common/stage2_common.py --model lstm --seed 42 --zero-shot
     .venv/bin/python src/models/Stage2_Common/stage2_common.py --model lstm --seed 42 --device cpu --threads 1
     .venv/bin/python src/models/Stage2_Common/stage2_common.py --model lstm --seed 42 --device cpu --threads 1 --resume
+    .venv/bin/python src/models/Stage2_Common/stage2_common.py --model ddpm_minimal --seed 42 --device cuda --lr 1e-4 --resume
 
     フラグ:
         --model M        モデル（MODEL_ADAPTERS のキー: lstm / gru_minimal / vae_minimal / ddpm_minimal /
@@ -65,6 +66,10 @@ flowchart TD
         --zero-shot      学習せず Pre-trained を採点する（E0）
         --lam V          リハーサルの重み λ（既定 0.01、暫定）
         --steps N        更新回数（既定 1,000）
+        --lr V           学習率（既定 1e-3）。既定と違えば保存名に _lr{値} が付く。
+                         ★約束事では全モデル 1e-3。DDPM（幅 32）だけ 1e-4 にした（2026-11-01、ユーザー決定）。
+                         新しく作る AdamW の 1 回目の更新で、1e-3 だと Pre-trained が崩れるため
+                         （docs/Stage2_common_results.md §7）
         --resume         保存済みの最新の ckpt から続ける。無ければ最初から。
                          ★--resume なしで ckpt が既にあるときは止まる（上書きしない）
         --device D       cpu / mps / cuda
@@ -783,19 +788,40 @@ def smoke(name: str, device: str) -> None:
     print(f"smoke: OK（{name}、{device}、{len(rows)} 行、更新されたパラメータ {len(moved)}/{len(before)}）")
 
 
-def main() -> None:
-    """CLI"""
+def build_parser() -> argparse.ArgumentParser:
+    """CLI の引数の定義"""
     ap = argparse.ArgumentParser(description="モデルによらない共通の Stage 2")
     ap.add_argument("--model", choices=tuple(MODEL_ADAPTERS), default="lstm")
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--zero-shot", action="store_true", help="学習せず Pre-trained を採点する（E0）")
     ap.add_argument("--lam", type=float, default=Stage2Settings.lam, help="リハーサルの重み λ（暫定の既定 0.01）")
     ap.add_argument("--steps", type=int, default=Stage2Settings.steps)
+    ap.add_argument("--lr", type=float, default=Stage2Settings.lr, help="学習率（既定 1e-3。既定と違えば保存名に _lr{値}）")
     ap.add_argument("--resume", action="store_true", help="保存済みの最新の ckpt から続ける")
     ap.add_argument("--device", choices=DEVICES, default="cpu")
     ap.add_argument("--threads", type=int, default=0, help="CPU の計算のスレッド数。0 なら torch の既定")
     ap.add_argument("--smoke", action="store_true")
+    return ap
+
+
+def settings_from_args(args: argparse.Namespace) -> Stage2Settings:
+    """CLI の引数から Stage 2 の設定を作る（指定の無い項目は本番の既定値）
+
+    Args:
+        args: build_parser().parse_args() の結果
+
+    Returns:
+        Stage 2 の設定
+    """
+    return Stage2Settings(lam=args.lam, steps=args.steps, lr=args.lr)
+
+
+def main() -> None:
+    """CLI"""
+    ap = build_parser()
     args = ap.parse_args()
+    if args.lr <= 0:
+        ap.error(f"--lr は正の値: {args.lr}")
     if args.device == "mps" and not torch.backends.mps.is_available():
         ap.error("--device mps: この計算機では MPS が使えない")
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -807,8 +833,7 @@ def main() -> None:
     if args.smoke:
         smoke(args.model, args.device)
         return
-    run(args.model, args.seed, args.zero_shot, args.device, Stage2Settings(lam=args.lam, steps=args.steps),
-        args.resume)
+    run(args.model, args.seed, args.zero_shot, args.device, settings_from_args(args), args.resume)
 
 
 if __name__ == "__main__":

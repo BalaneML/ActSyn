@@ -9,9 +9,11 @@
     d. 上書きしない: resume なしで ckpt が既にあると止まる。設定が違う ckpt からは再開しない
     e. 生成の前向きは硬い one-hot（LSTM と GRU_Minimal）
     f. 保存名: 変種の印は λ と計算場所を常に書き、既定と違う設定だけを足す
+    g. CLI の --lr: 設定に渡り、既定と違うときだけ保存名に _lr{値} が付く
 
     .venv/bin/python src/models/Stage2_Common/test_stage2_common.py
 """
+import dataclasses
 import importlib.util
 import math
 import shutil
@@ -157,6 +159,17 @@ def test_variant_tag() -> None:
     print("f. 保存名: OK")
 
 
+def test_cli_lr() -> None:
+    """g. CLI の --lr"""
+    ap = s2c.build_parser()
+    default = s2c.settings_from_args(ap.parse_args(["--model", "ddpm_minimal"]))
+    assert default == s2c.Stage2Settings() and default.variant_tag("cuda") == "_lam0.01_cuda"
+    lowered = s2c.settings_from_args(ap.parse_args(["--model", "ddpm_minimal", "--lr", "1e-4"]))
+    assert lowered.lr == 1e-4 and lowered.variant_tag("cuda") == "_lam0.01_lr0.0001_cuda"
+    assert dataclasses.replace(lowered, lr=s2c.Stage2Settings().lr) == s2c.Stage2Settings()   # lr 以外は本番の既定
+    print("g. CLI の --lr: OK")
+
+
 if __name__ == "__main__":
     test_gumbel()
     for cell_ in ("lstm", "gru_minimal"):
@@ -165,4 +178,5 @@ if __name__ == "__main__":
     test_resume_exact()
     test_refuse_overwrite()
     test_variant_tag()
+    test_cli_lr()
     print("all OK")

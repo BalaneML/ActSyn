@@ -19,6 +19,11 @@
 #   起動を含めて約 3.4 時間 × 安全率 1.5 ≒ 5 時間（ユーザー承認済み）
 #
 # 投入: SEED=42 jobs/submit.sh -v SEED jobs/two_stage_ddpm.sh
+#       SEED=42 LR=1e-4 jobs/submit.sh -v SEED,LR jobs/two_stage_ddpm.sh   （Stage 2 の学習率を変えるとき）
+#
+# LR（既定 0.001）は E1 の学習率。既定と違えば E1 の保存名に _lr{値} が付く（stage2_common.py の variant_tag）。
+# DDPM（幅 32）は 2026-11-01 に 1e-4 に決めた（ユーザー決定）。1e-3 だと、新しく作る AdamW の 1 回目の更新で
+# Pre-trained が崩れる（src/models/Stage2_Common/docs/Stage2_common_results.md §7）。E0 は学習率によらないので共通。
 #
 # ★出力が既にある段は飛ばす。E1 は --resume で保存済みの最新の ckpt から続けるので、時間切れで止まっても
 #   同じコマンドで再投入すれば続きから回る（25 step ごとに保存）。
@@ -26,21 +31,25 @@
 # 出力（${REPO} 配下）:
 #   outputs/checkpoints/ddpm_minimal_ch32_wd0.01{_s種}.pt                                   Stage 1
 #   data/processed/aggregates/stage2_common_ddpm_minimal_ch32_wd0.01_seed{種}_zeroshot.csv   E0
-#   outputs/checkpoints/stage2_common_ddpm_minimal_ch32_wd0.01_lam0.01_cuda_seed{種}_all/    E1 の ckpt・history.csv
-#   data/processed/aggregates/stage2_common_ddpm_minimal_ch32_wd0.01_lam0.01_cuda_seed{種}_all.csv  E1
+#   outputs/checkpoints/stage2_common_ddpm_minimal_ch32_wd0.01_lam0.01[_lr値]_cuda_seed{種}_all/    E1 の ckpt・history.csv
+#   data/processed/aggregates/stage2_common_ddpm_minimal_ch32_wd0.01_lam0.01[_lr値]_cuda_seed{種}_all.csv  E1
 
 cd "${PBS_O_WORKDIR}"
 source jobs/_common.sh
 
 SEED="${SEED:-42}"
+LR="${LR:-0.001}"
 SUFFIX=""
 [ "${SEED}" != "42" ] && SUFFIX="_s${SEED}"
+# 保存名の学習率の印は Python の f"{lr:g}" と同じ書き方（C の printf %g と一致する）。既定 0.001 なら付けない
+LR_TAG=""
+[ "$(printf '%g' "${LR}")" != "0.001" ] && LR_TAG="_lr$(printf '%g' "${LR}")"
 TAG="ddpm_minimal_ch32_wd0.01"     # model.py の "ddpm_minimal" + stage1_tag()。BASE_CH を変えたらここも変える
 STAGE1="${REPO}/outputs/checkpoints/${TAG}${SUFFIX}.pt"
 E0_CSV="${REPO}/data/processed/aggregates/stage2_common_${TAG}_seed${SEED}_zeroshot.csv"
-E1_CSV="${REPO}/data/processed/aggregates/stage2_common_${TAG}_lam0.01_cuda_seed${SEED}_all.csv"
-LOG="${WORK}/logs/two_stage_ddpm_s${SEED}_${PBS_JOBID:-manual}.log"
-echo "seed=${SEED}  log=${LOG}"
+E1_CSV="${REPO}/data/processed/aggregates/stage2_common_${TAG}_lam0.01${LR_TAG}_cuda_seed${SEED}_all.csv"
+LOG="${WORK}/logs/two_stage_ddpm_s${SEED}${LR_TAG}_${PBS_JOBID:-manual}.log"
+echo "seed=${SEED}  lr=${LR}  log=${LOG}"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
 set -o pipefail
@@ -63,7 +72,7 @@ set -o pipefail
     else
         echo "=== E1（Stage 2、保存済みの ckpt があれば続きから）==="
         run_gpu python src/models/Stage2_Common/stage2_common.py --model ddpm_minimal --seed "${SEED}" \
-            --device cuda --resume || exit 1
+            --device cuda --lr "${LR}" --resume || exit 1
     fi
     echo "=== done ==="
 } 2>&1 | tee "${LOG}"
